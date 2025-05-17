@@ -1,4 +1,4 @@
-#![allow(dead_code, unused_imports, unused_variables)]
+#![allow(dead_code, unused_imports, unused_variables, warnings)]
 //mod messages;
 mod agents;
 mod config;
