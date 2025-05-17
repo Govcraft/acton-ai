@@ -1,3 +1,4 @@
+#![allow(warnings)]
 //mod messages;
 mod agents;
 mod config;
