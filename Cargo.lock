@@ -13,6 +13,7 @@ dependencies = [
  "mti",
  "rig-core",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
