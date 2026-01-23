@@ -324,8 +324,7 @@ impl MemoryStore {
     ///
     /// A handle to the spawned Memory Store actor.
     pub async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
-        let mut builder =
-            runtime.new_actor_with_name::<MemoryStore>("memory_store".to_string());
+        let mut builder = runtime.new_actor_with_name::<MemoryStore>("memory_store".to_string());
 
         // Set up lifecycle hooks
         builder

@@ -692,7 +692,9 @@ mod tests {
     #[test]
     fn system_event_agent_spawned() {
         let agent_id = AgentId::new();
-        let event = SystemEvent::AgentSpawned { id: agent_id.clone() };
+        let event = SystemEvent::AgentSpawned {
+            id: agent_id.clone(),
+        };
 
         if let SystemEvent::AgentSpawned { id } = event {
             assert_eq!(id, agent_id);

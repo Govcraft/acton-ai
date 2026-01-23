@@ -181,7 +181,10 @@ impl LLMError {
                 | LLMErrorKind::RateLimited { .. }
                 | LLMErrorKind::ModelOverloaded { .. }
                 | LLMErrorKind::Timeout { .. }
-                | LLMErrorKind::ApiError { status_code: 500..=599, .. }
+                | LLMErrorKind::ApiError {
+                    status_code: 500..=599,
+                    ..
+                }
         )
     }
 
@@ -244,7 +247,10 @@ impl fmt::Display for LLMError {
                 write!(f, "failed to parse API response: {}", message)
             }
             LLMErrorKind::ShuttingDown => {
-                write!(f, "LLM provider is shutting down; cannot accept new requests")
+                write!(
+                    f,
+                    "LLM provider is shutting down; cannot accept new requests"
+                )
             }
             LLMErrorKind::InvalidConfig { field, reason } => {
                 write!(f, "invalid configuration for '{}': {}", field, reason)
@@ -257,11 +263,7 @@ impl fmt::Display for LLMError {
                 )
             }
             LLMErrorKind::Timeout { duration } => {
-                write!(
-                    f,
-                    "request timed out after {} seconds",
-                    duration.as_secs()
-                )
+                write!(f, "request timed out after {} seconds", duration.as_secs())
             }
         }
     }

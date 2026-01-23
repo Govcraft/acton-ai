@@ -62,9 +62,9 @@ impl StubSandbox {
 impl Sandbox for StubSandbox {
     fn execute(&self, code: &str, args: Value) -> SandboxExecutionFuture {
         if self.destroyed {
-            return Box::pin(async move {
-                Err(ToolError::sandbox_error("sandbox has been destroyed"))
-            });
+            return Box::pin(
+                async move { Err(ToolError::sandbox_error("sandbox has been destroyed")) },
+            );
         }
 
         // Stub implementation just returns a placeholder response

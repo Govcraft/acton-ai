@@ -146,10 +146,7 @@ impl Embedding {
     /// Uses little-endian byte order for cross-platform compatibility.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
-        self.values
-            .iter()
-            .flat_map(|f| f.to_le_bytes())
-            .collect()
+        self.values.iter().flat_map(|f| f.to_le_bytes()).collect()
     }
 
     /// Creates an embedding from bytes.
@@ -356,7 +353,9 @@ impl EmbeddingProvider for StubEmbeddingProvider {
         let values: Vec<f32> = (0..self.dimension)
             .map(|i| {
                 // Simple PRNG using seed + index
-                let combined = seed.wrapping_add(i as u64).wrapping_mul(0x5851_f42d_4c95_7f2d);
+                let combined = seed
+                    .wrapping_add(i as u64)
+                    .wrapping_mul(0x5851_f42d_4c95_7f2d);
                 // Map to [-1, 1] range using sin for smooth distribution
                 ((combined as f64 / u64::MAX as f64) * std::f64::consts::PI * 2.0).sin() as f32
             })
@@ -563,7 +562,12 @@ mod tests {
         let normalized = a.normalize();
 
         // Magnitude should be 1
-        let magnitude: f32 = normalized.values().iter().map(|x| x * x).sum::<f32>().sqrt();
+        let magnitude: f32 = normalized
+            .values()
+            .iter()
+            .map(|x| x * x)
+            .sum::<f32>()
+            .sqrt();
         assert!((magnitude - 1.0).abs() < 0.0001);
 
         // Should be [0.6, 0.8]

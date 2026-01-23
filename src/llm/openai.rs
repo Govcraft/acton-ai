@@ -425,9 +425,10 @@ impl LLMClient for OpenAIClient {
             .await
             .map_err(|e| LLMError::parse_error(format!("failed to parse response: {}", e)))?;
 
-        let choice = completion.choices.first().ok_or_else(|| {
-            LLMError::parse_error("response contained no choices".to_string())
-        })?;
+        let choice = completion
+            .choices
+            .first()
+            .ok_or_else(|| LLMError::parse_error("response contained no choices".to_string()))?;
 
         let content = choice.message.content.clone().unwrap_or_default();
 
@@ -526,9 +527,8 @@ impl LLMClient for OpenAIClient {
                                             for delta in tool_deltas {
                                                 let mut accumulators =
                                                     tool_call_accumulators.lock().unwrap();
-                                                let acc = accumulators
-                                                    .entry(delta.index)
-                                                    .or_default();
+                                                let acc =
+                                                    accumulators.entry(delta.index).or_default();
 
                                                 if let Some(id) = delta.id {
                                                     acc.id = Some(id);
@@ -551,8 +551,7 @@ impl LLMClient for OpenAIClient {
                                             let accumulators =
                                                 tool_call_accumulators.lock().unwrap();
                                             for acc in accumulators.values() {
-                                                if let (Some(id), Some(name)) =
-                                                    (&acc.id, &acc.name)
+                                                if let (Some(id), Some(name)) = (&acc.id, &acc.name)
                                                 {
                                                     let arguments: serde_json::Value =
                                                         serde_json::from_str(&acc.arguments)
@@ -569,9 +568,7 @@ impl LLMClient for OpenAIClient {
                                             }
 
                                             events.push(Ok(LLMStreamEvent::End {
-                                                stop_reason: Self::parse_stop_reason(
-                                                    Some(reason),
-                                                ),
+                                                stop_reason: Self::parse_stop_reason(Some(reason)),
                                             }));
                                         }
                                     }
@@ -671,7 +668,10 @@ mod tests {
 
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, "system");
-        assert_eq!(api_messages[0].content, Some("You are helpful.".to_string()));
+        assert_eq!(
+            api_messages[0].content,
+            Some("You are helpful.".to_string())
+        );
     }
 
     #[test]
@@ -715,7 +715,10 @@ mod tests {
         assert_eq!(api_messages.len(), 1);
         assert_eq!(api_messages[0].role, "tool");
         assert_eq!(api_messages[0].tool_call_id, Some("tc_123".to_string()));
-        assert_eq!(api_messages[0].content, Some("Search results...".to_string()));
+        assert_eq!(
+            api_messages[0].content,
+            Some("Search results...".to_string())
+        );
     }
 
     #[test]

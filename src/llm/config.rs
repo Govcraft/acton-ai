@@ -555,16 +555,15 @@ mod tests {
 
     #[test]
     fn provider_config_with_provider_type() {
-        let config = ProviderConfig::anthropic("test-key")
-            .with_provider_type(ProviderType::ollama());
+        let config =
+            ProviderConfig::anthropic("test-key").with_provider_type(ProviderType::ollama());
 
         assert!(matches!(config.provider_type, ProviderType::OpenAI { .. }));
     }
 
     #[test]
     fn provider_config_with_api_key() {
-        let config = ProviderConfig::ollama("llama3.2")
-            .with_api_key("new-key");
+        let config = ProviderConfig::ollama("llama3.2").with_api_key("new-key");
 
         assert_eq!(config.api_key, "new-key");
     }

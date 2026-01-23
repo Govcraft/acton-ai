@@ -27,7 +27,11 @@ async fn main() {
 
     // Example: spawn an agent
     let agent_config = AgentConfig::new("You are a helpful assistant.");
-    kernel_handle.send(SpawnAgent { config: agent_config }).await;
+    kernel_handle
+        .send(SpawnAgent {
+            config: agent_config,
+        })
+        .await;
 
     // Keep running until interrupted
     tracing::info!("Acton-AI is running. Press Ctrl+C to shutdown.");

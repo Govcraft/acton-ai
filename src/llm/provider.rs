@@ -203,7 +203,11 @@ impl LLMProvider {
         let handle = builder.start().await;
 
         // Initialize with config
-        handle.send(InitLLMProvider { config: provider_config }).await;
+        handle
+            .send(InitLLMProvider {
+                config: provider_config,
+            })
+            .await;
 
         handle
     }
@@ -221,10 +225,8 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 ProviderType::Anthropic => {
                     AnthropicClient::new(config.clone()).map(|c| Arc::new(c) as Arc<dyn LLMClient>)
                 }
-                ProviderType::OpenAI { base_url } => {
-                    OpenAIClient::new(base_url.clone(), &config)
-                        .map(|c| Arc::new(c) as Arc<dyn LLMClient>)
-                }
+                ProviderType::OpenAI { base_url } => OpenAIClient::new(base_url.clone(), &config)
+                    .map(|c| Arc::new(c) as Arc<dyn LLMClient>),
             };
 
         match client_result {
@@ -379,7 +381,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 let broker = actor.broker().clone();
                 let request = pending.request;
 
-                actor.model.rate_limiter.record_request(estimate_tokens(&request));
+                actor
+                    .model
+                    .rate_limiter
+                    .record_request(estimate_tokens(&request));
                 actor.model.metrics.requests_total += 1;
 
                 // Spawn the request processing
@@ -448,7 +453,10 @@ async fn process_streaming_request(
         .await;
 
     // Start streaming request
-    match client.send_streaming_request(&request.messages, tools).await {
+    match client
+        .send_streaming_request(&request.messages, tools)
+        .await
+    {
         Ok(mut stream) => {
             let mut accumulated_text = String::new();
             let mut tool_calls = Vec::new();
@@ -614,11 +622,7 @@ async fn process_non_streaming_request(
 /// Estimates the number of tokens in a request.
 fn estimate_tokens(request: &LLMRequest) -> u32 {
     // Rough estimate: 4 characters per token
-    let char_count: usize = request
-        .messages
-        .iter()
-        .map(|m| m.content.len())
-        .sum();
+    let char_count: usize = request.messages.iter().map(|m| m.content.len()).sum();
 
     (char_count / 4) as u32
 }

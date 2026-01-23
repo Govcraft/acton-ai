@@ -124,17 +124,10 @@ impl fmt::Display for KernelError {
                 )
             }
             KernelErrorKind::ShuttingDown => {
-                write!(
-                    f,
-                    "kernel is shutting down; cannot accept new requests"
-                )
+                write!(f, "kernel is shutting down; cannot accept new requests")
             }
             KernelErrorKind::InvalidConfig { field, reason } => {
-                write!(
-                    f,
-                    "invalid configuration for '{}': {}",
-                    field, reason
-                )
+                write!(f, "invalid configuration for '{}': {}", field, reason)
             }
         }
     }
@@ -289,11 +282,7 @@ impl fmt::Display for AgentError {
 
         match &self.kind {
             AgentErrorKind::InvalidState { current, expected } => {
-                write!(
-                    f,
-                    "invalid state '{}'; expected {}",
-                    current, expected
-                )
+                write!(f, "invalid state '{}'; expected {}", current, expected)
             }
             AgentErrorKind::ProcessingFailed { reason } => {
                 write!(f, "message processing failed: {}", reason)
@@ -302,21 +291,13 @@ impl fmt::Display for AgentError {
                 write!(f, "LLM request failed: {}", reason)
             }
             AgentErrorKind::ToolExecutionFailed { tool_name, reason } => {
-                write!(
-                    f,
-                    "tool '{}' execution failed: {}",
-                    tool_name, reason
-                )
+                write!(f, "tool '{}' execution failed: {}", tool_name, reason)
             }
             AgentErrorKind::Stopping => {
                 write!(f, "agent is stopping and cannot process new messages")
             }
             AgentErrorKind::InvalidConfig { field, reason } => {
-                write!(
-                    f,
-                    "invalid configuration for '{}': {}",
-                    field, reason
-                )
+                write!(f, "invalid configuration for '{}': {}", field, reason)
             }
         }
     }
@@ -522,7 +503,8 @@ mod tests {
     #[test]
     fn agent_error_with_agent_id_display() {
         let agent_id = AgentId::new();
-        let error = AgentError::invalid_state(Some(agent_id.clone()), "Idle", "Thinking or Executing");
+        let error =
+            AgentError::invalid_state(Some(agent_id.clone()), "Idle", "Thinking or Executing");
 
         let message = error.to_string();
         assert!(message.contains(&agent_id.to_string()));
@@ -550,11 +532,8 @@ mod tests {
     #[test]
     fn agent_error_tool_execution_failed() {
         let agent_id = AgentId::new();
-        let error = AgentError::tool_execution_failed(
-            Some(agent_id),
-            "web_search",
-            "connection timeout",
-        );
+        let error =
+            AgentError::tool_execution_failed(Some(agent_id), "web_search", "connection timeout");
 
         let message = error.to_string();
         assert!(message.contains("web_search"));

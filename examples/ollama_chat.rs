@@ -112,7 +112,7 @@ async fn main() -> anyhow::Result<()> {
         agent_id,
         messages: vec![
             Message::system("You are a helpful assistant. Be concise."),
-            Message::user("What is the capital of France? Answer in one sentence."),
+            Message::user("What is the capital of France? Answer in three sentences."),
         ],
         tools: None,
     };
@@ -126,7 +126,7 @@ async fn main() -> anyhow::Result<()> {
     std::io::stdout().flush().ok();
 
     // Wait for response
-    tokio::time::sleep(Duration::from_secs(30)).await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     // Print final response
     let final_response = response_buffer.lock().await;

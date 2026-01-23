@@ -82,7 +82,10 @@ impl Kernel {
     /// # Returns
     ///
     /// The ActorHandle for the started Kernel actor.
-    pub async fn spawn_with_config(runtime: &mut ActorRuntime, config: KernelConfig) -> ActorHandle {
+    pub async fn spawn_with_config(
+        runtime: &mut ActorRuntime,
+        config: KernelConfig,
+    ) -> ActorHandle {
         // Initialize file logging before any tracing calls
         if let Some(ref logging_config) = config.logging {
             match init_and_store_logging(logging_config) {
@@ -139,7 +142,11 @@ impl Kernel {
         let handle = builder.start().await;
 
         // Initialize kernel with config
-        handle.send(InitKernel { config: kernel_config }).await;
+        handle
+            .send(InitKernel {
+                config: kernel_config,
+            })
+            .await;
 
         handle
     }
@@ -205,7 +212,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
                 })
                 .await;
 
-            reply.send(AgentSpawned { agent_id: spawned_id }).await;
+            reply
+                .send(AgentSpawned {
+                    agent_id: spawned_id,
+                })
+                .await;
         })
     });
 
@@ -342,7 +353,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
             })
         } else {
             tracing::warn!(to = %msg.to, "Target agent not found for message");
-            Reply::try_err(crate::error::MultiAgentError::agent_not_found(msg.to.clone()))
+            Reply::try_err(crate::error::MultiAgentError::agent_not_found(
+                msg.to.clone(),
+            ))
         }
     });
 
@@ -371,7 +384,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
             })
         } else {
             tracing::warn!(to = %msg.to, "Target agent not found for task delegation");
-            Reply::try_err(crate::error::MultiAgentError::agent_not_found(msg.to.clone()))
+            Reply::try_err(crate::error::MultiAgentError::agent_not_found(
+                msg.to.clone(),
+            ))
         }
     });
 

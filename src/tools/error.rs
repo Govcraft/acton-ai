@@ -203,7 +203,10 @@ impl fmt::Display for ToolError {
             ToolErrorKind::ExecutionFailed { tool_name, reason } => {
                 write!(f, "tool '{}' execution failed: {}", tool_name, reason)
             }
-            ToolErrorKind::Timeout { tool_name, duration } => {
+            ToolErrorKind::Timeout {
+                tool_name,
+                duration,
+            } => {
                 write!(
                     f,
                     "tool '{}' timed out after {} seconds",

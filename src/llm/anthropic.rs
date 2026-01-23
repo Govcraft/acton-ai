@@ -438,9 +438,7 @@ impl AnthropicClient {
 
         if let Ok(api_error) = serde_json::from_str::<ApiErrorResponse>(&error_body) {
             match api_error.error.error_type.as_str() {
-                "authentication_error" => {
-                    LLMError::authentication_failed(&api_error.error.message)
-                }
+                "authentication_error" => LLMError::authentication_failed(&api_error.error.message),
                 "invalid_request_error" => LLMError::invalid_request(&api_error.error.message),
                 "overloaded_error" => LLMError::model_overloaded(&self.config.model),
                 _ => LLMError::api_error(
@@ -643,13 +641,11 @@ fn convert_anthropic_stream(
                 StreamEvent::ContentBlockDelta { text, .. } => {
                     text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
                 }
-                StreamEvent::MessageDelta { stop_reason } => {
-                    stop_reason.map(|reason| {
-                        Ok(LLMStreamEvent::End {
-                            stop_reason: parse_stop_reason(&reason),
-                        })
+                StreamEvent::MessageDelta { stop_reason } => stop_reason.map(|reason| {
+                    Ok(LLMStreamEvent::End {
+                        stop_reason: parse_stop_reason(&reason),
                     })
-                }
+                }),
                 StreamEvent::MessageStop => Some(Ok(LLMStreamEvent::End {
                     stop_reason: StopReason::EndTurn,
                 })),
@@ -741,10 +737,7 @@ mod tests {
         let config = ProviderConfig::new("test-key");
         let client = AnthropicClient::new(config).unwrap();
 
-        let messages = vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ];
+        let messages = vec![Message::system("You are helpful"), Message::user("Hello")];
 
         let (system, api_messages) = client.convert_messages(&messages);
 

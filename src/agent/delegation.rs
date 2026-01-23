@@ -313,8 +313,7 @@ mod tests {
         let task_id = TaskId::new();
         let agent_id = AgentId::new();
 
-        let task =
-            DelegatedTask::new(task_id.clone(), agent_id.clone(), "code_review".to_string());
+        let task = DelegatedTask::new(task_id.clone(), agent_id.clone(), "code_review".to_string());
         tracker.track_outgoing(task);
 
         assert!(tracker.get_outgoing(&task_id).is_some());
@@ -332,7 +331,11 @@ mod tests {
         let task_id = TaskId::new();
         let from_agent = AgentId::new();
 
-        tracker.track_incoming(task_id.clone(), from_agent.clone(), "code_review".to_string());
+        tracker.track_incoming(
+            task_id.clone(),
+            from_agent.clone(),
+            "code_review".to_string(),
+        );
 
         assert!(tracker.get_incoming(&task_id).is_some());
         assert_eq!(tracker.pending_incoming_count(), 1);

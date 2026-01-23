@@ -460,7 +460,10 @@ pub async fn delete_conversation(
 /// # Errors
 ///
 /// Returns an error if the delete fails.
-pub async fn delete_agent_state(conn: &Connection, agent_id: &AgentId) -> Result<(), PersistenceError> {
+pub async fn delete_agent_state(
+    conn: &Connection,
+    agent_id: &AgentId,
+) -> Result<(), PersistenceError> {
     conn.execute(
         "DELETE FROM agent_state WHERE agent_id = ?1",
         [agent_id.to_string()],
@@ -753,7 +756,10 @@ pub async fn load_memories_for_agent(
 /// # Errors
 ///
 /// Returns an error if the delete fails.
-pub async fn delete_memory(conn: &Connection, memory_id: &MemoryId) -> Result<(), PersistenceError> {
+pub async fn delete_memory(
+    conn: &Connection,
+    memory_id: &MemoryId,
+) -> Result<(), PersistenceError> {
     conn.execute(
         "DELETE FROM memories WHERE id = ?1",
         [memory_id.to_string()],

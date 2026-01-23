@@ -590,10 +590,10 @@ mod tests {
         let window = ContextWindow::new(config);
 
         let messages = vec![
-            msg(MessageRole::System, "sys"),                // Small, should be kept
-            msg(MessageRole::User, &"a".repeat(200)),       // Will be dropped
-            msg(MessageRole::Assistant, &"b".repeat(200)),  // Will be dropped
-            msg(MessageRole::User, &"c".repeat(50)),        // Should fit
+            msg(MessageRole::System, "sys"),          // Small, should be kept
+            msg(MessageRole::User, &"a".repeat(200)), // Will be dropped
+            msg(MessageRole::Assistant, &"b".repeat(200)), // Will be dropped
+            msg(MessageRole::User, &"c".repeat(50)),  // Should fit
         ];
 
         let fitted = window.fit_messages(&messages);
@@ -746,7 +746,10 @@ mod tests {
 
     #[test]
     fn truncation_strategy_equality() {
-        assert_eq!(TruncationStrategy::KeepRecent, TruncationStrategy::KeepRecent);
+        assert_eq!(
+            TruncationStrategy::KeepRecent,
+            TruncationStrategy::KeepRecent
+        );
         assert_ne!(
             TruncationStrategy::KeepRecent,
             TruncationStrategy::KeepSystemAndRecent

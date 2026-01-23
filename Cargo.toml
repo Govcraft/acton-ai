@@ -34,9 +34,6 @@ libsql = "0.9"
 dirs = "6"
 tracing-appender = "0.2"
 
-# Persistence (deferred to Phase 4, but adding now)
-# libsql = "0.6"
-
 [dev-dependencies]
 anyhow = "1.0.100"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

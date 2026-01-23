@@ -7,9 +7,9 @@ use crate::agent::delegation::DelegationTracker;
 use crate::agent::{AgentConfig, AgentState};
 use crate::llm::StreamAccumulator;
 use crate::messages::{
-    AgentStatusResponse, GetAgentStatus, GetStatus, IncomingAgentMessage, IncomingTask,
-    LLMRequest, LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall,
-    Message, StopReason, TaskAccepted, TaskCompleted, TaskFailed, UserPrompt,
+    AgentStatusResponse, GetAgentStatus, GetStatus, IncomingAgentMessage, IncomingTask, LLMRequest,
+    LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
+    StopReason, TaskAccepted, TaskCompleted, TaskFailed, UserPrompt,
 };
 use crate::types::{AgentId, CorrelationId};
 use acton_reactive::prelude::*;
@@ -239,7 +239,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         );
 
         // Start accumulating the stream
-        actor.model.stream_accumulator.start_stream(&msg.correlation_id);
+        actor
+            .model
+            .stream_accumulator
+            .start_stream(&msg.correlation_id);
 
         Reply::ready()
     });
@@ -255,7 +258,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         }
 
         // Append token to accumulator
-        actor.model.stream_accumulator.append_token(&msg.correlation_id, &msg.token);
+        actor
+            .model
+            .stream_accumulator
+            .append_token(&msg.correlation_id, &msg.token);
 
         tracing::trace!(
             agent_id = ?actor.model.id,
@@ -346,10 +352,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 // Stream was never started or already ended - this is an error
                 return Reply::try_err(crate::error::AgentError::processing_failed(
                     actor.model.id.clone(),
-                    format!(
-                        "No active stream for correlation_id {}",
-                        msg.correlation_id
-                    ),
+                    format!("No active stream for correlation_id {}", msg.correlation_id),
                 ));
             };
 
@@ -362,7 +365,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 // Transition to Executing state for tool calls
                 actor.model.state = AgentState::Executing;
             } else {
-                actor.model.add_message(Message::assistant(stream.content.clone()));
+                actor
+                    .model
+                    .add_message(Message::assistant(stream.content.clone()));
                 // Return to Idle state (or Completed based on stop reason)
                 actor.model.state = match msg.stop_reason {
                     StopReason::MaxTokens => AgentState::Completed,
@@ -413,7 +418,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         }
 
         // If we already processed via streaming, skip the complete response
-        if actor.model.stream_accumulator.get_stream(&msg.correlation_id).is_some() {
+        if actor
+            .model
+            .stream_accumulator
+            .get_stream(&msg.correlation_id)
+            .is_some()
+        {
             return Reply::ready();
         }
 
@@ -432,7 +442,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
             ));
             actor.model.state = AgentState::Executing;
         } else {
-            actor.model.add_message(Message::assistant(msg.content.clone()));
+            actor
+                .model
+                .add_message(Message::assistant(msg.content.clone()));
             actor.model.state = match msg.stop_reason {
                 StopReason::MaxTokens => AgentState::Completed,
                 _ => AgentState::Idle,
@@ -538,7 +550,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
     builder.mutate_on::<TaskAccepted>(|actor, envelope| {
         let msg = envelope.message();
 
-        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+        if let Some(task) = actor
+            .model
+            .delegation_tracker
+            .get_outgoing_mut(&msg.task_id)
+        {
             task.accept();
             tracing::debug!(
                 task_id = %msg.task_id,
@@ -554,7 +570,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
     builder.mutate_on::<TaskCompleted>(|actor, envelope| {
         let msg = envelope.message();
 
-        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+        if let Some(task) = actor
+            .model
+            .delegation_tracker
+            .get_outgoing_mut(&msg.task_id)
+        {
             task.complete(msg.result.clone());
             tracing::info!(
                 task_id = %msg.task_id,
@@ -569,7 +589,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
     builder.mutate_on::<TaskFailed>(|actor, envelope| {
         let msg = envelope.message();
 
-        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+        if let Some(task) = actor
+            .model
+            .delegation_tracker
+            .get_outgoing_mut(&msg.task_id)
+        {
             task.fail(&msg.error);
             tracing::warn!(
                 task_id = %msg.task_id,

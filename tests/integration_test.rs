@@ -18,7 +18,11 @@ async fn test_spawn_kernel() {
 
     // The kernel should have a valid handle - check that root is "kernel"
     let id_str = kernel_handle.id().root.to_string();
-    assert!(id_str.contains("kernel"), "Expected kernel in id: {}", id_str);
+    assert!(
+        id_str.contains("kernel"),
+        "Expected kernel in id: {}",
+        id_str
+    );
 
     // Graceful shutdown
     runtime.shutdown_all().await.expect("Shutdown failed");
@@ -256,8 +260,7 @@ fn test_llm_error_types() {
 /// Test rate limit configuration.
 #[test]
 fn test_rate_limit_config() {
-    let config = RateLimitConfig::new(60, 50_000)
-        .with_max_queue_size(200);
+    let config = RateLimitConfig::new(60, 50_000).with_max_queue_size(200);
 
     assert_eq!(config.requests_per_minute, 60);
     assert_eq!(config.tokens_per_minute, 50_000);
@@ -277,10 +280,7 @@ fn test_llm_request_creation() {
     let request = LLMRequest {
         correlation_id: corr_id.clone(),
         agent_id: agent_id.clone(),
-        messages: vec![
-            Message::system("You are helpful"),
-            Message::user("Hello"),
-        ],
+        messages: vec![Message::system("You are helpful"), Message::user("Hello")],
         tools: None,
     };
 
@@ -382,7 +382,9 @@ fn test_stream_accumulator() {
     accumulator.append_token(&corr_id, "World");
 
     // End the stream
-    let stream = accumulator.end_stream(&corr_id, StopReason::EndTurn).unwrap();
+    let stream = accumulator
+        .end_stream(&corr_id, StopReason::EndTurn)
+        .unwrap();
     assert_eq!(stream.content, "Hello World");
     assert!(stream.is_ended());
     assert!(accumulator.is_empty());
@@ -647,7 +649,9 @@ async fn test_failing_tool_execution() {
 use acton_ai::memory::{
     AgentStateSnapshot, InitMemoryStore, MemoryStore, PersistenceConfig, PersistenceError,
 };
-use acton_ai::types::{ConversationId, InvalidConversationId, InvalidMemoryId, InvalidMessageId, MemoryId, MessageId};
+use acton_ai::types::{
+    ConversationId, InvalidConversationId, InvalidMemoryId, InvalidMessageId, MemoryId, MessageId,
+};
 
 /// Test ConversationId type.
 #[test]
@@ -1072,10 +1076,7 @@ fn test_build_context_with_memories() {
         Memory::new(agent_id, "User prefers concise answers."),
     ];
 
-    let conversation = vec![
-        Message::user("Hello!"),
-        Message::assistant("Hi there!"),
-    ];
+    let conversation = vec![Message::user("Hello!"), Message::assistant("Hi there!")];
 
     let context = window.build_context("You are a helpful assistant.", &memories, &conversation);
 
@@ -1093,10 +1094,10 @@ fn test_build_context_with_memories() {
 // Phase 6: Multi-Agent Tests
 // =============================================================================
 
-use acton_ai::types::{InvalidTaskId, TaskId};
 use acton_ai::agent::{DelegatedTask, DelegatedTaskState, DelegationTracker};
-use acton_ai::kernel::CapabilityRegistry;
 use acton_ai::error::{MultiAgentError, MultiAgentErrorKind};
+use acton_ai::kernel::CapabilityRegistry;
+use acton_ai::types::{InvalidTaskId, TaskId};
 
 /// Test TaskId type.
 #[test]

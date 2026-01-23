@@ -78,34 +78,34 @@ pub use persistence::{
 pub use store::{
     // Agent state messages
     AgentStateLoaded,
-    LoadAgentState,
-    SaveAgentState,
     // Context window messages
     ContextWindowResponse,
-    GetContextWindow,
     // Conversation messages
     ConversationCreated,
     ConversationList,
     ConversationLoaded,
     CreateConversation,
+    // Memory messages
+    DeleteAgentMemories,
     DeleteConversation,
+    DeleteMemory,
+    GetContextWindow,
     GetLatestConversation,
     InitMemoryStore,
     LatestConversationResponse,
     ListConversations,
+    LoadAgentState,
     LoadConversation,
-    // Memory messages
-    DeleteAgentMemories,
-    DeleteMemory,
     LoadMemories,
     MemoriesLoaded,
     MemorySearchResults,
-    MemoryStored,
     // Core store types
     MemoryStore,
     MemoryStoreMetrics,
+    MemoryStored,
     // Message store messages
     MessageSaved,
+    SaveAgentState,
     SaveMessage,
     SearchMemories,
     SharedConnection,

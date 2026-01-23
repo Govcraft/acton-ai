@@ -261,7 +261,9 @@ mod tests {
         accumulator.start_stream(&corr_id);
         accumulator.append_token(&corr_id, "Test content");
 
-        let stream = accumulator.end_stream(&corr_id, StopReason::EndTurn).unwrap();
+        let stream = accumulator
+            .end_stream(&corr_id, StopReason::EndTurn)
+            .unwrap();
 
         assert_eq!(stream.content, "Test content");
         assert!(stream.is_ended());
