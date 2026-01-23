@@ -4,9 +4,12 @@
 //! Acton-AI system. It manages agent lifecycles, routes inter-agent
 //! communication, and handles agent failures through supervision.
 
+use crate::kernel::discovery::CapabilityRegistry;
 use crate::kernel::KernelConfig;
 use crate::messages::{
-    AgentSpawned, GetAgentStatus, RouteMessage, SpawnAgent, StopAgent, SystemEvent,
+    AgentMessage, AgentSpawned, AnnounceCapabilities, CapableAgentFound, DelegateTask,
+    FindCapableAgent, GetAgentStatus, IncomingAgentMessage, IncomingTask, RouteMessage, SpawnAgent,
+    StopAgent, SystemEvent,
 };
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -43,6 +46,8 @@ pub struct Kernel {
     pub metrics: KernelMetrics,
     /// Whether the kernel is shutting down
     pub shutting_down: bool,
+    /// Registry of agent capabilities for discovery
+    pub capability_registry: CapabilityRegistry,
 }
 
 impl Kernel {
@@ -279,6 +284,112 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
         // For now, this is a placeholder for supervision handling
 
         Reply::ready()
+    });
+
+    // =========================================================================
+    // Multi-Agent Message Handlers (Phase 6)
+    // =========================================================================
+
+    // Handle AgentMessage - route to target agent
+    builder.try_mutate_on::<AgentMessage, (), crate::error::MultiAgentError>(|actor, envelope| {
+        let msg = envelope.message();
+        let to_str = msg.to.to_string();
+
+        // Check if target agent exists
+        if let Some(target_handle) = actor.model.agents.get(&to_str) {
+            let handle = target_handle.clone();
+            let incoming = IncomingAgentMessage::from(msg.clone());
+
+            tracing::debug!(
+                from = %msg.from,
+                to = %msg.to,
+                "Routing agent message"
+            );
+
+            actor.model.metrics.messages_routed += 1;
+
+            Reply::try_pending(async move {
+                handle.send(incoming).await;
+                Ok(())
+            })
+        } else {
+            tracing::warn!(to = %msg.to, "Target agent not found for message");
+            Reply::try_err(crate::error::MultiAgentError::agent_not_found(msg.to.clone()))
+        }
+    });
+
+    // Handle DelegateTask - route to target agent
+    builder.try_mutate_on::<DelegateTask, (), crate::error::MultiAgentError>(|actor, envelope| {
+        let msg = envelope.message();
+        let to_str = msg.to.to_string();
+
+        if let Some(target_handle) = actor.model.agents.get(&to_str) {
+            let handle = target_handle.clone();
+            let incoming = IncomingTask::from_delegate(msg);
+
+            tracing::info!(
+                from = %msg.from,
+                to = %msg.to,
+                task_id = %msg.task_id,
+                task_type = %msg.task_type,
+                "Routing task delegation"
+            );
+
+            actor.model.metrics.messages_routed += 1;
+
+            Reply::try_pending(async move {
+                handle.send(incoming).await;
+                Ok(())
+            })
+        } else {
+            tracing::warn!(to = %msg.to, "Target agent not found for task delegation");
+            Reply::try_err(crate::error::MultiAgentError::agent_not_found(msg.to.clone()))
+        }
+    });
+
+    // Handle AnnounceCapabilities - update capability registry
+    builder.mutate_on::<AnnounceCapabilities>(|actor, envelope| {
+        let msg = envelope.message();
+
+        actor
+            .model
+            .capability_registry
+            .register(msg.agent_id.clone(), msg.capabilities.clone());
+
+        tracing::info!(
+            agent_id = %msg.agent_id,
+            capabilities = ?msg.capabilities,
+            "Agent capabilities registered"
+        );
+
+        Reply::ready()
+    });
+
+    // Handle FindCapableAgent - search capability registry
+    builder.act_on::<FindCapableAgent>(|actor, envelope| {
+        let msg = envelope.message();
+        let reply = envelope.reply_envelope();
+
+        let agent_id = actor
+            .model
+            .capability_registry
+            .find_capable_agent(&msg.capability);
+
+        tracing::debug!(
+            capability = %msg.capability,
+            found = agent_id.is_some(),
+            "Capability search"
+        );
+
+        let response = CapableAgentFound {
+            correlation_id: msg.correlation_id.clone(),
+            agent_id,
+            capability: msg.capability.clone(),
+        };
+
+        Reply::pending(async move {
+            reply.send(response).await;
+        })
     });
 }
 

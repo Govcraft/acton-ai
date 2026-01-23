@@ -324,6 +324,159 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
+/// Errors that can occur in multi-agent operations.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultiAgentError {
+    /// The specific error that occurred
+    pub kind: MultiAgentErrorKind,
+}
+
+/// Specific multi-agent error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MultiAgentErrorKind {
+    /// Target agent not found for message routing
+    AgentNotFound {
+        /// The ID of the agent that was not found
+        agent_id: crate::types::AgentId,
+    },
+    /// Task with the given ID not found
+    TaskNotFound {
+        /// The ID of the task that was not found
+        task_id: crate::types::TaskId,
+    },
+    /// Task was already accepted
+    TaskAlreadyAccepted {
+        /// The ID of the task
+        task_id: crate::types::TaskId,
+    },
+    /// No agent found with the required capability
+    NoCapableAgent {
+        /// The capability that was searched for
+        capability: String,
+    },
+    /// Task delegation failed
+    DelegationFailed {
+        /// The task ID
+        task_id: crate::types::TaskId,
+        /// The reason for failure
+        reason: String,
+    },
+    /// Message routing failed
+    RoutingFailed {
+        /// The target agent
+        to: crate::types::AgentId,
+        /// The reason for failure
+        reason: String,
+    },
+}
+
+impl MultiAgentError {
+    /// Creates a new MultiAgentError with the given kind.
+    #[must_use]
+    pub fn new(kind: MultiAgentErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Creates an agent not found error.
+    #[must_use]
+    pub fn agent_not_found(agent_id: crate::types::AgentId) -> Self {
+        Self::new(MultiAgentErrorKind::AgentNotFound { agent_id })
+    }
+
+    /// Creates a task not found error.
+    #[must_use]
+    pub fn task_not_found(task_id: crate::types::TaskId) -> Self {
+        Self::new(MultiAgentErrorKind::TaskNotFound { task_id })
+    }
+
+    /// Creates a task already accepted error.
+    #[must_use]
+    pub fn task_already_accepted(task_id: crate::types::TaskId) -> Self {
+        Self::new(MultiAgentErrorKind::TaskAlreadyAccepted { task_id })
+    }
+
+    /// Creates a no capable agent error.
+    #[must_use]
+    pub fn no_capable_agent(capability: impl Into<String>) -> Self {
+        Self::new(MultiAgentErrorKind::NoCapableAgent {
+            capability: capability.into(),
+        })
+    }
+
+    /// Creates a delegation failed error.
+    #[must_use]
+    pub fn delegation_failed(task_id: crate::types::TaskId, reason: impl Into<String>) -> Self {
+        Self::new(MultiAgentErrorKind::DelegationFailed {
+            task_id,
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a routing failed error.
+    #[must_use]
+    pub fn routing_failed(to: crate::types::AgentId, reason: impl Into<String>) -> Self {
+        Self::new(MultiAgentErrorKind::RoutingFailed {
+            to,
+            reason: reason.into(),
+        })
+    }
+
+    /// Returns true if this error indicates an agent was not found.
+    #[must_use]
+    pub fn is_agent_not_found(&self) -> bool {
+        matches!(self.kind, MultiAgentErrorKind::AgentNotFound { .. })
+    }
+
+    /// Returns true if this error indicates no capable agent was found.
+    #[must_use]
+    pub fn is_no_capable_agent(&self) -> bool {
+        matches!(self.kind, MultiAgentErrorKind::NoCapableAgent { .. })
+    }
+}
+
+impl fmt::Display for MultiAgentError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            MultiAgentErrorKind::AgentNotFound { agent_id } => {
+                write!(
+                    f,
+                    "agent '{}' not found; verify the agent is running and registered",
+                    agent_id
+                )
+            }
+            MultiAgentErrorKind::TaskNotFound { task_id } => {
+                write!(
+                    f,
+                    "task '{}' not found; verify the task ID is correct",
+                    task_id
+                )
+            }
+            MultiAgentErrorKind::TaskAlreadyAccepted { task_id } => {
+                write!(
+                    f,
+                    "task '{}' was already accepted; cannot accept twice",
+                    task_id
+                )
+            }
+            MultiAgentErrorKind::NoCapableAgent { capability } => {
+                write!(
+                    f,
+                    "no agent found with capability '{}'; start an agent with this capability",
+                    capability
+                )
+            }
+            MultiAgentErrorKind::DelegationFailed { task_id, reason } => {
+                write!(f, "delegation of task '{}' failed: {}", task_id, reason)
+            }
+            MultiAgentErrorKind::RoutingFailed { to, reason } => {
+                write!(f, "message routing to agent '{}' failed: {}", to, reason)
+            }
+        }
+    }
+}
+
+impl std::error::Error for MultiAgentError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;

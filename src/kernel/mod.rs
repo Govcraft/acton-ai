@@ -6,6 +6,8 @@
 
 mod actor;
 mod config;
+mod discovery;
 
 pub use actor::{InitKernel, Kernel, KernelMetrics};
 pub use config::KernelConfig;
+pub use discovery::CapabilityRegistry;

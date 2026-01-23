@@ -5,8 +5,10 @@
 
 mod actor;
 mod config;
+mod delegation;
 mod state;
 
 pub use actor::{Agent, InitAgent, PendingLLMRequest};
 pub use config::AgentConfig;
+pub use delegation::{DelegatedTask, DelegatedTaskState, DelegationTracker, IncomingTaskInfo};
 pub use state::AgentState;

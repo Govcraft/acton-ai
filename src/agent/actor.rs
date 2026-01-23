@@ -3,11 +3,13 @@
 //! The Agent actor represents an individual AI agent with its own state,
 //! conversation history, and reasoning loop.
 
+use crate::agent::delegation::DelegationTracker;
 use crate::agent::{AgentConfig, AgentState};
 use crate::llm::StreamAccumulator;
 use crate::messages::{
-    AgentStatusResponse, GetAgentStatus, GetStatus, LLMRequest, LLMResponse, LLMStreamEnd,
-    LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message, StopReason, UserPrompt,
+    AgentStatusResponse, GetAgentStatus, GetStatus, IncomingAgentMessage, IncomingTask,
+    LLMRequest, LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall,
+    Message, StopReason, TaskAccepted, TaskCompleted, TaskFailed, UserPrompt,
 };
 use crate::types::{AgentId, CorrelationId};
 use acton_reactive::prelude::*;
@@ -54,6 +56,8 @@ pub struct Agent {
     pub pending_tools: HashMap<String, String>,
     /// Stream accumulator for receiving streamed responses
     pub stream_accumulator: StreamAccumulator,
+    /// Tracker for delegated tasks (both outgoing and incoming)
+    pub delegation_tracker: DelegationTracker,
 }
 
 impl Agent {
@@ -475,6 +479,106 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 })
                 .await;
         })
+    });
+
+    // =========================================================================
+    // Multi-Agent Message Handlers (Phase 6)
+    // =========================================================================
+
+    // Handle incoming messages from other agents
+    builder.mutate_on::<IncomingAgentMessage>(|actor, envelope| {
+        let msg = envelope.message();
+
+        tracing::info!(
+            agent_id = ?actor.model.id,
+            from = %msg.from,
+            content_len = msg.content.len(),
+            "Received message from another agent"
+        );
+
+        // Add to conversation as a user message (from another agent)
+        let content = format!("[From Agent {}]: {}", msg.from, msg.content);
+        actor.model.add_message(Message::user(content));
+
+        Reply::ready()
+    });
+
+    // Handle incoming task delegations
+    builder.mutate_on::<IncomingTask>(|actor, envelope| {
+        let msg = envelope.message();
+
+        tracing::info!(
+            agent_id = ?actor.model.id,
+            from = %msg.from,
+            task_id = %msg.task_id,
+            task_type = %msg.task_type,
+            "Received delegated task"
+        );
+
+        // Track the incoming task
+        actor.model.delegation_tracker.track_incoming(
+            msg.task_id.clone(),
+            msg.from.clone(),
+            msg.task_type.clone(),
+        );
+
+        // Auto-accept the task and broadcast TaskAccepted
+        actor.model.delegation_tracker.accept_incoming(&msg.task_id);
+
+        let broker = actor.broker().clone();
+        let agent_id = actor.model.id.clone().unwrap_or_default();
+        let task_id = msg.task_id.clone();
+
+        Reply::pending(async move {
+            broker.broadcast(TaskAccepted { task_id, agent_id }).await;
+        })
+    });
+
+    // Handle task acceptance notifications
+    builder.mutate_on::<TaskAccepted>(|actor, envelope| {
+        let msg = envelope.message();
+
+        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+            task.accept();
+            tracing::debug!(
+                task_id = %msg.task_id,
+                agent_id = %msg.agent_id,
+                "Delegated task accepted"
+            );
+        }
+
+        Reply::ready()
+    });
+
+    // Handle task completion notifications
+    builder.mutate_on::<TaskCompleted>(|actor, envelope| {
+        let msg = envelope.message();
+
+        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+            task.complete(msg.result.clone());
+            tracing::info!(
+                task_id = %msg.task_id,
+                "Delegated task completed"
+            );
+        }
+
+        Reply::ready()
+    });
+
+    // Handle task failure notifications
+    builder.mutate_on::<TaskFailed>(|actor, envelope| {
+        let msg = envelope.message();
+
+        if let Some(task) = actor.model.delegation_tracker.get_outgoing_mut(&msg.task_id) {
+            task.fail(&msg.error);
+            tracing::warn!(
+                task_id = %msg.task_id,
+                error = %msg.error,
+                "Delegated task failed"
+            );
+        }
+
+        Reply::ready()
     });
 }
 

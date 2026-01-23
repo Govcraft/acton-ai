@@ -39,9 +39,12 @@ pub mod types;
 
 /// Prelude module for convenient imports
 pub mod prelude {
-    pub use crate::agent::{Agent, AgentConfig, AgentState, InitAgent};
-    pub use crate::error::{AgentError, KernelError};
-    pub use crate::kernel::{InitKernel, Kernel, KernelConfig, KernelMetrics};
+    pub use crate::agent::{
+        Agent, AgentConfig, AgentState, DelegatedTask, DelegatedTaskState, DelegationTracker,
+        IncomingTaskInfo, InitAgent,
+    };
+    pub use crate::error::{AgentError, KernelError, MultiAgentError, MultiAgentErrorKind};
+    pub use crate::kernel::{CapabilityRegistry, InitKernel, Kernel, KernelConfig, KernelMetrics};
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMError, LLMErrorKind, LLMProvider, ProviderConfig,
         RateLimitConfig,
@@ -58,7 +61,10 @@ pub mod prelude {
         RegisterTool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind, ToolExecutorTrait,
         ToolRegistry,
     };
-    pub use crate::types::{AgentId, ConversationId, CorrelationId, MemoryId, MessageId, ToolName};
+    pub use crate::types::{
+        AgentId, ConversationId, CorrelationId, InvalidTaskId, MemoryId, MessageId, TaskId,
+        ToolName,
+    };
 
     // Re-export acton-reactive prelude
     pub use acton_reactive::prelude::*;

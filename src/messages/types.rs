@@ -3,7 +3,7 @@
 //! All messages implement Send + Sync + Debug + Clone + 'static as required by acton-reactive.
 
 use crate::agent::AgentConfig;
-use crate::types::{AgentId, CorrelationId};
+use crate::types::{AgentId, CorrelationId, TaskId};
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -374,6 +374,238 @@ pub enum SystemEvent {
         /// Seconds until retry is allowed
         retry_after_secs: u64,
     },
+}
+
+// =============================================================================
+// Multi-Agent Messages (Phase 6)
+// =============================================================================
+
+/// Direct message between agents.
+///
+/// Agents can send messages directly to other agents via the kernel's routing.
+/// The kernel forwards messages to the target agent.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct AgentMessage {
+    /// The agent sending the message
+    pub from: AgentId,
+    /// The target agent to receive the message
+    pub to: AgentId,
+    /// The message content
+    pub content: String,
+    /// Optional metadata (JSON value for extensibility)
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl AgentMessage {
+    /// Creates a new agent message.
+    #[must_use]
+    pub fn new(from: AgentId, to: AgentId, content: impl Into<String>) -> Self {
+        Self {
+            from,
+            to,
+            content: content.into(),
+            metadata: None,
+        }
+    }
+
+    /// Adds metadata to the message.
+    #[must_use]
+    pub fn with_metadata(mut self, metadata: serde_json::Value) -> Self {
+        self.metadata = Some(metadata);
+        self
+    }
+}
+
+/// Request to delegate a task to another agent.
+///
+/// The delegating agent creates this message to assign work to a specialist agent.
+/// The task_id serves as a correlation ID for tracking the result.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct DelegateTask {
+    /// The agent delegating the task
+    pub from: AgentId,
+    /// The agent to perform the task
+    pub to: AgentId,
+    /// Unique identifier for this task
+    pub task_id: TaskId,
+    /// The type of task (e.g., "code_review", "summarize", "translate")
+    pub task_type: String,
+    /// Task payload as JSON
+    pub payload: serde_json::Value,
+    /// Optional deadline for the task
+    pub deadline: Option<std::time::Duration>,
+}
+
+impl DelegateTask {
+    /// Creates a new task delegation.
+    #[must_use]
+    pub fn new(
+        from: AgentId,
+        to: AgentId,
+        task_type: impl Into<String>,
+        payload: serde_json::Value,
+    ) -> Self {
+        Self {
+            from,
+            to,
+            task_id: TaskId::new(),
+            task_type: task_type.into(),
+            payload,
+            deadline: None,
+        }
+    }
+
+    /// Sets a deadline for task completion.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: std::time::Duration) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+}
+
+/// Acknowledgment that a task was accepted.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct TaskAccepted {
+    /// The task that was accepted
+    pub task_id: TaskId,
+    /// The agent that accepted the task
+    pub agent_id: AgentId,
+}
+
+/// Notification that a delegated task completed successfully.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct TaskCompleted {
+    /// The task that completed
+    pub task_id: TaskId,
+    /// The result of the task as JSON
+    pub result: serde_json::Value,
+}
+
+/// Notification that a delegated task failed.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct TaskFailed {
+    /// The task that failed
+    pub task_id: TaskId,
+    /// The error message
+    pub error: String,
+}
+
+/// Announcement of agent capabilities for discovery.
+///
+/// Agents broadcast this message to announce what they can do.
+/// Other agents or the kernel can track these capabilities.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct AnnounceCapabilities {
+    /// The agent announcing its capabilities
+    pub agent_id: AgentId,
+    /// List of capability strings (e.g., "code_review", "translation", "summarization")
+    pub capabilities: Vec<String>,
+}
+
+impl AnnounceCapabilities {
+    /// Creates a new capability announcement.
+    #[must_use]
+    pub fn new(agent_id: AgentId, capabilities: Vec<String>) -> Self {
+        Self {
+            agent_id,
+            capabilities,
+        }
+    }
+}
+
+/// Request to find an agent with a specific capability.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct FindCapableAgent {
+    /// The capability to search for
+    pub capability: String,
+    /// Correlation ID for the response
+    pub correlation_id: CorrelationId,
+}
+
+impl FindCapableAgent {
+    /// Creates a new capability search request.
+    #[must_use]
+    pub fn new(capability: impl Into<String>) -> Self {
+        Self {
+            capability: capability.into(),
+            correlation_id: CorrelationId::new(),
+        }
+    }
+}
+
+/// Response to a capability search request.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct CapableAgentFound {
+    /// The correlation ID from the request
+    pub correlation_id: CorrelationId,
+    /// The agent with the capability, if found
+    pub agent_id: Option<AgentId>,
+    /// The capability that was searched for
+    pub capability: String,
+}
+
+/// Incoming message from another agent (delivered to agent).
+///
+/// This is what an agent receives when another agent sends it a message.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct IncomingAgentMessage {
+    /// The agent that sent the message
+    pub from: AgentId,
+    /// The message content
+    pub content: String,
+    /// Optional metadata
+    pub metadata: Option<serde_json::Value>,
+}
+
+impl From<AgentMessage> for IncomingAgentMessage {
+    fn from(msg: AgentMessage) -> Self {
+        Self {
+            from: msg.from,
+            content: msg.content,
+            metadata: msg.metadata,
+        }
+    }
+}
+
+/// Incoming task delegation (delivered to agent).
+///
+/// This is what an agent receives when another agent delegates a task to it.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct IncomingTask {
+    /// The agent that delegated the task
+    pub from: AgentId,
+    /// The task identifier
+    pub task_id: TaskId,
+    /// The type of task
+    pub task_type: String,
+    /// The task payload
+    pub payload: serde_json::Value,
+    /// Optional deadline
+    pub deadline: Option<std::time::Duration>,
+}
+
+impl IncomingTask {
+    /// Creates an IncomingTask from a DelegateTask message.
+    #[must_use]
+    pub fn from_delegate(msg: &DelegateTask) -> Self {
+        Self {
+            from: msg.from.clone(),
+            task_id: msg.task_id.clone(),
+            task_type: msg.task_type.clone(),
+            payload: msg.payload.clone(),
+            deadline: msg.deadline,
+        }
+    }
 }
 
 #[cfg(test)]
