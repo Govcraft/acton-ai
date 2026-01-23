@@ -14,8 +14,12 @@
 //!
 //! ```bash
 //! export OLLAMA_URL="http://localhost:11434/v1"
-//! export OLLAMA_MODEL="qwen2.5:7b"
+//! export OLLAMA_MODEL="qwen2.5:7b"  # 7b+ recommended for tool calling
 //! ```
+//!
+//! **Note:** This example uses tool calling for exit detection. Smaller models
+//! (3b and below) may not handle tool calling reliably. Use 7b+ models for
+//! best results.
 //!
 //! # Usage
 //!
