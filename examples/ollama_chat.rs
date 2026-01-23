@@ -22,11 +22,13 @@ use tokio::sync::Notify;
 const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// A simple response collector that subscribes to LLM events.
-/// Uses actor state to collect tokens - no mutex needed!
+/// Uses actor state to collect tokens and drive the spinner animation.
 #[acton_actor]
 struct ResponseCollector {
     /// Buffer to collect streamed tokens
     buffer: String,
+    /// Current spinner frame (advanced by each token)
+    frame: usize,
 }
 
 #[tokio::main]
@@ -81,9 +83,26 @@ async fn main() -> anyhow::Result<()> {
         Reply::ready()
     });
 
-    // Handle streaming tokens - silently append to actor's buffer
+    // Handle stream start - show initial spinner
+    collector.mutate_on::<LLMStreamStart>(|actor, envelope| {
+        tracing::info!("[Stream started: {}]", envelope.message().correlation_id);
+        print!(
+            "\r{} Thinking...",
+            SPINNER[actor.model.frame % SPINNER.len()]
+        );
+        std::io::stdout().flush().ok();
+        Reply::ready()
+    });
+
+    // Handle streaming tokens - advance spinner and collect
     collector.mutate_on::<LLMStreamToken>(|actor, envelope| {
         actor.model.buffer.push_str(&envelope.message().token);
+        actor.model.frame += 1;
+        print!(
+            "\r{} Thinking...",
+            SPINNER[actor.model.frame % SPINNER.len()]
+        );
+        std::io::stdout().flush().ok();
         Reply::ready()
     });
 
@@ -91,12 +110,6 @@ async fn main() -> anyhow::Result<()> {
     collector.mutate_on::<LLMStreamEnd>(move |_actor, envelope| {
         tracing::info!("[Stream ended: {:?}]", envelope.message().stop_reason);
         stream_done_signal.notify_one();
-        Reply::ready()
-    });
-
-    // Handle stream start
-    collector.act_on::<LLMStreamStart>(|_actor, envelope| {
-        tracing::info!("[Stream started: {}]", envelope.message().correlation_id);
         Reply::ready()
     });
 
@@ -118,7 +131,7 @@ async fn main() -> anyhow::Result<()> {
         agent_id: AgentId::new(),
         messages: vec![
             Message::system("You are a helpful assistant. Be concise."),
-            Message::user("What is the capital of France? Answer in one sentence."),
+            Message::user("What is the capital of France? Answer in one paragraph."),
         ],
         tools: None,
     };
@@ -126,18 +139,8 @@ async fn main() -> anyhow::Result<()> {
     // Send the request
     provider_handle.send(request).await;
 
-    // Show spinner while waiting for response
-    let mut frame = 0;
-    loop {
-        print!("\r{} Thinking...", SPINNER[frame % SPINNER.len()]);
-        std::io::stdout().flush().ok();
-        frame += 1;
-
-        tokio::select! {
-            _ = stream_done.notified() => break,
-            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
-        }
-    }
+    // Wait for stream completion (driven by token messages)
+    stream_done.notified().await;
 
     // Graceful shutdown - this triggers after_stop on the collector
     tracing::info!("Shutting down...");
