@@ -13,9 +13,13 @@
 //! ```
 
 use acton_ai::prelude::*;
+use std::io::Write;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
+
+/// Spinner frames for the thinking animation
+const SPINNER: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// A simple response collector that subscribes to LLM events.
 /// Uses actor state to collect tokens - no mutex needed!
@@ -66,27 +70,26 @@ async fn main() -> anyhow::Result<()> {
 
     // Use lifecycle hook to print the collected response when actor stops
     collector.after_stop(|actor| {
+        // Clear the spinner line and print the response
+        print!("\r\x1b[K"); // Carriage return + clear line
         if actor.model.buffer.is_empty() {
-            eprintln!("\nNo response received!");
+            println!("No response received!");
         } else {
-            println!("\n\nFull response: {}", actor.model.buffer);
+            println!("Response: {}", actor.model.buffer);
         }
+        std::io::stdout().flush().ok();
         Reply::ready()
     });
 
-    // Handle streaming tokens - append to actor's buffer
+    // Handle streaming tokens - silently append to actor's buffer
     collector.mutate_on::<LLMStreamToken>(|actor, envelope| {
-        let token = &envelope.message().token;
-        print!("{}", token);
-        use std::io::Write;
-        std::io::stdout().flush().ok();
-        actor.model.buffer.push_str(token);
+        actor.model.buffer.push_str(&envelope.message().token);
         Reply::ready()
     });
 
     // Handle stream end - signal completion
     collector.mutate_on::<LLMStreamEnd>(move |_actor, envelope| {
-        tracing::info!("\n[Stream ended: {:?}]", envelope.message().stop_reason);
+        tracing::info!("[Stream ended: {:?}]", envelope.message().stop_reason);
         stream_done_signal.notify_one();
         Reply::ready()
     });
@@ -121,18 +124,23 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Send the request
-    print!("Response: ");
-    use std::io::Write;
-    std::io::stdout().flush().ok();
-
     provider_handle.send(request).await;
 
-    // Wait for stream completion (no arbitrary sleep!)
-    stream_done.notified().await;
+    // Show spinner while waiting for response
+    let mut frame = 0;
+    loop {
+        print!("\r{} Thinking...", SPINNER[frame % SPINNER.len()]);
+        std::io::stdout().flush().ok();
+        frame += 1;
+
+        tokio::select! {
+            _ = stream_done.notified() => break,
+            _ = tokio::time::sleep(Duration::from_millis(80)) => {}
+        }
+    }
 
     // Graceful shutdown - this triggers after_stop on the collector
     tracing::info!("Shutting down...");
-    provider_handle.stop().await?;
     runtime.shutdown_all().await?;
 
     Ok(())
