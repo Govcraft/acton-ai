@@ -51,7 +51,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Configure for Ollama on server (network IP)
     let ollama_url = "http://localhost:11434/v1";
-    let model = "qwen2.5:3b";
+    let model = "qwen2.5:7b";
 
     let provider_config = ProviderConfig::openai_compatible(ollama_url, model)
         .with_timeout(Duration::from_secs(120))
