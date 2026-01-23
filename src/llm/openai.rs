@@ -488,9 +488,10 @@ impl LLMClient for OpenAIClient {
         let stream = response.bytes_stream();
 
         // State for accumulating tool calls across chunks
+        // Using std::sync::Mutex because flat_map closure is synchronous
         let tool_call_accumulators: std::sync::Arc<
-            tokio::sync::Mutex<std::collections::HashMap<usize, ToolCallAccumulator>>,
-        > = std::sync::Arc::new(tokio::sync::Mutex::new(std::collections::HashMap::new()));
+            std::sync::Mutex<std::collections::HashMap<usize, ToolCallAccumulator>>,
+        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
 
         let event_stream = stream.flat_map(move |result| {
             let tool_call_accumulators = tool_call_accumulators.clone();
@@ -524,7 +525,7 @@ impl LLMClient for OpenAIClient {
                                         if let Some(tool_deltas) = choice.delta.tool_calls {
                                             for delta in tool_deltas {
                                                 let mut accumulators =
-                                                    tool_call_accumulators.blocking_lock();
+                                                    tool_call_accumulators.lock().unwrap();
                                                 let acc = accumulators
                                                     .entry(delta.index)
                                                     .or_default();
@@ -548,7 +549,7 @@ impl LLMClient for OpenAIClient {
                                         if let Some(ref reason) = choice.finish_reason {
                                             // Emit any accumulated tool calls
                                             let accumulators =
-                                                tool_call_accumulators.blocking_lock();
+                                                tool_call_accumulators.lock().unwrap();
                                             for acc in accumulators.values() {
                                                 if let (Some(id), Some(name)) =
                                                     (&acc.id, &acc.name)
