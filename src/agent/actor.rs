@@ -4,7 +4,11 @@
 //! conversation history, and reasoning loop.
 
 use crate::agent::{AgentConfig, AgentState};
-use crate::messages::{AgentStatusResponse, GetAgentStatus, GetStatus, Message, UserPrompt};
+use crate::llm::StreamAccumulator;
+use crate::messages::{
+    AgentStatusResponse, GetAgentStatus, GetStatus, LLMRequest, LLMResponse, LLMStreamEnd,
+    LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message, StopReason, UserPrompt,
+};
 use crate::types::{AgentId, CorrelationId};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -48,6 +52,8 @@ pub struct Agent {
     pub pending_llm: HashMap<String, PendingLLMRequest>,
     /// Pending tool calls awaiting response
     pub pending_tools: HashMap<String, String>,
+    /// Stream accumulator for receiving streamed responses
+    pub stream_accumulator: StreamAccumulator,
 }
 
 impl Agent {
@@ -189,30 +195,187 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
             },
         );
 
-        // In Phase 1, we just simulate a response
-        // In Phase 2, this will send an LLMRequest via the broker
-        let agent_id_str = actor
-            .model
-            .id
-            .as_ref()
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "unknown".to_string());
+        // Build conversation messages including system prompt
+        let mut messages = Vec::new();
+        if !actor.model.system_prompt.is_empty() {
+            messages.push(Message::system(&actor.model.system_prompt));
+        }
+        messages.extend(actor.model.conversation.clone());
 
-        // For now, simulate completing the reasoning loop
-        // TODO: Replace with actual LLM integration in Phase 2
-        actor.model.state = AgentState::Completed;
-        actor.model.pending_llm.remove(&corr_id_str);
+        // Create LLM request
+        let llm_request = LLMRequest {
+            correlation_id: prompt.correlation_id.clone(),
+            agent_id: actor.model.id.clone().unwrap_or_default(),
+            messages,
+            tools: None, // Tools will be added in Phase 3
+        };
 
-        // Add a placeholder assistant response
-        actor.model.add_message(Message::assistant(format!(
-            "Hello! I received your message. (Agent {} - Phase 1 stub)",
-            agent_id_str
-        )));
+        // Broadcast LLM request via broker for LLM Provider to pick up
+        let broker = actor.broker().clone();
+
+        Reply::pending(async move {
+            broker.broadcast(llm_request).await;
+        })
+    });
+
+    // Handle LLM stream start
+    builder.mutate_on::<LLMStreamStart>(|actor, envelope| {
+        let msg = envelope.message();
+        let corr_id_str = msg.correlation_id.to_string();
+
+        // Check if this stream is for us
+        if !actor.model.pending_llm.contains_key(&corr_id_str) {
+            return Reply::ready();
+        }
 
         tracing::debug!(
-            agent_id = agent_id_str,
-            "Completed processing prompt (stub)"
+            agent_id = ?actor.model.id,
+            correlation_id = %msg.correlation_id,
+            "LLM stream started"
         );
+
+        // Start accumulating the stream
+        actor.model.stream_accumulator.start_stream(&msg.correlation_id);
+
+        Reply::ready()
+    });
+
+    // Handle LLM stream tokens
+    builder.mutate_on::<LLMStreamToken>(|actor, envelope| {
+        let msg = envelope.message();
+        let corr_id_str = msg.correlation_id.to_string();
+
+        // Check if this token is for us
+        if !actor.model.pending_llm.contains_key(&corr_id_str) {
+            return Reply::ready();
+        }
+
+        // Append token to accumulator
+        actor.model.stream_accumulator.append_token(&msg.correlation_id, &msg.token);
+
+        tracing::trace!(
+            agent_id = ?actor.model.id,
+            correlation_id = %msg.correlation_id,
+            token_len = msg.token.len(),
+            "Received stream token"
+        );
+
+        Reply::ready()
+    });
+
+    // Handle LLM stream tool calls
+    builder.mutate_on::<LLMStreamToolCall>(|actor, envelope| {
+        let msg = envelope.message();
+        let corr_id_str = msg.correlation_id.to_string();
+
+        // Check if this tool call is for us
+        if !actor.model.pending_llm.contains_key(&corr_id_str) {
+            return Reply::ready();
+        }
+
+        tracing::debug!(
+            agent_id = ?actor.model.id,
+            correlation_id = %msg.correlation_id,
+            tool_name = %msg.tool_call.name,
+            "Received tool call"
+        );
+
+        // Add tool call to accumulator
+        actor.model.stream_accumulator.add_tool_call(&msg.correlation_id, msg.tool_call.clone());
+
+        Reply::ready()
+    });
+
+    // Handle LLM stream end
+    builder.mutate_on::<LLMStreamEnd>(|actor, envelope| {
+        let msg = envelope.message();
+        let corr_id_str = msg.correlation_id.to_string();
+
+        // Check if this stream end is for us
+        if !actor.model.pending_llm.contains_key(&corr_id_str) {
+            return Reply::ready();
+        }
+
+        tracing::debug!(
+            agent_id = ?actor.model.id,
+            correlation_id = %msg.correlation_id,
+            stop_reason = ?msg.stop_reason,
+            "LLM stream ended"
+        );
+
+        // Complete the stream and get accumulated content
+        if let Some(stream) = actor.model.stream_accumulator.end_stream(&msg.correlation_id, msg.stop_reason) {
+            // Add assistant response to conversation
+            if stream.has_tool_calls() {
+                actor.model.add_message(Message::assistant_with_tools(
+                    stream.content.clone(),
+                    stream.tool_calls.clone(),
+                ));
+                // Transition to Executing state for tool calls
+                actor.model.state = AgentState::Executing;
+            } else {
+                actor.model.add_message(Message::assistant(stream.content.clone()));
+                // Return to Idle state (or Completed based on stop reason)
+                actor.model.state = match msg.stop_reason {
+                    StopReason::MaxTokens => AgentState::Completed,
+                    _ => AgentState::Idle,
+                };
+            }
+
+            tracing::info!(
+                agent_id = ?actor.model.id,
+                correlation_id = %msg.correlation_id,
+                content_len = stream.content.len(),
+                tool_calls = stream.tool_calls.len(),
+                "Completed LLM response"
+            );
+        }
+
+        // Remove from pending
+        actor.model.pending_llm.remove(&corr_id_str);
+
+        Reply::ready()
+    });
+
+    // Handle complete LLM responses (non-streaming fallback)
+    builder.mutate_on::<LLMResponse>(|actor, envelope| {
+        let msg = envelope.message();
+        let corr_id_str = msg.correlation_id.to_string();
+
+        // Check if this response is for us
+        if !actor.model.pending_llm.contains_key(&corr_id_str) {
+            return Reply::ready();
+        }
+
+        // If we already processed via streaming, skip the complete response
+        if actor.model.stream_accumulator.get_stream(&msg.correlation_id).is_some() {
+            return Reply::ready();
+        }
+
+        tracing::debug!(
+            agent_id = ?actor.model.id,
+            correlation_id = %msg.correlation_id,
+            content_len = msg.content.len(),
+            "Received complete LLM response"
+        );
+
+        // Add assistant response to conversation
+        if let Some(tool_calls) = &msg.tool_calls {
+            actor.model.add_message(Message::assistant_with_tools(
+                msg.content.clone(),
+                tool_calls.clone(),
+            ));
+            actor.model.state = AgentState::Executing;
+        } else {
+            actor.model.add_message(Message::assistant(msg.content.clone()));
+            actor.model.state = match msg.stop_reason {
+                StopReason::MaxTokens => AgentState::Completed,
+                _ => AgentState::Idle,
+            };
+        }
+
+        // Remove from pending
+        actor.model.pending_llm.remove(&corr_id_str);
 
         Reply::ready()
     });

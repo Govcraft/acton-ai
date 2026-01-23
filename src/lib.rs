@@ -31,11 +31,11 @@
 pub mod agent;
 pub mod error;
 pub mod kernel;
+pub mod llm;
 pub mod messages;
 pub mod types;
 
-// Future modules (Phase 2+)
-// pub mod llm;
+// Future modules (Phase 3+)
 // pub mod memory;
 // pub mod tools;
 
@@ -44,6 +44,10 @@ pub mod prelude {
     pub use crate::agent::{Agent, AgentConfig, AgentState, InitAgent};
     pub use crate::error::{AgentError, KernelError};
     pub use crate::kernel::{InitKernel, Kernel, KernelConfig, KernelMetrics};
+    pub use crate::llm::{
+        AnthropicClient, InitLLMProvider, LLMError, LLMErrorKind, LLMProvider, ProviderConfig,
+        RateLimitConfig,
+    };
     pub use crate::messages::*;
     pub use crate::types::{AgentId, CorrelationId};
 

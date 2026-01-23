@@ -217,3 +217,208 @@ fn test_user_prompt_generates_correlation_id() {
     assert!(prompt1.correlation_id.to_string().starts_with("corr_"));
     assert!(prompt2.correlation_id.to_string().starts_with("corr_"));
 }
+
+// ============================================================================
+// Phase 2: LLM Integration Tests
+// ============================================================================
+
+/// Test LLM provider configuration.
+#[test]
+fn test_llm_provider_config() {
+    let config = ProviderConfig::new("test-api-key")
+        .with_model("claude-3-haiku-20240307")
+        .with_max_tokens(2048);
+
+    assert_eq!(config.api_key, "test-api-key");
+    assert_eq!(config.model, "claude-3-haiku-20240307");
+    assert_eq!(config.max_tokens, 2048);
+}
+
+/// Test LLM error types.
+#[test]
+fn test_llm_error_types() {
+    use std::time::Duration;
+
+    // Network error is retriable
+    let net_err = LLMError::network("connection refused");
+    assert!(net_err.is_retriable());
+
+    // Rate limited error is retriable with retry-after
+    let rate_err = LLMError::rate_limited(Duration::from_secs(30));
+    assert!(rate_err.is_retriable());
+    assert_eq!(rate_err.retry_after(), Some(Duration::from_secs(30)));
+
+    // Auth error is not retriable
+    let auth_err = LLMError::authentication_failed("invalid key");
+    assert!(!auth_err.is_retriable());
+}
+
+/// Test rate limit configuration.
+#[test]
+fn test_rate_limit_config() {
+    let config = RateLimitConfig::new(60, 50_000)
+        .with_max_queue_size(200);
+
+    assert_eq!(config.requests_per_minute, 60);
+    assert_eq!(config.tokens_per_minute, 50_000);
+    assert_eq!(config.max_queue_size, 200);
+    assert!(config.queue_when_limited);
+
+    let no_queue_config = config.without_queueing();
+    assert!(!no_queue_config.queue_when_limited);
+}
+
+/// Test LLM request message creation.
+#[test]
+fn test_llm_request_creation() {
+    let corr_id = CorrelationId::new();
+    let agent_id = AgentId::new();
+
+    let request = LLMRequest {
+        correlation_id: corr_id.clone(),
+        agent_id: agent_id.clone(),
+        messages: vec![
+            Message::system("You are helpful"),
+            Message::user("Hello"),
+        ],
+        tools: None,
+    };
+
+    assert_eq!(request.correlation_id, corr_id);
+    assert_eq!(request.agent_id, agent_id);
+    assert_eq!(request.messages.len(), 2);
+    assert!(request.tools.is_none());
+}
+
+/// Test LLM response message handling.
+#[test]
+fn test_llm_response_handling() {
+    let corr_id = CorrelationId::new();
+
+    let response = LLMResponse {
+        correlation_id: corr_id.clone(),
+        content: "Hello! How can I help you today?".to_string(),
+        tool_calls: None,
+        stop_reason: StopReason::EndTurn,
+    };
+
+    assert_eq!(response.correlation_id, corr_id);
+    assert_eq!(response.content, "Hello! How can I help you today?");
+    assert!(response.tool_calls.is_none());
+    assert_eq!(response.stop_reason, StopReason::EndTurn);
+}
+
+/// Test LLM response with tool calls.
+#[test]
+fn test_llm_response_with_tools() {
+    let corr_id = CorrelationId::new();
+
+    let tool_call = ToolCall {
+        id: "tc_123".to_string(),
+        name: "search".to_string(),
+        arguments: serde_json::json!({"query": "rust programming"}),
+    };
+
+    let response = LLMResponse {
+        correlation_id: corr_id.clone(),
+        content: "Let me search for that.".to_string(),
+        tool_calls: Some(vec![tool_call.clone()]),
+        stop_reason: StopReason::ToolUse,
+    };
+
+    assert!(response.tool_calls.is_some());
+    let tool_calls = response.tool_calls.unwrap();
+    assert_eq!(tool_calls.len(), 1);
+    assert_eq!(tool_calls[0].name, "search");
+    assert_eq!(response.stop_reason, StopReason::ToolUse);
+}
+
+/// Test streaming message flow.
+#[test]
+fn test_streaming_messages() {
+    let corr_id = CorrelationId::new();
+
+    // Stream start
+    let start = LLMStreamStart {
+        correlation_id: corr_id.clone(),
+    };
+    assert_eq!(start.correlation_id, corr_id);
+
+    // Stream tokens
+    let token1 = LLMStreamToken {
+        correlation_id: corr_id.clone(),
+        token: "Hello".to_string(),
+    };
+    let token2 = LLMStreamToken {
+        correlation_id: corr_id.clone(),
+        token: " World".to_string(),
+    };
+    assert_eq!(token1.token, "Hello");
+    assert_eq!(token2.token, " World");
+
+    // Stream end
+    let end = LLMStreamEnd {
+        correlation_id: corr_id.clone(),
+        stop_reason: StopReason::EndTurn,
+    };
+    assert_eq!(end.stop_reason, StopReason::EndTurn);
+}
+
+/// Test stream accumulator functionality.
+#[test]
+fn test_stream_accumulator() {
+    use acton_ai::llm::StreamAccumulator;
+
+    let mut accumulator = StreamAccumulator::new();
+    let corr_id = CorrelationId::new();
+
+    // Start a stream
+    accumulator.start_stream(&corr_id);
+    assert_eq!(accumulator.active_count(), 1);
+
+    // Append tokens
+    accumulator.append_token(&corr_id, "Hello");
+    accumulator.append_token(&corr_id, " ");
+    accumulator.append_token(&corr_id, "World");
+
+    // End the stream
+    let stream = accumulator.end_stream(&corr_id, StopReason::EndTurn).unwrap();
+    assert_eq!(stream.content, "Hello World");
+    assert!(stream.is_ended());
+    assert!(accumulator.is_empty());
+}
+
+/// Test stop reason variants.
+#[test]
+fn test_stop_reason_variants() {
+    assert_eq!(StopReason::EndTurn, StopReason::EndTurn);
+    assert_ne!(StopReason::EndTurn, StopReason::MaxTokens);
+    assert_ne!(StopReason::EndTurn, StopReason::ToolUse);
+    assert_ne!(StopReason::EndTurn, StopReason::StopSequence);
+
+    // Test serialization
+    let json = serde_json::to_string(&StopReason::EndTurn).unwrap();
+    assert!(json.contains("end_turn") || json.contains("EndTurn"));
+}
+
+/// Test tool definition structure.
+#[test]
+fn test_tool_definition() {
+    let tool = ToolDefinition {
+        name: "calculator".to_string(),
+        description: "Performs mathematical calculations".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "expression": {
+                    "type": "string",
+                    "description": "The mathematical expression to evaluate"
+                }
+            },
+            "required": ["expression"]
+        }),
+    };
+
+    assert_eq!(tool.name, "calculator");
+    assert!(tool.input_schema.is_object());
+}
