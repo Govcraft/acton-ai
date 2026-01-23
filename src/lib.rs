@@ -33,11 +33,11 @@ pub mod error;
 pub mod kernel;
 pub mod llm;
 pub mod messages;
+pub mod tools;
 pub mod types;
 
-// Future modules (Phase 3+)
+// Future modules (Phase 4+)
 // pub mod memory;
-// pub mod tools;
 
 /// Prelude module for convenient imports
 pub mod prelude {
@@ -49,7 +49,11 @@ pub mod prelude {
         RateLimitConfig,
     };
     pub use crate::messages::*;
-    pub use crate::types::{AgentId, CorrelationId};
+    pub use crate::tools::{
+        RegisterTool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind, ToolExecutorTrait,
+        ToolRegistry,
+    };
+    pub use crate::types::{AgentId, CorrelationId, ToolName};
 
     // Re-export acton-reactive prelude
     pub use acton_reactive::prelude::*;

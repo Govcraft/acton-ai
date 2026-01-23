@@ -422,3 +422,220 @@ fn test_tool_definition() {
     assert_eq!(tool.name, "calculator");
     assert!(tool.input_schema.is_object());
 }
+
+// ============================================================================
+// Phase 3: Tool System Integration Tests
+// ============================================================================
+
+use acton_ai::tools::{
+    RegisterTool, ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait, ToolRegistry,
+};
+use std::sync::Arc;
+
+/// A simple echo tool for testing.
+#[derive(Debug)]
+struct EchoTool;
+
+impl ToolExecutorTrait for EchoTool {
+    fn execute(&self, args: serde_json::Value) -> ToolExecutionFuture {
+        Box::pin(async move { Ok(args) })
+    }
+}
+
+/// A tool that always fails for testing error handling.
+#[derive(Debug)]
+struct FailingTool;
+
+impl ToolExecutorTrait for FailingTool {
+    fn execute(&self, _args: serde_json::Value) -> ToolExecutionFuture {
+        Box::pin(async move { Err(ToolError::execution_failed("failing_tool", "always fails")) })
+    }
+}
+
+/// Test spawning the Tool Registry actor.
+#[tokio::test]
+async fn test_spawn_tool_registry() {
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn the registry
+    let registry = ToolRegistry::spawn(&mut runtime).await;
+
+    // The registry should have a valid handle - check that root is "tool_registry"
+    let id_str = registry.id().root.to_string();
+    assert!(
+        id_str.contains("tool_registry"),
+        "Expected tool_registry in id: {}",
+        id_str
+    );
+
+    // Graceful shutdown
+    runtime.shutdown_all().await.expect("Shutdown failed");
+}
+
+/// Test registering a tool with the registry.
+#[tokio::test]
+async fn test_register_tool() {
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn the registry
+    let registry = ToolRegistry::spawn(&mut runtime).await;
+
+    // Create a tool definition
+    let tool_def = ToolDefinition {
+        name: "echo".to_string(),
+        description: "Echoes input back".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "message": {"type": "string"}
+            }
+        }),
+    };
+
+    // Register the tool
+    registry
+        .send(RegisterTool {
+            config: ToolConfig::new(tool_def),
+            executor: Arc::new(Box::new(EchoTool) as Box<dyn ToolExecutorTrait>),
+        })
+        .await;
+
+    // Give time for message processing
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    // Graceful shutdown
+    runtime.shutdown_all().await.expect("Shutdown failed");
+}
+
+/// Test tool error types.
+#[test]
+fn test_tool_error_not_found() {
+    let error = ToolError::not_found("missing_tool");
+    let msg = error.to_string();
+    assert!(msg.contains("missing_tool"));
+    assert!(msg.contains("not found"));
+    assert!(error.is_not_found());
+}
+
+/// Test tool error already registered.
+#[test]
+fn test_tool_error_already_registered() {
+    let error = ToolError::already_registered("duplicate_tool");
+    let msg = error.to_string();
+    assert!(msg.contains("duplicate_tool"));
+    assert!(msg.contains("already registered"));
+    assert!(error.is_already_registered());
+}
+
+/// Test tool error execution failed.
+#[test]
+fn test_tool_error_execution_failed() {
+    let error = ToolError::execution_failed("buggy_tool", "null pointer");
+    let msg = error.to_string();
+    assert!(msg.contains("buggy_tool"));
+    assert!(msg.contains("execution failed"));
+    assert!(msg.contains("null pointer"));
+}
+
+/// Test tool error timeout.
+#[test]
+fn test_tool_error_timeout() {
+    let error = ToolError::timeout("slow_tool", Duration::from_secs(30));
+    let msg = error.to_string();
+    assert!(msg.contains("slow_tool"));
+    assert!(msg.contains("timed out"));
+    assert!(msg.contains("30"));
+    assert!(error.is_retriable());
+}
+
+/// Test tool error validation failed.
+#[test]
+fn test_tool_error_validation_failed() {
+    let error = ToolError::validation_failed("strict_tool", "missing required field");
+    let msg = error.to_string();
+    assert!(msg.contains("strict_tool"));
+    assert!(msg.contains("validation failed"));
+    assert!(msg.contains("missing required field"));
+}
+
+/// Test tool config builder.
+#[test]
+fn test_tool_config_builder() {
+    let tool_def = ToolDefinition {
+        name: "test".to_string(),
+        description: "Test tool".to_string(),
+        input_schema: serde_json::json!({"type": "object"}),
+    };
+
+    let config = ToolConfig::new(tool_def)
+        .with_sandbox(true)
+        .with_timeout(Duration::from_secs(60));
+
+    assert!(config.sandboxed);
+    assert_eq!(config.timeout, Duration::from_secs(60));
+    assert_eq!(config.definition.name, "test");
+}
+
+/// Test ToolName type.
+#[test]
+fn test_tool_name_creation() {
+    use acton_ai::types::ToolName;
+
+    let name1 = ToolName::new();
+    let name2 = ToolName::new();
+
+    // Each name should be unique
+    assert_ne!(name1, name2);
+
+    // Names should have correct prefix
+    assert!(name1.to_string().starts_with("tool_"));
+    assert!(name2.to_string().starts_with("tool_"));
+}
+
+/// Test ToolName parsing.
+#[test]
+fn test_tool_name_parsing() {
+    use acton_ai::types::{InvalidToolName, ToolName};
+
+    // Valid tool name should parse
+    let name = ToolName::new();
+    let parsed = ToolName::parse(&name.to_string());
+    assert!(parsed.is_ok());
+    assert_eq!(name, parsed.unwrap());
+
+    // Wrong prefix should fail
+    let result = ToolName::parse("agent_01h455vb4pex5vsknk084sn02q");
+    assert!(matches!(
+        result,
+        Err(InvalidToolName::WrongPrefix {
+            expected: "tool",
+            ..
+        })
+    ));
+
+    // Invalid format should fail
+    let result = ToolName::parse("not-a-valid-typeid");
+    assert!(matches!(result, Err(InvalidToolName::Parse(_))));
+}
+
+/// Test tool execution via executor trait.
+#[tokio::test]
+async fn test_echo_tool_execution() {
+    let tool = EchoTool;
+    let input = serde_json::json!({"message": "hello world"});
+    let result = tool.execute(input.clone()).await;
+
+    assert!(result.is_ok());
+    assert_eq!(result.unwrap(), input);
+}
+
+/// Test failing tool execution.
+#[tokio::test]
+async fn test_failing_tool_execution() {
+    let tool = FailingTool;
+    let result = tool.execute(serde_json::json!({})).await;
+
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("always fails"));
+}
