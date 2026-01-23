@@ -3,10 +3,10 @@
 //! The LLM Provider actor manages API calls to language models with
 //! rate limiting, retry logic, and streaming support.
 
-use crate::llm::anthropic::{
-    extract_text_content, extract_tool_calls, parse_stop_reason, AnthropicClient, StreamEvent,
-};
-use crate::llm::config::ProviderConfig;
+use crate::llm::anthropic::AnthropicClient;
+use crate::llm::client::{LLMClient, LLMStreamEvent};
+use crate::llm::config::{ProviderConfig, ProviderType};
+use crate::llm::openai::OpenAIClient;
 use crate::llm::streaming::StreamAccumulator;
 use crate::messages::{
     LLMRequest, LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall,
@@ -15,6 +15,7 @@ use crate::messages::{
 use acton_reactive::prelude::*;
 use futures::StreamExt;
 use std::collections::VecDeque;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Message to initialize the LLM Provider with configuration.
@@ -125,8 +126,8 @@ impl RateLimiterState {
 pub struct LLMProvider {
     /// Configuration
     pub config: Option<ProviderConfig>,
-    /// HTTP client
-    client: Option<AnthropicClient>,
+    /// The LLM client (trait object for provider abstraction)
+    client: Option<Arc<dyn LLMClient>>,
     /// Request queue
     queue: VecDeque<PendingRequest>,
     /// Rate limiter state
@@ -214,16 +215,28 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
     builder.mutate_on::<InitLLMProvider>(|actor, envelope| {
         let config = envelope.message().config.clone();
 
-        // Create the HTTP client
-        match AnthropicClient::new(config.clone()) {
+        // Create the appropriate client based on provider type
+        let client_result: Result<Arc<dyn LLMClient>, crate::llm::error::LLMError> =
+            match &config.provider_type {
+                ProviderType::Anthropic => {
+                    AnthropicClient::new(config.clone()).map(|c| Arc::new(c) as Arc<dyn LLMClient>)
+                }
+                ProviderType::OpenAI { base_url } => {
+                    OpenAIClient::new(base_url.clone(), &config)
+                        .map(|c| Arc::new(c) as Arc<dyn LLMClient>)
+                }
+            };
+
+        match client_result {
             Ok(client) => {
+                let provider_name = client.provider_name();
                 actor.model.client = Some(client);
                 actor.model.config = Some(config);
                 actor.model.shutting_down = false;
-                tracing::info!("LLM Provider configured");
+                tracing::info!(provider = %provider_name, "LLM Provider configured");
             }
             Err(e) => {
-                tracing::error!(error = %e, "Failed to create Anthropic client");
+                tracing::error!(error = %e, "Failed to create LLM client");
             }
         }
 
@@ -306,16 +319,18 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 .record_request(estimate_tokens(&request));
             actor.model.metrics.requests_total += 1;
 
-            Reply::try_pending(async move {
-                if let Some(client) = client {
+            // Spawn the request processing to avoid Sync requirements
+            if let Some(client) = client {
+                tokio::spawn(async move {
                     if streaming {
                         process_streaming_request(&client, &request, &broker).await;
                     } else {
                         process_non_streaming_request(&client, &request, &broker).await;
                     }
-                }
-                Ok(())
-            })
+                });
+            }
+
+            Reply::try_ok(())
         })
         .on_error::<LLMRequest, crate::llm::error::LLMError>(|actor, envelope, error| {
             let correlation_id = &envelope.message().correlation_id;
@@ -332,10 +347,16 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             // Broadcast rate limit event if applicable
             if let Some(retry_after) = error.retry_after() {
                 let broker = actor.broker().clone();
+                let provider_name = actor
+                    .model
+                    .client
+                    .as_ref()
+                    .map(|c| c.provider_name().to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
                 return Box::pin(async move {
                     broker
                         .broadcast(SystemEvent::RateLimitHit {
-                            provider: "anthropic".to_string(),
+                            provider: provider_name,
                             retry_after_secs: retry_after.as_secs(),
                         })
                         .await;
@@ -407,13 +428,14 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
     });
 }
 
-/// Processes a streaming request.
+/// Processes a streaming request using the unified LLMClient trait.
 async fn process_streaming_request(
-    client: &AnthropicClient,
+    client: &Arc<dyn LLMClient>,
     request: &LLMRequest,
     broker: &ActorHandle,
 ) {
     let correlation_id = &request.correlation_id;
+    let provider_name = client.provider_name();
 
     // Convert tools if present
     let tools = request.tools.as_deref();
@@ -426,88 +448,48 @@ async fn process_streaming_request(
         .await;
 
     // Start streaming request
-    match client.send_messages_streaming(&request.messages, tools).await {
+    match client.send_streaming_request(&request.messages, tools).await {
         Ok(mut stream) => {
             let mut accumulated_text = String::new();
             let mut tool_calls = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
-            let mut current_tool_id: Option<String> = None;
-            let mut current_tool_name: Option<String> = None;
-            let mut current_tool_input = String::new();
 
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
                         match event {
-                            StreamEvent::ContentBlockStart {
-                                block_type,
-                                tool_id,
-                                tool_name,
-                                ..
+                            LLMStreamEvent::Start { .. } => {
+                                // Stream already started, no action needed
+                            }
+                            LLMStreamEvent::Token { text } => {
+                                accumulated_text.push_str(&text);
+
+                                // Broadcast token
+                                broker
+                                    .broadcast(LLMStreamToken {
+                                        correlation_id: correlation_id.clone(),
+                                        token: text,
+                                    })
+                                    .await;
+                            }
+                            LLMStreamEvent::ToolCall { tool_call } => {
+                                // Broadcast tool call
+                                broker
+                                    .broadcast(LLMStreamToolCall {
+                                        correlation_id: correlation_id.clone(),
+                                        tool_call: tool_call.clone(),
+                                    })
+                                    .await;
+
+                                tool_calls.push(tool_call);
+                            }
+                            LLMStreamEvent::End {
+                                stop_reason: reason,
                             } => {
-                                if block_type == "tool_use" {
-                                    current_tool_id = tool_id;
-                                    current_tool_name = tool_name;
-                                    current_tool_input.clear();
-                                }
-                            }
-                            StreamEvent::ContentBlockDelta {
-                                text,
-                                partial_json,
-                                ..
-                            } => {
-                                if let Some(text) = text {
-                                    accumulated_text.push_str(&text);
-
-                                    // Broadcast token
-                                    broker
-                                        .broadcast(LLMStreamToken {
-                                            correlation_id: correlation_id.clone(),
-                                            token: text,
-                                        })
-                                        .await;
-                                }
-
-                                if let Some(json) = partial_json {
-                                    current_tool_input.push_str(&json);
-                                }
-                            }
-                            StreamEvent::ContentBlockStop { .. } => {
-                                // If we were building a tool call, finalize it
-                                if let (Some(id), Some(name)) =
-                                    (current_tool_id.take(), current_tool_name.take())
-                                {
-                                    let input: serde_json::Value =
-                                        serde_json::from_str(&current_tool_input)
-                                            .unwrap_or(serde_json::json!({}));
-
-                                    let tool_call = crate::messages::ToolCall {
-                                        id: id.clone(),
-                                        name: name.clone(),
-                                        arguments: input,
-                                    };
-
-                                    // Broadcast tool call
-                                    broker
-                                        .broadcast(LLMStreamToolCall {
-                                            correlation_id: correlation_id.clone(),
-                                            tool_call: tool_call.clone(),
-                                        })
-                                        .await;
-
-                                    tool_calls.push(tool_call);
-                                    current_tool_input.clear();
-                                }
-                            }
-                            StreamEvent::MessageDelta {
-                                stop_reason: Some(reason),
-                            } => {
-                                stop_reason = parse_stop_reason(&reason);
-                            }
-                            StreamEvent::MessageStop => {
+                                stop_reason = reason;
                                 break;
                             }
-                            StreamEvent::Error {
+                            LLMStreamEvent::Error {
                                 error_type,
                                 message,
                             } => {
@@ -518,9 +500,6 @@ async fn process_streaming_request(
                                     "Stream error"
                                 );
                                 break;
-                            }
-                            StreamEvent::Ping | StreamEvent::MessageStart { .. } | StreamEvent::MessageDelta { stop_reason: None } => {
-                                // Ignore ping and message start events
                             }
                         }
                     }
@@ -568,7 +547,7 @@ async fn process_streaming_request(
             if let Some(retry_after) = e.retry_after() {
                 broker
                     .broadcast(SystemEvent::RateLimitHit {
-                        provider: "anthropic".to_string(),
+                        provider: provider_name.to_string(),
                         retry_after_secs: retry_after.as_secs(),
                     })
                     .await;
@@ -585,37 +564,30 @@ async fn process_streaming_request(
     }
 }
 
-/// Processes a non-streaming request.
+/// Processes a non-streaming request using the unified LLMClient trait.
 async fn process_non_streaming_request(
-    client: &AnthropicClient,
+    client: &Arc<dyn LLMClient>,
     request: &LLMRequest,
     broker: &ActorHandle,
 ) {
     let correlation_id = &request.correlation_id;
+    let provider_name = client.provider_name();
 
     // Convert tools if present
     let tools = request.tools.as_deref();
 
-    match client.send_messages(&request.messages, tools).await {
+    match client.send_request(&request.messages, tools).await {
         Ok(response) => {
-            let content = extract_text_content(&response);
-            let tool_calls = extract_tool_calls(&response);
-            let stop_reason = response
-                .stop_reason
-                .as_ref()
-                .map(|s| parse_stop_reason(s))
-                .unwrap_or(StopReason::EndTurn);
-
             broker
                 .broadcast(LLMResponse {
                     correlation_id: correlation_id.clone(),
-                    content,
-                    tool_calls: if tool_calls.is_empty() {
+                    content: response.content,
+                    tool_calls: if response.tool_calls.is_empty() {
                         None
                     } else {
-                        Some(tool_calls)
+                        Some(response.tool_calls)
                     },
-                    stop_reason,
+                    stop_reason: response.stop_reason,
                 })
                 .await;
         }
@@ -630,7 +602,7 @@ async fn process_non_streaming_request(
             if let Some(retry_after) = e.retry_after() {
                 broker
                     .broadcast(SystemEvent::RateLimitHit {
-                        provider: "anthropic".to_string(),
+                        provider: provider_name.to_string(),
                         retry_after_secs: retry_after.as_secs(),
                     })
                     .await;

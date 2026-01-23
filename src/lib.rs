@@ -46,7 +46,8 @@ pub mod prelude {
     pub use crate::error::{AgentError, KernelError, MultiAgentError, MultiAgentErrorKind};
     pub use crate::kernel::{CapabilityRegistry, InitKernel, Kernel, KernelConfig, KernelMetrics};
     pub use crate::llm::{
-        AnthropicClient, InitLLMProvider, LLMError, LLMErrorKind, LLMProvider, ProviderConfig,
+        AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,
+        LLMEventStream, LLMProvider, LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderType,
         RateLimitConfig,
     };
     pub use crate::memory::{

@@ -3,9 +3,11 @@
 //! HTTP client for communicating with the Anthropic Claude API,
 //! including streaming SSE response handling.
 
+use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
 use crate::llm::config::ProviderConfig;
 use crate::llm::error::LLMError;
 use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolDefinition};
+use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -597,6 +599,76 @@ impl AnthropicClient {
     }
 }
 
+#[async_trait]
+impl LLMClient for AnthropicClient {
+    async fn send_request(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<LLMClientResponse, LLMError> {
+        let response = self.send_messages(messages, tools).await?;
+        Ok(LLMClientResponse {
+            content: extract_text_content(&response),
+            tool_calls: extract_tool_calls(&response),
+            stop_reason: response
+                .stop_reason
+                .as_ref()
+                .map(|s| parse_stop_reason(s))
+                .unwrap_or(StopReason::EndTurn),
+        })
+    }
+
+    async fn send_streaming_request(
+        &self,
+        messages: &[Message],
+        tools: Option<&[ToolDefinition]>,
+    ) -> Result<LLMEventStream, LLMError> {
+        let stream = self.send_messages_streaming(messages, tools).await?;
+        Ok(Box::pin(convert_anthropic_stream(stream)))
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "anthropic"
+    }
+}
+
+/// Converts Anthropic stream events to unified LLMStreamEvent.
+fn convert_anthropic_stream(
+    stream: impl futures::Stream<Item = Result<StreamEvent, LLMError>> + Send + 'static,
+) -> impl futures::Stream<Item = Result<LLMStreamEvent, LLMError>> + Send {
+    stream.filter_map(|result| async move {
+        match result {
+            Ok(event) => match event {
+                StreamEvent::MessageStart { id } => Some(Ok(LLMStreamEvent::Start { id })),
+                StreamEvent::ContentBlockDelta { text, .. } => {
+                    text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
+                }
+                StreamEvent::MessageDelta { stop_reason } => {
+                    stop_reason.map(|reason| {
+                        Ok(LLMStreamEvent::End {
+                            stop_reason: parse_stop_reason(&reason),
+                        })
+                    })
+                }
+                StreamEvent::MessageStop => Some(Ok(LLMStreamEvent::End {
+                    stop_reason: StopReason::EndTurn,
+                })),
+                StreamEvent::Error {
+                    error_type,
+                    message,
+                } => Some(Ok(LLMStreamEvent::Error {
+                    error_type,
+                    message,
+                })),
+                StreamEvent::Ping
+                | StreamEvent::ContentBlockStart { .. }
+                | StreamEvent::ContentBlockStop { .. } => None,
+            },
+            Err(e) => Some(Err(e)),
+        }
+    })
+}
+
 /// Converts an API stop reason string to our `StopReason` enum.
 #[must_use]
 pub fn parse_stop_reason(reason: &str) -> StopReason {
@@ -829,5 +901,19 @@ mod tests {
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "tc_456");
         assert_eq!(tool_calls[0].name, "search");
+    }
+
+    #[test]
+    fn anthropic_client_implements_llm_client() {
+        let config = ProviderConfig::anthropic("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+        let _boxed: Box<dyn LLMClient> = Box::new(client);
+    }
+
+    #[test]
+    fn anthropic_client_provider_name() {
+        let config = ProviderConfig::anthropic("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+        assert_eq!(client.provider_name(), "anthropic");
     }
 }
