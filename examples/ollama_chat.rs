@@ -17,7 +17,6 @@ use tokio::sync::Mutex;
 /// A simple response collector that subscribes to LLM events
 #[acton_actor]
 struct ResponseCollector {
-    tokens: Vec<String>,
     done: bool,
 }
 
@@ -33,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Configure for Ollama on server (network IP)
     let ollama_url = "http://localhost:11434/v1";
-    let model = "qwen2.5-coder:1.5b";
+    let model = "qwen2.5:3b";
 
     let provider_config = ProviderConfig::openai_compatible(ollama_url, model)
         .with_timeout(Duration::from_secs(120))
