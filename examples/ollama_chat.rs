@@ -55,11 +55,8 @@ async fn main() -> Result<(), ActonAIError> {
         .await?;
 
     // Send a prompt and stream the response
-    print!("Response: ");
-    std::io::stdout().flush().ok();
-
     let response = runtime
-        .prompt("What is the capital of France? Answer in one paragraph.")
+        .prompt("What is the capital of France? Answer in one sentence.")
         .system("You are a helpful assistant. Be concise.")
         .on_token(|token| {
             print!("{token}");

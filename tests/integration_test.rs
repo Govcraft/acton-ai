@@ -1095,7 +1095,7 @@ fn test_build_context_with_memories() {
 // =============================================================================
 
 use acton_ai::agent::{DelegatedTask, DelegatedTaskState, DelegationTracker};
-use acton_ai::error::{MultiAgentError, MultiAgentErrorKind};
+use acton_ai::error::MultiAgentError;
 use acton_ai::kernel::CapabilityRegistry;
 use acton_ai::types::{InvalidTaskId, TaskId};
 
