@@ -1,6 +1,8 @@
-# Hidden files and directories (except .gitignore)
+# Hidden files and directories (except .gitignore and .env.example)
 .*
 !.gitignore
+!.env.example
+!**/.env.example
 
 # Text and markdown files (except README.md)
 *.txt

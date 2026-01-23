@@ -1,10 +1,18 @@
-//! Example: Chat with Ollama on a remote server
+//! Example: Chat with Ollama
 //!
-//! This example demonstrates using acton-ai to connect to Ollama
-//! running on a remote server via network.
+//! This example demonstrates using acton-ai to connect to an Ollama server.
 //!
 //! File logging is automatically initialized by the kernel and writes to
 //! `~/.local/share/acton/logs/`. No manual logging setup is required.
+//!
+//! # Configuration
+//!
+//! Set environment variables or create a `.env` file:
+//!
+//! ```bash
+//! export OLLAMA_URL="http://localhost:11434/v1"
+//! export OLLAMA_MODEL="qwen2.5:7b"
+//! ```
 //!
 //! # Usage
 //!
@@ -31,13 +39,30 @@ struct ResponseCollector {
     frame: usize,
 }
 
+/// Load environment variables from .env file if present
+fn load_dotenv() {
+    if let Ok(contents) = std::fs::read_to_string(".env") {
+        for line in contents.lines() {
+            if let Some((key, value)) = line.split_once('=') {
+                let key = key.trim();
+                let value = value.trim().trim_matches('"');
+                if !key.is_empty() && !key.starts_with('#') {
+                    std::env::set_var(key, value);
+                }
+            }
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // Load .env file if present
+    load_dotenv();
+
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
 
     // Spawn the kernel with custom app name for logs
-    // This automatically initializes file logging to ~/.local/share/acton/logs/
     let kernel_config = KernelConfig::default().with_app_name("ollama-chat");
     let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
 
@@ -49,11 +74,12 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting Ollama chat example...");
 
-    // Configure for Ollama on server (network IP)
-    let ollama_url = "http://localhost:11434/v1";
-    let model = "qwen2.5:7b";
+    // Configure for Ollama - URL and model from environment
+    let ollama_url =
+        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
+    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
 
-    let provider_config = ProviderConfig::openai_compatible(ollama_url, model)
+    let provider_config = ProviderConfig::openai_compatible(&ollama_url, &model)
         .with_timeout(Duration::from_secs(120))
         .with_max_tokens(256);
 
