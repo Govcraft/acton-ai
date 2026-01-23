@@ -5,6 +5,7 @@
 //! communication, and handles agent failures through supervision.
 
 use crate::kernel::discovery::CapabilityRegistry;
+use crate::kernel::logging::init_and_store_logging;
 use crate::kernel::KernelConfig;
 use crate::messages::{
     AgentMessage, AgentSpawned, AnnounceCapabilities, CapableAgentFound, DelegateTask,
@@ -69,6 +70,10 @@ impl Kernel {
 
     /// Spawns the Kernel actor with the given configuration.
     ///
+    /// If logging is configured, this will automatically initialize file-based logging
+    /// before starting the kernel. Logs are written to the configured directory
+    /// (default: `~/.local/share/acton/logs/`).
+    ///
     /// # Arguments
     ///
     /// * `runtime` - The ActorRuntime
@@ -78,6 +83,29 @@ impl Kernel {
     ///
     /// The ActorHandle for the started Kernel actor.
     pub async fn spawn_with_config(runtime: &mut ActorRuntime, config: KernelConfig) -> ActorHandle {
+        // Initialize file logging before any tracing calls
+        if let Some(ref logging_config) = config.logging {
+            match init_and_store_logging(logging_config) {
+                Ok(true) => {
+                    // Logging initialized successfully - log to the file
+                    if let Ok(log_dir) = crate::kernel::logging::get_log_dir(logging_config) {
+                        tracing::info!(
+                            log_dir = %log_dir.display(),
+                            app_name = %logging_config.app_name,
+                            "File logging initialized"
+                        );
+                    }
+                }
+                Ok(false) => {
+                    // Logging disabled or already initialized - nothing to do
+                }
+                Err(e) => {
+                    // Log to stderr since file logging failed
+                    eprintln!("Warning: file logging initialization failed: {e}");
+                }
+            }
+        }
+
         let mut builder = runtime.new_actor_with_name::<Kernel>("kernel".to_string());
 
         // Store config for use in init message

@@ -31,6 +31,8 @@ futures = "0.3"
 async-stream = "0.3"
 async-trait = "0.1.89"
 libsql = "0.9"
+dirs = "6"
+tracing-appender = "0.2"
 
 # Persistence (deferred to Phase 4, but adding now)
 # libsql = "0.6"

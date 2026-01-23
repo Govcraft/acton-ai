@@ -44,7 +44,11 @@ pub mod prelude {
         IncomingTaskInfo, InitAgent,
     };
     pub use crate::error::{AgentError, KernelError, MultiAgentError, MultiAgentErrorKind};
-    pub use crate::kernel::{CapabilityRegistry, InitKernel, Kernel, KernelConfig, KernelMetrics};
+    pub use crate::kernel::{
+        get_log_dir, init_and_store_logging, init_file_logging, CapabilityRegistry, InitKernel,
+        Kernel, KernelConfig, KernelMetrics, LoggingConfig, LoggingError, LoggingErrorKind,
+        LoggingGuard, LogLevel,
+    };
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,
         LLMEventStream, LLMProvider, LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderType,

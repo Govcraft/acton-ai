@@ -3,6 +3,9 @@
 //! This example demonstrates using acton-ai to connect to Ollama
 //! running on a remote server via network.
 //!
+//! File logging is automatically initialized by the kernel and writes to
+//! `~/.local/share/acton/logs/`. No manual logging setup is required.
+//!
 //! # Usage
 //!
 //! ```bash
@@ -22,11 +25,19 @@ struct ResponseCollector {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Initialize tracing for logs
-    tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_target(false)
-        .init();
+    // Launch the actor runtime
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn the kernel with custom app name for logs
+    // This automatically initializes file logging to ~/.local/share/acton/logs/
+    let kernel_config = KernelConfig::default().with_app_name("ollama-chat");
+    let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
+
+    // Get and display the log directory
+    let log_config = LoggingConfig::default().with_app_name("ollama-chat");
+    if let Ok(log_dir) = get_log_dir(&log_config) {
+        eprintln!("Logs being written to: {}", log_dir.display());
+    }
 
     tracing::info!("Starting Ollama chat example...");
 
@@ -43,9 +54,6 @@ async fn main() -> anyhow::Result<()> {
         ollama_url,
         model
     );
-
-    // Launch the actor runtime
-    let mut runtime = ActonApp::launch_async().await;
 
     // Create a shared buffer to collect the response
     let response_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
