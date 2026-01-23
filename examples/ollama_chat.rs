@@ -1,7 +1,7 @@
 //! Example: Chat with Ollama on a remote server
 //!
 //! This example demonstrates using acton-ai to connect to Ollama
-//! running on a remote server (server) via network.
+//! running on a remote server via network.
 //!
 //! # Usage
 //!
@@ -38,7 +38,11 @@ async fn main() -> anyhow::Result<()> {
         .with_timeout(Duration::from_secs(120))
         .with_max_tokens(256);
 
-    tracing::info!("Connecting to Ollama at {} with model {}", ollama_url, model);
+    tracing::info!(
+        "Connecting to Ollama at {} with model {}",
+        ollama_url,
+        model
+    );
 
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
