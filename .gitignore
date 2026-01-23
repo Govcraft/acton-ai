@@ -6,3 +6,7 @@
 *.txt
 *.md
 !README.md
+
+# Rust
+/target/
+Cargo.lock
