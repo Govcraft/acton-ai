@@ -6,7 +6,7 @@
 //! 1. Setting up ActonAI runtime with Ollama
 //! 2. Using the fluent `.messages()` API for conversation history
 //! 3. Streaming responses with `.on_token()` callback
-//! 4. Clean conversation loop without any mutexes or low-level actor boilerplate
+//! 4. Using a tool for graceful exit (LLM recognizes exit intent)
 //!
 //! # Configuration
 //!
@@ -25,6 +25,8 @@
 
 use acton_ai::prelude::*;
 use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Load environment variables from .env file if present.
 fn load_dotenv() {
@@ -56,12 +58,6 @@ fn read_user_input(prompt: &str) -> Option<String> {
     }
 }
 
-/// Check if the user wants to quit the conversation.
-fn should_quit(input: &str) -> bool {
-    let lower = input.to_lowercase();
-    matches!(lower.as_str(), "quit" | "exit" | "/quit" | "/exit")
-}
-
 #[tokio::main]
 async fn main() -> Result<(), ActonAIError> {
     load_dotenv();
@@ -72,7 +68,7 @@ async fn main() -> Result<(), ActonAIError> {
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
 
     eprintln!("Connecting to Ollama at {ollama_url} with model {model}");
-    eprintln!("Type 'quit' or 'exit' to end the conversation.\n");
+    eprintln!("Say goodbye to end the conversation.\n");
 
     // Launch ActonAI runtime
     let runtime = ActonAI::builder()
@@ -81,11 +77,33 @@ async fn main() -> Result<(), ActonAIError> {
         .launch()
         .await?;
 
-    // System prompt for the assistant
-    let system_prompt =
-        "You are a helpful assistant. Be conversational and remember our previous exchanges.";
+    // Shutdown flag - set by the exit tool
+    let shutdown = Arc::new(AtomicBool::new(false));
 
-    // Conversation history - simple Vec, no mutexes needed!
+    // Exit tool definition - LLM calls this when user wants to leave
+    let exit_tool = ToolDefinition {
+        name: "exit_conversation".to_string(),
+        description: "Call this tool when the user wants to end the conversation, say goodbye, \
+                      or leave. Examples: 'bye', 'goodbye', 'I'm done', 'quit', 'exit', 'see ya'."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "farewell": {
+                    "type": "string",
+                    "description": "A friendly farewell message to the user"
+                }
+            },
+            "required": ["farewell"]
+        }),
+    };
+
+    // System prompt for the assistant
+    let system_prompt = "You are a helpful assistant. Be conversational and remember our \
+                         previous exchanges. When the user wants to leave, use the \
+                         exit_conversation tool.";
+
+    // Conversation history
     let mut history: Vec<Message> = Vec::new();
 
     // Main conversation loop
@@ -98,27 +116,41 @@ async fn main() -> Result<(), ActonAIError> {
             continue;
         }
 
-        if should_quit(&input) {
-            eprintln!("\nGoodbye!");
-            break;
-        }
-
         // Add user message to history
         history.push(Message::user(&input));
 
-        // Send request with full history using the clean PromptBuilder API
+        // Send request with exit tool - LLM will call it when user wants to leave
         print!("Assistant: ");
         let response = runtime
-            .prompt("") // Ignored when .messages() is used
+            .prompt("")
             .system(system_prompt)
             .messages(history.clone())
+            .with_tool_callback(
+                exit_tool.clone(),
+                {
+                    let shutdown = shutdown.clone();
+                    move |_args| {
+                        let shutdown = shutdown.clone();
+                        async move {
+                            shutdown.store(true, Ordering::SeqCst);
+                            Ok(serde_json::json!({"status": "goodbye"}))
+                        }
+                    }
+                },
+                |_result| {},
+            )
             .on_token(|token| {
                 print!("{token}");
                 std::io::stdout().flush().ok();
             })
             .collect()
             .await?;
-        println!(); // New line after streaming
+        println!();
+
+        // Check if exit was triggered
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
 
         // Add assistant response to history
         history.push(Message::assistant(&response.text));
