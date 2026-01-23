@@ -37,5 +37,6 @@ chrono = "0.4.43"
 
 [dev-dependencies]
 anyhow = "1.0.100"
+colored = "3.1.1"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 tokio-test = "0.4"
