@@ -62,6 +62,11 @@ type TokenCallback = Box<dyn FnMut(&str) + Send + 'static>;
 /// Type alias for end callbacks.
 type EndCallback = Box<dyn FnMut(StopReason) + Send + 'static>;
 
+/// Type alias for tool result callbacks.
+///
+/// Called after a tool executes with the result (success or error).
+type ToolResultCallback = Box<dyn FnMut(Result<&serde_json::Value, &str>) + Send + 'static>;
+
 /// Type alias for tool execution futures.
 type ToolFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send>>;
 
@@ -89,12 +94,14 @@ where
     }
 }
 
-/// A tool specification combining definition and executor.
+/// A tool specification combining definition, executor, and optional result callback.
 pub struct ToolSpec {
     /// The tool definition sent to the LLM
     pub definition: ToolDefinition,
     /// The executor for this tool
     executor: Arc<dyn ToolExecutorFn>,
+    /// Optional callback invoked when the tool returns a result
+    on_result: Option<ToolResultCallback>,
 }
 
 impl std::fmt::Debug for ToolSpec {
@@ -110,6 +117,8 @@ impl Clone for ToolSpec {
         Self {
             definition: self.definition.clone(),
             executor: self.executor.clone(),
+            // Callbacks cannot be cloned (FnMut is not Clone)
+            on_result: None,
         }
     }
 }
@@ -312,6 +321,7 @@ impl<'a> PromptBuilder<'a> {
         let spec = ToolSpec {
             definition,
             executor: Arc::new(ClosureToolExecutor { func: executor }),
+            on_result: None,
         };
 
         self.tools.push(spec);
@@ -354,6 +364,67 @@ impl<'a> PromptBuilder<'a> {
         let spec = ToolSpec {
             definition,
             executor: Arc::new(ClosureToolExecutor { func: executor }),
+            on_result: None,
+        };
+
+        self.tools.push(spec);
+        self
+    }
+
+    /// Registers a tool using a `ToolDefinition` with a result callback.
+    ///
+    /// The callback is invoked after the tool executes, receiving either the
+    /// successful result value or an error message. This is useful for logging,
+    /// debugging, or updating UI state when a tool completes.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let calculator = ToolDefinition {
+    ///     name: "calculator".to_string(),
+    ///     description: "Evaluates math expressions".to_string(),
+    ///     input_schema: json!({
+    ///         "type": "object",
+    ///         "properties": {
+    ///             "expression": { "type": "string" }
+    ///         },
+    ///     }),
+    /// };
+    ///
+    /// runtime
+    ///     .prompt("What is 2 + 2?")
+    ///     .with_tool_callback(
+    ///         calculator,
+    ///         |args| async move {
+    ///             let expr = args["expression"].as_str().unwrap();
+    ///             Ok(json!({"result": calculate(expr)}))
+    ///         },
+    ///         |result| {
+    ///             match result {
+    ///                 Ok(value) => println!("Calculator returned: {value}"),
+    ///                 Err(e) => println!("Calculator failed: {e}"),
+    ///             }
+    ///         },
+    ///     )
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_tool_callback<F, Fut, C>(
+        mut self,
+        definition: ToolDefinition,
+        executor: F,
+        on_result: C,
+    ) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
+        C: FnMut(Result<&serde_json::Value, &str>) + Send + 'static,
+    {
+        let spec = ToolSpec {
+            definition,
+            executor: Arc::new(ClosureToolExecutor { func: executor }),
+            on_result: Some(Box::new(on_result)),
         };
 
         self.tools.push(spec);
@@ -426,7 +497,7 @@ impl<'a> PromptBuilder<'a> {
             on_start,
             on_token,
             on_end,
-            tools,
+            mut tools,
             max_tool_rounds,
         } = self;
 
@@ -505,7 +576,7 @@ impl<'a> PromptBuilder<'a> {
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
-                        let result = execute_tool(&tools, tool_call).await;
+                        let result = execute_tool_with_callback(&mut tools, tool_call).await;
 
                         // Record the executed tool call
                         let executed = match &result {
@@ -548,7 +619,6 @@ impl<'a> PromptBuilder<'a> {
             executed_tool_calls,
         ))
     }
-
 }
 
 /// Collects a single stream round.
@@ -674,12 +744,28 @@ async fn collect_stream_round(
     ))
 }
 
-/// Executes a single tool call.
-async fn execute_tool(tools: &[ToolSpec], tool_call: &ToolCall) -> Result<serde_json::Value, ToolError> {
+/// Executes a single tool call and invokes the result callback if present.
+async fn execute_tool_with_callback(
+    tools: &mut [ToolSpec],
+    tool_call: &ToolCall,
+) -> Result<serde_json::Value, ToolError> {
     // Find the tool by name
-    for spec in tools {
+    for spec in tools.iter_mut() {
         if spec.definition.name == tool_call.name {
-            return spec.executor.call(tool_call.arguments.clone()).await;
+            let result = spec.executor.call(tool_call.arguments.clone()).await;
+
+            // Invoke the result callback if present
+            if let Some(ref mut callback) = spec.on_result {
+                match &result {
+                    Ok(value) => callback(Ok(value)),
+                    Err(e) => {
+                        let error_str = e.to_string();
+                        callback(Err(&error_str));
+                    }
+                }
+            }
+
+            return result;
         }
     }
 
@@ -705,6 +791,7 @@ mod tests {
             executor: Arc::new(ClosureToolExecutor {
                 func: |_args: serde_json::Value| async { Ok(serde_json::json!({})) },
             }),
+            on_result: None,
         };
 
         let debug = format!("{:?}", spec);
@@ -722,16 +809,18 @@ mod tests {
             executor: Arc::new(ClosureToolExecutor {
                 func: |_args: serde_json::Value| async { Ok(serde_json::json!({})) },
             }),
+            on_result: Some(Box::new(|_result| {})),
         };
 
         let cloned = spec.clone();
         assert_eq!(cloned.definition.name, "test");
+        // Callbacks are not cloned
+        assert!(cloned.on_result.is_none());
     }
 
     #[test]
     fn collected_response_new_creates_correctly() {
-        let response =
-            CollectedResponse::new("Hello world".to_string(), StopReason::EndTurn, 2);
+        let response = CollectedResponse::new("Hello world".to_string(), StopReason::EndTurn, 2);
 
         assert_eq!(response.text, "Hello world");
         assert_eq!(response.stop_reason, StopReason::EndTurn);

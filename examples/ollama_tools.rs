@@ -127,7 +127,7 @@ async fn main() -> anyhow::Result<()> {
     eprintln!("Tools available: calculator, get_current_time\n");
 
     // Send the prompt with tools - the high-level API handles:
-    // - Tool registration
+    // - Tool registration with result callbacks
     // - Tool execution loop
     // - Returning results to the LLM
     // - Collecting the final response
@@ -138,27 +138,48 @@ async fn main() -> anyhow::Result<()> {
              Use the calculator tool for any math operations. \
              Always show your work.",
         )
-        .with_tool(calculator, |args| async move {
-            let expression = args
-                .get("expression")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ToolError::validation_failed("calculator", "missing 'expression'"))?;
+        .with_tool_callback(
+            calculator,
+            |args| async move {
+                let expression = args
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        ToolError::validation_failed("calculator", "missing 'expression'")
+                    })?;
 
-            let result = evaluate_expression(expression)
-                .map_err(|e| ToolError::execution_failed("calculator", e))?;
+                let result = evaluate_expression(expression)
+                    .map_err(|e| ToolError::execution_failed("calculator", e))?;
 
-            Ok(serde_json::json!({
-                "expression": expression,
-                "result": result
-            }))
-        })
-        .with_tool(get_time, |_args| async move {
-            let now = chrono::Utc::now();
-            Ok(serde_json::json!({
-                "utc_time": now.to_rfc3339(),
-                "unix_timestamp": now.timestamp()
-            }))
-        })
+                Ok(serde_json::json!({
+                    "expression": expression,
+                    "result": result
+                }))
+            },
+            |result| {
+                // This callback is invoked when the calculator tool returns
+                match result {
+                    Ok(value) => eprintln!("\n[Calculator returned: {value}]"),
+                    Err(e) => eprintln!("\n[Calculator error: {e}]"),
+                }
+            },
+        )
+        .with_tool_callback(
+            get_time,
+            |_args| async move {
+                let now = chrono::Utc::now();
+                Ok(serde_json::json!({
+                    "utc_time": now.to_rfc3339(),
+                    "unix_timestamp": now.timestamp()
+                }))
+            },
+            |result| {
+                match result {
+                    Ok(value) => eprintln!("\n[Time returned: {value}]"),
+                    Err(e) => eprintln!("\n[Time error: {e}]"),
+                }
+            },
+        )
         .on_token(|token| {
             print!("{token}");
             std::io::stdout().flush().ok();
@@ -167,24 +188,6 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     println!("\n");
-
-    // Show response details
-    if response.has_tool_calls() {
-        println!("Tool calls executed: {}", response.tool_calls.len());
-        for call in &response.tool_calls {
-            println!(
-                "  - {} ({}): {}",
-                call.name,
-                if call.is_success() { "✓" } else { "✗" },
-                if let Ok(ref result) = call.result {
-                    result.to_string()
-                } else {
-                    call.result.as_ref().unwrap_err().clone()
-                }
-            );
-        }
-    }
-
     println!("Total tokens: {}", response.token_count);
     println!("Stop reason: {:?}", response.stop_reason);
 
