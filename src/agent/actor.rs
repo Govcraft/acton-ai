@@ -263,48 +263,92 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         Reply::ready()
     });
 
-    // Handle LLM stream tool calls
-    builder.mutate_on::<LLMStreamToolCall>(|actor, envelope| {
-        let msg = envelope.message();
-        let corr_id_str = msg.correlation_id.to_string();
+    // Handle LLM stream tool calls with fallible handler pattern
+    builder
+        .try_mutate_on::<LLMStreamToolCall, (), crate::error::AgentError>(|actor, envelope| {
+            let msg = envelope.message();
+            let corr_id_str = msg.correlation_id.to_string();
 
-        // Check if this tool call is for us
-        if !actor.model.pending_llm.contains_key(&corr_id_str) {
-            return Reply::ready();
-        }
+            // Check if this tool call is for us
+            if !actor.model.pending_llm.contains_key(&corr_id_str) {
+                return Reply::try_ok(());
+            }
 
-        tracing::debug!(
-            agent_id = ?actor.model.id,
-            correlation_id = %msg.correlation_id,
-            tool_name = %msg.tool_call.name,
-            "Received tool call"
-        );
+            // Validate tool call has required fields
+            if msg.tool_call.name.is_empty() {
+                return Reply::try_err(crate::error::AgentError::processing_failed(
+                    actor.model.id.clone(),
+                    "Tool call missing name",
+                ));
+            }
 
-        // Add tool call to accumulator
-        actor.model.stream_accumulator.add_tool_call(&msg.correlation_id, msg.tool_call.clone());
+            if msg.tool_call.id.is_empty() {
+                return Reply::try_err(crate::error::AgentError::processing_failed(
+                    actor.model.id.clone(),
+                    "Tool call missing ID",
+                ));
+            }
 
-        Reply::ready()
-    });
+            tracing::debug!(
+                agent_id = ?actor.model.id,
+                correlation_id = %msg.correlation_id,
+                tool_name = %msg.tool_call.name,
+                "Received tool call"
+            );
 
-    // Handle LLM stream end
-    builder.mutate_on::<LLMStreamEnd>(|actor, envelope| {
-        let msg = envelope.message();
-        let corr_id_str = msg.correlation_id.to_string();
+            // Add tool call to accumulator
+            actor
+                .model
+                .stream_accumulator
+                .add_tool_call(&msg.correlation_id, msg.tool_call.clone());
 
-        // Check if this stream end is for us
-        if !actor.model.pending_llm.contains_key(&corr_id_str) {
-            return Reply::ready();
-        }
+            Reply::try_ok(())
+        })
+        .on_error::<LLMStreamToolCall, crate::error::AgentError>(|actor, envelope, error| {
+            tracing::error!(
+                agent_id = ?actor.model.id,
+                correlation_id = %envelope.message().correlation_id,
+                error = %error,
+                "Tool call processing failed"
+            );
+            Box::pin(async {})
+        });
 
-        tracing::debug!(
-            agent_id = ?actor.model.id,
-            correlation_id = %msg.correlation_id,
-            stop_reason = ?msg.stop_reason,
-            "LLM stream ended"
-        );
+    // Handle LLM stream end with fallible handler pattern
+    builder
+        .try_mutate_on::<LLMStreamEnd, (), crate::error::AgentError>(|actor, envelope| {
+            let msg = envelope.message();
+            let corr_id_str = msg.correlation_id.to_string();
 
-        // Complete the stream and get accumulated content
-        if let Some(stream) = actor.model.stream_accumulator.end_stream(&msg.correlation_id, msg.stop_reason) {
+            // Check if this stream end is for us
+            if !actor.model.pending_llm.contains_key(&corr_id_str) {
+                return Reply::try_ok(());
+            }
+
+            tracing::debug!(
+                agent_id = ?actor.model.id,
+                correlation_id = %msg.correlation_id,
+                stop_reason = ?msg.stop_reason,
+                "LLM stream ended"
+            );
+
+            // Complete the stream and get accumulated content
+            let stream = actor
+                .model
+                .stream_accumulator
+                .end_stream(&msg.correlation_id, msg.stop_reason);
+
+            let Some(stream) = stream else {
+                // Stream was never started or already ended - this is an error
+                return Reply::try_err(crate::error::AgentError::processing_failed(
+                    actor.model.id.clone(),
+                    format!(
+                        "No active stream for correlation_id {}",
+                        msg.correlation_id
+                    ),
+                ));
+            };
+
             // Add assistant response to conversation
             if stream.has_tool_calls() {
                 actor.model.add_message(Message::assistant_with_tools(
@@ -329,13 +373,30 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 tool_calls = stream.tool_calls.len(),
                 "Completed LLM response"
             );
-        }
 
-        // Remove from pending
-        actor.model.pending_llm.remove(&corr_id_str);
+            // Remove from pending
+            actor.model.pending_llm.remove(&corr_id_str);
 
-        Reply::ready()
-    });
+            Reply::try_ok(())
+        })
+        .on_error::<LLMStreamEnd, crate::error::AgentError>(|actor, envelope, error| {
+            let corr_id_str = envelope.message().correlation_id.to_string();
+
+            tracing::error!(
+                agent_id = ?actor.model.id,
+                correlation_id = %envelope.message().correlation_id,
+                error = %error,
+                "Stream finalization failed"
+            );
+
+            // Clean up the pending request on error
+            actor.model.pending_llm.remove(&corr_id_str);
+
+            // Reset state to Idle on error
+            actor.model.state = AgentState::Idle;
+
+            Box::pin(async {})
+        });
 
     // Handle complete LLM responses (non-streaming fallback)
     builder.mutate_on::<LLMResponse>(|actor, envelope| {

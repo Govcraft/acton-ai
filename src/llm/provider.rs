@@ -230,84 +230,120 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         Reply::ready()
     });
 
-    // Handle LLM requests
-    builder.mutate_on::<LLMRequest>(|actor, envelope| {
-        let request = envelope.message().clone();
-        let correlation_id = request.correlation_id.clone();
+    // Handle LLM requests with fallible handler pattern
+    builder
+        .try_mutate_on::<LLMRequest, (), crate::llm::error::LLMError>(|actor, envelope| {
+            let request = envelope.message().clone();
+            let correlation_id = request.correlation_id.clone();
 
-        if actor.model.shutting_down {
-            tracing::warn!(
-                correlation_id = %correlation_id,
-                "Rejecting request - provider is shutting down"
-            );
-            return Reply::ready();
-        }
-
-        let Some(ref config) = actor.model.config else {
-            tracing::error!(
-                correlation_id = %correlation_id,
-                "Provider not configured"
-            );
-            return Reply::ready();
-        };
-
-        // Check rate limits
-        if !actor.model.rate_limiter.can_make_request(config) {
-            if config.rate_limit.queue_when_limited {
-                // Check queue size
-                if actor.model.queue.len() >= config.rate_limit.max_queue_size {
-                    tracing::warn!(
-                        correlation_id = %correlation_id,
-                        queue_size = actor.model.queue.len(),
-                        "Request queue full, rejecting request"
-                    );
-                    return Reply::ready();
-                }
-
-                // Queue the request
-                actor.model.queue.push_back(PendingRequest {
-                    request,
-                    _attempts: 0,
-                    _queued_at: Instant::now(),
-                });
-
-                tracing::debug!(
-                    correlation_id = %correlation_id,
-                    queue_size = actor.model.queue.len(),
-                    "Request queued due to rate limit"
-                );
-
-                return Reply::ready();
-            } else {
+            if actor.model.shutting_down {
                 tracing::warn!(
                     correlation_id = %correlation_id,
-                    "Rate limited and queueing disabled"
+                    "Rejecting request - provider is shutting down"
                 );
-                return Reply::ready();
+                return Reply::try_err(crate::llm::error::LLMError::shutting_down());
             }
-        }
 
-        // Process the request
-        let client = actor.model.client.clone();
-        let broker = actor.broker().clone();
-        let streaming = actor.model.config.as_ref()
-            .map(|c| c.rate_limit.queue_when_limited) // Streaming is enabled by default
-            .unwrap_or(true);
+            let Some(ref config) = actor.model.config else {
+                return Reply::try_err(crate::llm::error::LLMError::invalid_config(
+                    "provider",
+                    "Provider not configured",
+                ));
+            };
 
-        // Record the request
-        actor.model.rate_limiter.record_request(estimate_tokens(&request));
-        actor.model.metrics.requests_total += 1;
+            // Check rate limits
+            if !actor.model.rate_limiter.can_make_request(config) {
+                if config.rate_limit.queue_when_limited {
+                    // Check queue size
+                    if actor.model.queue.len() >= config.rate_limit.max_queue_size {
+                        tracing::warn!(
+                            correlation_id = %correlation_id,
+                            queue_size = actor.model.queue.len(),
+                            "Request queue full, rejecting request"
+                        );
+                        return Reply::try_err(crate::llm::error::LLMError::api_error(
+                            429,
+                            "Request queue full",
+                            Some("queue_full".to_string()),
+                        ));
+                    }
 
-        Reply::pending(async move {
-            if let Some(client) = client {
-                if streaming {
-                    process_streaming_request(&client, &request, &broker).await;
+                    // Queue the request (this is success from handler perspective)
+                    actor.model.queue.push_back(PendingRequest {
+                        request,
+                        _attempts: 0,
+                        _queued_at: Instant::now(),
+                    });
+
+                    tracing::debug!(
+                        correlation_id = %correlation_id,
+                        queue_size = actor.model.queue.len(),
+                        "Request queued due to rate limit"
+                    );
+
+                    return Reply::try_ok(());
                 } else {
-                    process_non_streaming_request(&client, &request, &broker).await;
+                    return Reply::try_err(crate::llm::error::LLMError::rate_limited(
+                        Duration::from_secs(60),
+                    ));
                 }
             }
+
+            // Process the request
+            let client = actor.model.client.clone();
+            let broker = actor.broker().clone();
+            let streaming = actor
+                .model
+                .config
+                .as_ref()
+                .map(|c| c.rate_limit.queue_when_limited) // Streaming is enabled by default
+                .unwrap_or(true);
+
+            // Record the request
+            actor
+                .model
+                .rate_limiter
+                .record_request(estimate_tokens(&request));
+            actor.model.metrics.requests_total += 1;
+
+            Reply::try_pending(async move {
+                if let Some(client) = client {
+                    if streaming {
+                        process_streaming_request(&client, &request, &broker).await;
+                    } else {
+                        process_non_streaming_request(&client, &request, &broker).await;
+                    }
+                }
+                Ok(())
+            })
         })
-    });
+        .on_error::<LLMRequest, crate::llm::error::LLMError>(|actor, envelope, error| {
+            let correlation_id = &envelope.message().correlation_id;
+
+            tracing::error!(
+                correlation_id = %correlation_id,
+                error = %error,
+                "LLM request failed"
+            );
+
+            // Update metrics
+            actor.model.metrics.requests_failed += 1;
+
+            // Broadcast rate limit event if applicable
+            if let Some(retry_after) = error.retry_after() {
+                let broker = actor.broker().clone();
+                return Box::pin(async move {
+                    broker
+                        .broadcast(SystemEvent::RateLimitHit {
+                            provider: "anthropic".to_string(),
+                            retry_after_secs: retry_after.as_secs(),
+                        })
+                        .await;
+                });
+            }
+
+            Box::pin(async {})
+        });
 
     // Handle queue processing
     builder.mutate_on::<ProcessQueue>(|actor, _envelope| {
@@ -630,7 +666,7 @@ mod tests {
     #[test]
     fn rate_limiter_tracks_requests() {
         let mut state = RateLimiterState::default();
-        let config = ProviderConfig::new("test-key");
+        let _config = ProviderConfig::new("test-key");
 
         state.record_request(100);
 
