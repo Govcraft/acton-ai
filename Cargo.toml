@@ -1,6 +1,6 @@
 [package]
 name = "acton-ai"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 description = "An agentic AI framework where each agent is an actor"
 license = "MIT"
@@ -34,6 +34,7 @@ reqwest = { version = "0.12", features = ["json", "stream"] }
 futures = "0.3"
 async-stream = "0.3"
 async-trait = "0.1.89"
+libsql = "0.9"
 
 # Persistence (deferred to Phase 4, but adding now)
 # libsql = "0.6"

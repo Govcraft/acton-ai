@@ -32,12 +32,10 @@ pub mod agent;
 pub mod error;
 pub mod kernel;
 pub mod llm;
+pub mod memory;
 pub mod messages;
 pub mod tools;
 pub mod types;
-
-// Future modules (Phase 4+)
-// pub mod memory;
 
 /// Prelude module for convenient imports
 pub mod prelude {
@@ -48,12 +46,16 @@ pub mod prelude {
         AnthropicClient, InitLLMProvider, LLMError, LLMErrorKind, LLMProvider, ProviderConfig,
         RateLimitConfig,
     };
+    pub use crate::memory::{
+        AgentStateSnapshot, InitMemoryStore, MemoryStore, MemoryStoreMetrics, PersistenceConfig,
+        PersistenceError,
+    };
     pub use crate::messages::*;
     pub use crate::tools::{
         RegisterTool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind, ToolExecutorTrait,
         ToolRegistry,
     };
-    pub use crate::types::{AgentId, CorrelationId, ToolName};
+    pub use crate::types::{AgentId, ConversationId, CorrelationId, MemoryId, MessageId, ToolName};
 
     // Re-export acton-reactive prelude
     pub use acton_reactive::prelude::*;

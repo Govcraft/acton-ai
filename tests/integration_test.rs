@@ -639,3 +639,269 @@ async fn test_failing_tool_execution() {
     let err = result.unwrap_err();
     assert!(err.to_string().contains("always fails"));
 }
+
+// ============================================================================
+// Phase 4: Persistence Tests
+// ============================================================================
+
+use acton_ai::memory::{
+    AgentStateSnapshot, InitMemoryStore, MemoryStore, PersistenceConfig, PersistenceError,
+};
+use acton_ai::types::{ConversationId, InvalidConversationId, InvalidMemoryId, InvalidMessageId, MemoryId, MessageId};
+
+/// Test ConversationId type.
+#[test]
+fn test_conversation_id_creation() {
+    let id1 = ConversationId::new();
+    let id2 = ConversationId::new();
+
+    // Each ID should be unique
+    assert_ne!(id1, id2);
+
+    // IDs should have correct prefix
+    assert!(id1.to_string().starts_with("conv_"));
+    assert!(id2.to_string().starts_with("conv_"));
+}
+
+/// Test ConversationId parsing.
+#[test]
+fn test_conversation_id_parsing() {
+    // Valid conversation ID should parse
+    let id = ConversationId::new();
+    let parsed = ConversationId::parse(&id.to_string());
+    assert!(parsed.is_ok());
+    assert_eq!(id, parsed.unwrap());
+
+    // Wrong prefix should fail
+    let result = ConversationId::parse("agent_01h455vb4pex5vsknk084sn02q");
+    assert!(matches!(
+        result,
+        Err(InvalidConversationId::WrongPrefix {
+            expected: "conv",
+            ..
+        })
+    ));
+
+    // Invalid format should fail
+    let result = ConversationId::parse("not-a-valid-typeid");
+    assert!(matches!(result, Err(InvalidConversationId::Parse(_))));
+}
+
+/// Test MessageId type.
+#[test]
+fn test_message_id_creation() {
+    let id1 = MessageId::new();
+    let id2 = MessageId::new();
+
+    // Each ID should be unique
+    assert_ne!(id1, id2);
+
+    // IDs should have correct prefix
+    assert!(id1.to_string().starts_with("msg_"));
+    assert!(id2.to_string().starts_with("msg_"));
+}
+
+/// Test MessageId parsing.
+#[test]
+fn test_message_id_parsing() {
+    // Valid message ID should parse
+    let id = MessageId::new();
+    let parsed = MessageId::parse(&id.to_string());
+    assert!(parsed.is_ok());
+    assert_eq!(id, parsed.unwrap());
+
+    // Wrong prefix should fail
+    let result = MessageId::parse("agent_01h455vb4pex5vsknk084sn02q");
+    assert!(matches!(
+        result,
+        Err(InvalidMessageId::WrongPrefix {
+            expected: "msg",
+            ..
+        })
+    ));
+
+    // Invalid format should fail
+    let result = MessageId::parse("not-a-valid-typeid");
+    assert!(matches!(result, Err(InvalidMessageId::Parse(_))));
+}
+
+/// Test MemoryId type.
+#[test]
+fn test_memory_id_creation() {
+    let id1 = MemoryId::new();
+    let id2 = MemoryId::new();
+
+    // Each ID should be unique
+    assert_ne!(id1, id2);
+
+    // IDs should have correct prefix
+    assert!(id1.to_string().starts_with("mem_"));
+    assert!(id2.to_string().starts_with("mem_"));
+}
+
+/// Test MemoryId parsing.
+#[test]
+fn test_memory_id_parsing() {
+    // Valid memory ID should parse
+    let id = MemoryId::new();
+    let parsed = MemoryId::parse(&id.to_string());
+    assert!(parsed.is_ok());
+    assert_eq!(id, parsed.unwrap());
+
+    // Wrong prefix should fail
+    let result = MemoryId::parse("agent_01h455vb4pex5vsknk084sn02q");
+    assert!(matches!(
+        result,
+        Err(InvalidMemoryId::WrongPrefix {
+            expected: "mem",
+            ..
+        })
+    ));
+
+    // Invalid format should fail
+    let result = MemoryId::parse("not-a-valid-typeid");
+    assert!(matches!(result, Err(InvalidMemoryId::Parse(_))));
+}
+
+/// Test PersistenceConfig.
+#[test]
+fn test_persistence_config() {
+    // Default config
+    let config = PersistenceConfig::default();
+    assert_eq!(config.db_path, "acton-ai.db");
+    assert!(!config.is_in_memory());
+
+    // In-memory config
+    let mem_config = PersistenceConfig::in_memory();
+    assert!(mem_config.is_in_memory());
+
+    // Custom path config
+    let custom_config = PersistenceConfig::new("/path/to/db.sqlite");
+    assert_eq!(custom_config.db_path, "/path/to/db.sqlite");
+}
+
+/// Test PersistenceError types.
+#[test]
+fn test_persistence_error_database_open() {
+    let error = PersistenceError::database_open("/path/to/db", "permission denied");
+    let msg = error.to_string();
+    assert!(msg.contains("/path/to/db"));
+    assert!(msg.contains("permission denied"));
+}
+
+/// Test PersistenceError retriable.
+#[test]
+fn test_persistence_error_retriable() {
+    // Connection errors are retriable
+    let conn_err = PersistenceError::connection_error("timeout");
+    assert!(conn_err.is_retriable());
+
+    // Transaction errors are retriable
+    let tx_err = PersistenceError::transaction_failed("deadlock");
+    assert!(tx_err.is_retriable());
+
+    // Not found errors are not retriable
+    let not_found = PersistenceError::not_found("conversation", "conv_123");
+    assert!(!not_found.is_retriable());
+    assert!(not_found.is_not_found());
+}
+
+/// Test PersistenceError shutting down.
+#[test]
+fn test_persistence_error_shutting_down() {
+    let error = PersistenceError::shutting_down();
+    assert!(error.is_shutting_down());
+    let msg = error.to_string();
+    assert!(msg.contains("shutting down"));
+}
+
+/// Test AgentStateSnapshot serialization.
+#[test]
+fn test_agent_state_snapshot_serialization() {
+    let snapshot = AgentStateSnapshot {
+        agent_id: AgentId::new(),
+        conversation_id: Some(ConversationId::new()),
+        conversation: vec![Message::user("Hello"), Message::assistant("Hi there")],
+        system_prompt: "You are a helpful assistant".to_string(),
+    };
+
+    // Serialize
+    let json = serde_json::to_string(&snapshot).unwrap();
+    assert!(json.contains("agent_"));
+    assert!(json.contains("conv_"));
+
+    // Deserialize
+    let deserialized: AgentStateSnapshot = serde_json::from_str(&json).unwrap();
+    assert_eq!(snapshot.agent_id, deserialized.agent_id);
+    assert_eq!(snapshot.system_prompt, deserialized.system_prompt);
+    assert_eq!(snapshot.conversation.len(), deserialized.conversation.len());
+}
+
+/// Test spawning MemoryStore actor.
+#[tokio::test]
+async fn test_spawn_memory_store() {
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn the memory store
+    let store_handle = MemoryStore::spawn(&mut runtime).await;
+
+    // The store should have a valid handle - check that root is "memory_store"
+    let id_str = store_handle.id().root.to_string();
+    assert!(
+        id_str.contains("memory_store"),
+        "Expected memory_store in id: {}",
+        id_str
+    );
+
+    // Graceful shutdown
+    runtime.shutdown_all().await.expect("Shutdown failed");
+}
+
+/// Test initializing MemoryStore with in-memory database.
+#[tokio::test]
+async fn test_memory_store_initialization() {
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn the memory store
+    let store_handle = MemoryStore::spawn(&mut runtime).await;
+
+    // Initialize with in-memory database
+    store_handle
+        .send(InitMemoryStore {
+            config: PersistenceConfig::in_memory(),
+        })
+        .await;
+
+    // Give time for initialization
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Graceful shutdown
+    runtime.shutdown_all().await.expect("Shutdown failed");
+}
+
+/// Test ConversationId serialization roundtrip.
+#[test]
+fn test_conversation_id_serialization() {
+    let id = ConversationId::new();
+    let json = serde_json::to_string(&id).unwrap();
+    let deserialized: ConversationId = serde_json::from_str(&json).unwrap();
+    assert_eq!(id, deserialized);
+}
+
+/// Test MessageId serialization roundtrip.
+#[test]
+fn test_message_id_serialization() {
+    let id = MessageId::new();
+    let json = serde_json::to_string(&id).unwrap();
+    let deserialized: MessageId = serde_json::from_str(&json).unwrap();
+    assert_eq!(id, deserialized);
+}
+
+/// Test MemoryId serialization roundtrip.
+#[test]
+fn test_memory_id_serialization() {
+    let id = MemoryId::new();
+    let json = serde_json::to_string(&id).unwrap();
+    let deserialized: MemoryId = serde_json::from_str(&json).unwrap();
+    assert_eq!(id, deserialized);
+}
