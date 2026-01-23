@@ -13,7 +13,9 @@
 //! ```
 
 use acton_ai::prelude::*;
+use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::Notify;
 
 /// A simple response collector that subscribes to LLM events.
 /// Uses actor state to collect tokens - no mutex needed!
@@ -21,8 +23,6 @@ use std::time::Duration;
 struct ResponseCollector {
     /// Buffer to collect streamed tokens
     buffer: String,
-    /// Whether the stream has completed
-    done: bool,
 }
 
 #[tokio::main]
@@ -57,6 +57,10 @@ async fn main() -> anyhow::Result<()> {
         model
     );
 
+    // Notify to signal stream completion
+    let stream_done = Arc::new(Notify::new());
+    let stream_done_signal = stream_done.clone();
+
     // Create the response collector actor
     let mut collector = runtime.new_actor::<ResponseCollector>();
 
@@ -70,22 +74,20 @@ async fn main() -> anyhow::Result<()> {
         Reply::ready()
     });
 
-    // Handle streaming tokens - append to actor's buffer (no mutex!)
+    // Handle streaming tokens - append to actor's buffer
     collector.mutate_on::<LLMStreamToken>(|actor, envelope| {
         let token = &envelope.message().token;
-        // Print token as it arrives
         print!("{}", token);
         use std::io::Write;
         std::io::stdout().flush().ok();
-        // Append to actor's own buffer
         actor.model.buffer.push_str(token);
         Reply::ready()
     });
 
-    // Handle stream end
-    collector.mutate_on::<LLMStreamEnd>(|actor, envelope| {
+    // Handle stream end - signal completion
+    collector.mutate_on::<LLMStreamEnd>(move |_actor, envelope| {
         tracing::info!("\n[Stream ended: {:?}]", envelope.message().stop_reason);
-        actor.model.done = true;
+        stream_done_signal.notify_one();
         Reply::ready()
     });
 
@@ -108,15 +110,12 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("Sending prompt...");
 
     // Create the request
-    let correlation_id = CorrelationId::new();
-    let agent_id = AgentId::new();
-
     let request = LLMRequest {
-        correlation_id: correlation_id.clone(),
-        agent_id,
+        correlation_id: CorrelationId::new(),
+        agent_id: AgentId::new(),
         messages: vec![
             Message::system("You are a helpful assistant. Be concise."),
-            Message::user("What is the capital of France? Answer in three sentences."),
+            Message::user("What is the capital of France? Answer in one sentence."),
         ],
         tools: None,
     };
@@ -128,11 +127,12 @@ async fn main() -> anyhow::Result<()> {
 
     provider_handle.send(request).await;
 
-    // Wait for streaming response to complete
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait for stream completion (no arbitrary sleep!)
+    stream_done.notified().await;
 
     // Graceful shutdown - this triggers after_stop on the collector
     tracing::info!("Shutting down...");
+    provider_handle.stop().await?;
     runtime.shutdown_all().await?;
 
     Ok(())
