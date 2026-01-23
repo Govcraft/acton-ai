@@ -1,6 +1,6 @@
 [package]
 name = "acton-ai"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "An agentic AI framework where each agent is an actor"
 license = "MIT"
