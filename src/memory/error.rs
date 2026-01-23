@@ -66,6 +66,25 @@ pub enum PersistenceErrorKind {
         /// Error message
         message: String,
     },
+    /// Embedding generation failed
+    EmbeddingFailed {
+        /// The embedding provider name
+        provider: String,
+        /// Error message
+        message: String,
+    },
+    /// Embedding dimension mismatch
+    EmbeddingDimensionMismatch {
+        /// Expected dimension
+        expected: usize,
+        /// Actual dimension
+        actual: usize,
+    },
+    /// Vector search failed
+    VectorSearchFailed {
+        /// Error message
+        message: String,
+    },
 }
 
 impl PersistenceError {
@@ -166,6 +185,29 @@ impl PersistenceError {
         })
     }
 
+    /// Creates an embedding failed error.
+    #[must_use]
+    pub fn embedding_failed(provider: impl Into<String>, message: impl Into<String>) -> Self {
+        Self::new(PersistenceErrorKind::EmbeddingFailed {
+            provider: provider.into(),
+            message: message.into(),
+        })
+    }
+
+    /// Creates an embedding dimension mismatch error.
+    #[must_use]
+    pub fn embedding_dimension_mismatch(expected: usize, actual: usize) -> Self {
+        Self::new(PersistenceErrorKind::EmbeddingDimensionMismatch { expected, actual })
+    }
+
+    /// Creates a vector search failed error.
+    #[must_use]
+    pub fn vector_search_failed(message: impl Into<String>) -> Self {
+        Self::new(PersistenceErrorKind::VectorSearchFailed {
+            message: message.into(),
+        })
+    }
+
     /// Returns true if this error is retriable.
     ///
     /// Connection errors and transaction failures are typically transient
@@ -236,6 +278,23 @@ impl fmt::Display for PersistenceError {
             }
             PersistenceErrorKind::ConnectionError { message } => {
                 write!(f, "database connection error: {}", message)
+            }
+            PersistenceErrorKind::EmbeddingFailed { provider, message } => {
+                write!(
+                    f,
+                    "embedding provider '{}' failed: {}; check provider configuration",
+                    provider, message
+                )
+            }
+            PersistenceErrorKind::EmbeddingDimensionMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "embedding dimension mismatch: expected {}, got {}; ensure consistent provider",
+                    expected, actual
+                )
+            }
+            PersistenceErrorKind::VectorSearchFailed { message } => {
+                write!(f, "vector search failed: {}", message)
             }
         }
     }
@@ -345,5 +404,29 @@ mod tests {
             error.kind(),
             PersistenceErrorKind::ConnectionError { .. }
         ));
+    }
+
+    #[test]
+    fn persistence_error_embedding_failed_display() {
+        let error = PersistenceError::embedding_failed("openai", "rate limited");
+        let msg = error.to_string();
+        assert!(msg.contains("openai"));
+        assert!(msg.contains("rate limited"));
+    }
+
+    #[test]
+    fn persistence_error_embedding_dimension_mismatch_display() {
+        let error = PersistenceError::embedding_dimension_mismatch(384, 768);
+        let msg = error.to_string();
+        assert!(msg.contains("384"));
+        assert!(msg.contains("768"));
+    }
+
+    #[test]
+    fn persistence_error_vector_search_failed_display() {
+        let error = PersistenceError::vector_search_failed("index corrupted");
+        let msg = error.to_string();
+        assert!(msg.contains("vector search"));
+        assert!(msg.contains("index corrupted"));
     }
 }

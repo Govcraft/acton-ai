@@ -4,9 +4,10 @@
 //! connections as parameters and returning results. All functions are
 //! async and use libSQL for database access.
 
+use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
 use crate::messages::{Message, MessageRole};
-use crate::types::{AgentId, ConversationId, MessageId};
+use crate::types::{AgentId, ConversationId, MemoryId, MessageId};
 use libsql::{Connection, Database};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -525,6 +526,305 @@ fn parse_message_role(s: &str) -> Result<MessageRole, PersistenceError> {
             "unknown message role: {}",
             s
         ))),
+    }
+}
+
+// =============================================================================
+// Memory Functions
+// =============================================================================
+
+/// Saves a memory with optional embedding.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `memory` - The memory to save
+///
+/// # Returns
+///
+/// The ID of the saved memory.
+///
+/// # Errors
+///
+/// Returns an error if the insert fails.
+pub async fn save_memory(conn: &Connection, memory: &Memory) -> Result<MemoryId, PersistenceError> {
+    let embedding_bytes = memory.embedding.as_ref().map(Embedding::to_bytes);
+
+    conn.execute(
+        "INSERT INTO memories (id, agent_id, content, embedding, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        libsql::params![
+            memory.id.to_string(),
+            memory.agent_id.to_string(),
+            memory.content.clone(),
+            embedding_bytes,
+            memory.created_at.clone(),
+        ],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("save_memory", e.to_string()))?;
+
+    Ok(memory.id.clone())
+}
+
+/// Searches memories by embedding similarity.
+///
+/// Uses in-application cosine similarity calculation since libSQL
+/// vector extension requires specific setup. Loads all memories with
+/// embeddings for the agent and computes similarity in Rust.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `agent_id` - The agent to search within
+/// * `query_embedding` - The query embedding
+/// * `limit` - Maximum results to return
+/// * `min_similarity` - Optional minimum similarity threshold
+///
+/// # Returns
+///
+/// Memories ranked by similarity score (highest first).
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn search_memories_by_embedding(
+    conn: &Connection,
+    agent_id: &AgentId,
+    query_embedding: &Embedding,
+    limit: usize,
+    min_similarity: Option<f32>,
+) -> Result<Vec<ScoredMemory>, PersistenceError> {
+    // Load all memories with embeddings for this agent
+    let mut rows = conn
+        .query(
+            "SELECT id, content, embedding, created_at FROM memories
+             WHERE agent_id = ?1 AND embedding IS NOT NULL
+             ORDER BY created_at DESC",
+            [agent_id.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("search_memories", e.to_string()))?;
+
+    let mut scored: Vec<ScoredMemory> = Vec::new();
+    let threshold = min_similarity.unwrap_or(-1.0); // Default to include all
+
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("search_memories", e.to_string()))?
+    {
+        let id_str: String = row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let content: String = row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let embedding_bytes: Vec<u8> = row
+            .get(2)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let created_at: String = row
+            .get(3)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let memory_id = MemoryId::parse(&id_str)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let embedding = Embedding::from_bytes(&embedding_bytes)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let similarity = query_embedding
+            .cosine_similarity(&embedding)
+            .map_err(|e| PersistenceError::vector_search_failed(e.to_string()))?;
+
+        if similarity >= threshold {
+            scored.push(ScoredMemory {
+                memory: Memory {
+                    id: memory_id,
+                    agent_id: agent_id.clone(),
+                    content,
+                    embedding: Some(embedding),
+                    created_at,
+                },
+                score: similarity,
+            });
+        }
+    }
+
+    // Sort by score descending
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Limit results
+    scored.truncate(limit);
+
+    Ok(scored)
+}
+
+/// Loads all memories for an agent.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `agent_id` - The agent to load memories for
+/// * `limit` - Optional limit on results
+///
+/// # Returns
+///
+/// List of memories in reverse chronological order.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn load_memories_for_agent(
+    conn: &Connection,
+    agent_id: &AgentId,
+    limit: Option<usize>,
+) -> Result<Vec<Memory>, PersistenceError> {
+    let query = match limit {
+        Some(l) => format!(
+            "SELECT id, content, embedding, created_at FROM memories
+             WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT {}",
+            l
+        ),
+        None => "SELECT id, content, embedding, created_at FROM memories
+             WHERE agent_id = ?1 ORDER BY created_at DESC"
+            .to_string(),
+    };
+
+    let mut rows = conn
+        .query(&query, [agent_id.to_string()])
+        .await
+        .map_err(|e| PersistenceError::query_failed("load_memories", e.to_string()))?;
+
+    let mut memories = Vec::new();
+
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("load_memories", e.to_string()))?
+    {
+        let id_str: String = row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let content: String = row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let embedding_bytes: Option<Vec<u8>> = row
+            .get(2)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let created_at: String = row
+            .get(3)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let memory_id = MemoryId::parse(&id_str)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let embedding = match embedding_bytes {
+            Some(bytes) if !bytes.is_empty() => Some(
+                Embedding::from_bytes(&bytes)
+                    .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+            ),
+            _ => None,
+        };
+
+        memories.push(Memory {
+            id: memory_id,
+            agent_id: agent_id.clone(),
+            content,
+            embedding,
+            created_at,
+        });
+    }
+
+    Ok(memories)
+}
+
+/// Deletes a memory by ID.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `memory_id` - The memory to delete
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn delete_memory(conn: &Connection, memory_id: &MemoryId) -> Result<(), PersistenceError> {
+    conn.execute(
+        "DELETE FROM memories WHERE id = ?1",
+        [memory_id.to_string()],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("delete_memory", e.to_string()))?;
+
+    Ok(())
+}
+
+/// Deletes all memories for an agent.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `agent_id` - The agent whose memories to delete
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn delete_memories_for_agent(
+    conn: &Connection,
+    agent_id: &AgentId,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "DELETE FROM memories WHERE agent_id = ?1",
+        [agent_id.to_string()],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("delete_memories_for_agent", e.to_string()))?;
+
+    Ok(())
+}
+
+/// Counts memories for an agent.
+///
+/// # Arguments
+///
+/// * `conn` - The database connection
+/// * `agent_id` - The agent to count memories for
+///
+/// # Returns
+///
+/// The number of memories for this agent.
+///
+/// # Errors
+///
+/// Returns an error if the query fails.
+pub async fn count_memories_for_agent(
+    conn: &Connection,
+    agent_id: &AgentId,
+) -> Result<usize, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT COUNT(*) FROM memories WHERE agent_id = ?1",
+            [agent_id.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("count_memories", e.to_string()))?;
+
+    if let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("count_memories", e.to_string()))?
+    {
+        let count: i64 = row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        Ok(count as usize)
+    } else {
+        Ok(0)
     }
 }
 

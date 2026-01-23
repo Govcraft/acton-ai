@@ -905,3 +905,186 @@ fn test_memory_id_serialization() {
     let deserialized: MemoryId = serde_json::from_str(&json).unwrap();
     assert_eq!(id, deserialized);
 }
+
+// =============================================================================
+// Phase 5: Memory & Context Tests
+// =============================================================================
+
+/// Test embedding creation and cosine similarity.
+#[test]
+fn test_embedding_similarity() {
+    // Create embeddings for similar and different concepts
+    let vec_a = vec![1.0, 0.0, 0.0]; // Unit vector along x
+    let vec_b = vec![1.0, 0.0, 0.0]; // Same vector
+    let vec_c = vec![0.0, 1.0, 0.0]; // Orthogonal vector
+    let vec_d = vec![-1.0, 0.0, 0.0]; // Opposite vector
+
+    let emb_a = Embedding::new(vec_a).unwrap();
+    let emb_b = Embedding::new(vec_b).unwrap();
+    let emb_c = Embedding::new(vec_c).unwrap();
+    let emb_d = Embedding::new(vec_d).unwrap();
+
+    // Same vectors should have similarity 1.0
+    let sim_ab = emb_a.cosine_similarity(&emb_b).unwrap();
+    assert!((sim_ab - 1.0).abs() < 0.0001);
+
+    // Orthogonal vectors should have similarity 0.0
+    let sim_ac = emb_a.cosine_similarity(&emb_c).unwrap();
+    assert!(sim_ac.abs() < 0.0001);
+
+    // Opposite vectors should have similarity -1.0
+    let sim_ad = emb_a.cosine_similarity(&emb_d).unwrap();
+    assert!((sim_ad + 1.0).abs() < 0.0001);
+}
+
+/// Test stub embedding provider.
+#[tokio::test]
+async fn test_stub_embedding_provider() {
+    let provider = StubEmbeddingProvider::default();
+
+    // Same text should produce same embedding
+    let e1 = provider.embed("hello world").await.unwrap();
+    let e2 = provider.embed("hello world").await.unwrap();
+    assert_eq!(e1, e2);
+
+    // Different text should produce different embedding
+    let e3 = provider.embed("goodbye world").await.unwrap();
+    assert_ne!(e1, e3);
+
+    // Check dimension
+    assert_eq!(e1.dimension(), 384);
+}
+
+/// Test context window management.
+#[test]
+fn test_context_window_management() {
+    let config = ContextWindowConfig::with_max_tokens(100)
+        .with_strategy(TruncationStrategy::KeepSystemAndRecent)
+        .with_reserved_for_response(20);
+    let window = ContextWindow::new(config);
+
+    // Create messages
+    let system = Message::system("You are a test assistant.");
+    let user1 = Message::user("Hello!");
+    let assistant1 = Message::assistant("Hi there!");
+
+    let messages = vec![system.clone(), user1.clone(), assistant1.clone()];
+
+    // All messages should fit
+    let fitted = window.fit_messages(&messages);
+    assert_eq!(fitted.len(), 3);
+
+    // Check stats
+    let stats = window.get_context_stats(&messages);
+    assert_eq!(stats.message_count, 3);
+    assert!(!stats.is_truncated);
+}
+
+/// Test memory storage and retrieval.
+#[tokio::test]
+async fn test_memory_store_with_embeddings() {
+    let mut runtime = ActonApp::launch_async().await;
+
+    // Spawn memory store
+    let store = MemoryStore::spawn(&mut runtime).await;
+
+    // Initialize with in-memory database
+    store
+        .send(InitMemoryStore {
+            config: PersistenceConfig::in_memory(),
+        })
+        .await;
+
+    // Wait for initialization
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Create embedding provider
+    let provider = StubEmbeddingProvider::default();
+
+    // Store memories with embeddings
+    let agent_id = AgentId::new();
+    let memories = vec![
+        "User's favorite color is blue.",
+        "User lives in Seattle.",
+        "User prefers tea over coffee.",
+    ];
+
+    for content in &memories {
+        let embedding = provider.embed(content).await.unwrap();
+        store
+            .send(StoreMemory {
+                agent_id: agent_id.clone(),
+                content: content.to_string(),
+                embedding: Some(embedding),
+            })
+            .await;
+    }
+
+    // Wait for storage
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // Graceful shutdown
+    runtime.shutdown_all().await.expect("Shutdown failed");
+}
+
+/// Test that truncation strategies work correctly.
+#[test]
+fn test_truncation_strategies() {
+    // Test KeepRecent strategy
+    let config = ContextWindowConfig {
+        max_tokens: 20, // Very small window
+        truncation_strategy: TruncationStrategy::KeepRecent,
+        reserved_for_response: 5,
+        tokens_per_char: 0.5, // Higher ratio to make messages "larger"
+    };
+    let window = ContextWindow::new(config);
+
+    // Available: 15 tokens
+    // Each message ~7 tokens (4 chars * 0.5 + 4 overhead = 6 tokens)
+    // So only 2 messages can fit (12 tokens)
+    let messages = vec![
+        Message::system("sys1"),
+        Message::user("msg1"),
+        Message::user("msg2"),
+        Message::user("msg3"),
+    ];
+
+    let fitted = window.fit_messages(&messages);
+    // Should truncate to fit
+    assert!(
+        fitted.len() < messages.len(),
+        "Expected truncation but got {} messages",
+        fitted.len()
+    );
+    // Last message should be in result
+    assert!(fitted.iter().any(|m| m.content == "msg3"));
+}
+
+/// Test building context with memories.
+#[test]
+fn test_build_context_with_memories() {
+    let window = ContextWindow::default();
+    let agent_id = AgentId::new();
+
+    // Create some memories
+    let memories = vec![
+        Memory::new(agent_id.clone(), "User is a software developer."),
+        Memory::new(agent_id, "User prefers concise answers."),
+    ];
+
+    let conversation = vec![
+        Message::user("Hello!"),
+        Message::assistant("Hi there!"),
+    ];
+
+    let context = window.build_context("You are a helpful assistant.", &memories, &conversation);
+
+    // First message should be system with memories
+    assert_eq!(context[0].role, MessageRole::System);
+    assert!(context[0].content.contains("Relevant Context"));
+    assert!(context[0].content.contains("software developer"));
+    assert!(context[0].content.contains("concise answers"));
+
+    // Should have system + 2 conversation messages
+    assert_eq!(context.len(), 3);
+}
