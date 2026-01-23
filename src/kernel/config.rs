@@ -174,9 +174,7 @@ mod tests {
 
     #[test]
     fn serialization_roundtrip_without_logging() {
-        let config = KernelConfig::new()
-            .with_max_agents(25)
-            .without_logging();
+        let config = KernelConfig::new().with_max_agents(25).without_logging();
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: KernelConfig = serde_json::from_str(&json).unwrap();

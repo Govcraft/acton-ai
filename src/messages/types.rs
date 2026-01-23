@@ -932,9 +932,7 @@ mod tests {
 
     #[test]
     fn llm_request_builder_basic() {
-        let request = LLMRequest::builder()
-            .user("Hello")
-            .build();
+        let request = LLMRequest::builder().user("Hello").build();
 
         assert_eq!(request.messages.len(), 1);
         assert_eq!(request.messages[0].content, "Hello");
@@ -1000,10 +998,7 @@ mod tests {
             },
         ];
 
-        let request = LLMRequest::builder()
-            .user("Hello")
-            .tools(tools)
-            .build();
+        let request = LLMRequest::builder().user("Hello").tools(tools).build();
 
         assert!(request.tools.is_some());
         assert_eq!(request.tools.as_ref().unwrap().len(), 2);

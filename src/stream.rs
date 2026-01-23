@@ -159,6 +159,68 @@ pub trait StreamHandler: Send + 'static {
     }
 }
 
+/// Record of a tool call that was executed during the conversation.
+///
+/// This captures all information about a tool invocation, including
+/// the arguments passed and the result returned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutedToolCall {
+    /// The unique ID of the tool call (assigned by the LLM)
+    pub id: String,
+    /// The name of the tool that was called
+    pub name: String,
+    /// The arguments passed to the tool (as JSON)
+    pub arguments: serde_json::Value,
+    /// The result of the tool execution (Ok = JSON result, Err = error message)
+    pub result: Result<serde_json::Value, String>,
+}
+
+impl ExecutedToolCall {
+    /// Creates a new executed tool call record with a successful result.
+    #[must_use]
+    pub fn success(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+        result: serde_json::Value,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+            result: Ok(result),
+        }
+    }
+
+    /// Creates a new executed tool call record with an error result.
+    #[must_use]
+    pub fn error(
+        id: impl Into<String>,
+        name: impl Into<String>,
+        arguments: serde_json::Value,
+        error: impl Into<String>,
+    ) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            arguments,
+            result: Err(error.into()),
+        }
+    }
+
+    /// Returns true if the tool execution succeeded.
+    #[must_use]
+    pub fn is_success(&self) -> bool {
+        self.result.is_ok()
+    }
+
+    /// Returns true if the tool execution failed.
+    #[must_use]
+    pub fn is_error(&self) -> bool {
+        self.result.is_err()
+    }
+}
+
 /// Response collected from a completed stream.
 ///
 /// Returned by `PromptBuilder::collect()` after the stream completes.
@@ -172,6 +234,12 @@ pub struct CollectedResponse {
 
     /// Number of tokens in the response.
     pub token_count: usize,
+
+    /// Tool calls that were executed during the conversation (if any).
+    ///
+    /// This is populated when tools were used and contains all tool calls
+    /// that were executed during the conversation loop.
+    pub tool_calls: Vec<ExecutedToolCall>,
 }
 
 impl CollectedResponse {
@@ -182,7 +250,30 @@ impl CollectedResponse {
             text,
             stop_reason,
             token_count,
+            tool_calls: Vec::new(),
         }
+    }
+
+    /// Creates a new collected response with tool calls.
+    #[must_use]
+    pub fn with_tool_calls(
+        text: String,
+        stop_reason: StopReason,
+        token_count: usize,
+        tool_calls: Vec<ExecutedToolCall>,
+    ) -> Self {
+        Self {
+            text,
+            stop_reason,
+            token_count,
+            tool_calls,
+        }
+    }
+
+    /// Returns true if any tools were called during the conversation.
+    #[must_use]
+    pub fn has_tool_calls(&self) -> bool {
+        !self.tool_calls.is_empty()
     }
 
     /// Returns true if the response completed normally.
@@ -210,6 +301,7 @@ impl Default for CollectedResponse {
             text: String::new(),
             stop_reason: StopReason::EndTurn,
             token_count: 0,
+            tool_calls: Vec::new(),
         }
     }
 }
@@ -287,5 +379,63 @@ mod tests {
         assert!(response.text.is_empty());
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert_eq!(response.token_count, 0);
+        assert!(response.tool_calls.is_empty());
+    }
+
+    #[test]
+    fn collected_response_new_has_empty_tool_calls() {
+        let response = CollectedResponse::new("test".to_string(), StopReason::EndTurn, 1);
+        assert!(response.tool_calls.is_empty());
+        assert!(!response.has_tool_calls());
+    }
+
+    #[test]
+    fn collected_response_with_tool_calls() {
+        let tool_call = ExecutedToolCall::success(
+            "tc_1",
+            "calculator",
+            serde_json::json!({"expr": "2+2"}),
+            serde_json::json!({"result": 4}),
+        );
+
+        let response = CollectedResponse::with_tool_calls(
+            "The result is 4".to_string(),
+            StopReason::EndTurn,
+            5,
+            vec![tool_call],
+        );
+
+        assert!(response.has_tool_calls());
+        assert_eq!(response.tool_calls.len(), 1);
+        assert_eq!(response.tool_calls[0].name, "calculator");
+    }
+
+    #[test]
+    fn executed_tool_call_success() {
+        let call = ExecutedToolCall::success(
+            "tc_1",
+            "my_tool",
+            serde_json::json!({"arg": "value"}),
+            serde_json::json!({"result": "ok"}),
+        );
+
+        assert!(call.is_success());
+        assert!(!call.is_error());
+        assert_eq!(call.id, "tc_1");
+        assert_eq!(call.name, "my_tool");
+    }
+
+    #[test]
+    fn executed_tool_call_error() {
+        let call = ExecutedToolCall::error(
+            "tc_2",
+            "failing_tool",
+            serde_json::json!({}),
+            "Tool execution failed",
+        );
+
+        assert!(!call.is_success());
+        assert!(call.is_error());
+        assert_eq!(call.result.unwrap_err(), "Tool execution failed");
     }
 }

@@ -431,8 +431,10 @@ mod tests {
 
     #[test]
     fn logging_error_create_dir_failed_display() {
-        let error =
-            LoggingError::create_dir_failed(PathBuf::from("/nonexistent/path"), "permission denied");
+        let error = LoggingError::create_dir_failed(
+            PathBuf::from("/nonexistent/path"),
+            "permission denied",
+        );
         let message = error.to_string();
         assert!(message.contains("/nonexistent/path"));
         assert!(message.contains("permission denied"));

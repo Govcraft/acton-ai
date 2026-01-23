@@ -249,11 +249,7 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn anthropic_model(
-        mut self,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
-    ) -> Self {
+    pub fn anthropic_model(mut self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
         self.provider_config = Some(ProviderConfig::anthropic(api_key).with_model(model));
         self
     }
@@ -340,7 +336,9 @@ impl ActonAIBuilder {
         let provider_config = self.provider_config.ok_or_else(|| {
             ActonAIError::new(ActonAIErrorKind::Configuration {
                 field: "provider".to_string(),
-                reason: "no LLM provider configured; use ollama(), anthropic(), openai(), or provider()".to_string(),
+                reason:
+                    "no LLM provider configured; use ollama(), anthropic(), openai(), or provider()"
+                        .to_string(),
             })
         })?;
 
