@@ -13,13 +13,15 @@
 //! ```
 
 use acton_ai::prelude::*;
-use std::sync::Arc;
 use std::time::Duration;
-use tokio::sync::Mutex;
 
-/// A simple response collector that subscribes to LLM events
+/// A simple response collector that subscribes to LLM events.
+/// Uses actor state to collect tokens - no mutex needed!
 #[acton_actor]
 struct ResponseCollector {
+    /// Buffer to collect streamed tokens
+    buffer: String,
+    /// Whether the stream has completed
     done: bool,
 }
 
@@ -55,24 +57,29 @@ async fn main() -> anyhow::Result<()> {
         model
     );
 
-    // Create a shared buffer to collect the response
-    let response_buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-    let buffer_clone = response_buffer.clone();
-
-    // Create a simple collector actor
+    // Create the response collector actor
     let mut collector = runtime.new_actor::<ResponseCollector>();
 
-    // Handle streaming tokens
-    let buffer_for_token = buffer_clone.clone();
-    collector.mutate_on::<LLMStreamToken>(move |_actor, envelope| {
-        let token = envelope.message().token.clone();
-        let buffer = buffer_for_token.clone();
-        print!("{}", token); // Print token as it arrives
+    // Use lifecycle hook to print the collected response when actor stops
+    collector.after_stop(|actor| {
+        if actor.model.buffer.is_empty() {
+            eprintln!("\nNo response received!");
+        } else {
+            println!("\n\nFull response: {}", actor.model.buffer);
+        }
+        Reply::ready()
+    });
+
+    // Handle streaming tokens - append to actor's buffer (no mutex!)
+    collector.mutate_on::<LLMStreamToken>(|actor, envelope| {
+        let token = &envelope.message().token;
+        // Print token as it arrives
+        print!("{}", token);
         use std::io::Write;
         std::io::stdout().flush().ok();
-        Reply::pending(async move {
-            buffer.lock().await.push_str(&token);
-        })
+        // Append to actor's own buffer
+        actor.model.buffer.push_str(token);
+        Reply::ready()
     });
 
     // Handle stream end
@@ -125,18 +132,10 @@ async fn main() -> anyhow::Result<()> {
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    // Wait for response
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    // Wait for response to complete
+    tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // Print final response
-    let final_response = response_buffer.lock().await;
-    if final_response.is_empty() {
-        tracing::warn!("No response received!");
-    } else {
-        println!("\n\nFull response: {}", *final_response);
-    }
-
-    // Graceful shutdown
+    // Graceful shutdown - this triggers after_stop on the collector
     tracing::info!("Shutting down...");
     runtime.shutdown_all().await?;
 
