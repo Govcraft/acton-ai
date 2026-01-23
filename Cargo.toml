@@ -40,4 +40,5 @@ libsql = "0.9"
 # libsql = "0.6"
 
 [dev-dependencies]
+anyhow = "1.0.100"
 tokio-test = "0.4"
