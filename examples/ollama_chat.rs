@@ -105,10 +105,7 @@ async fn main() -> anyhow::Result<()> {
     // Create and start the LLM provider
     let provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
 
-    // Wait for provider to initialize
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    tracing::info!("LLM Provider ready, sending prompt...");
+    tracing::info!("Sending prompt...");
 
     // Create the request
     let correlation_id = CorrelationId::new();
@@ -125,14 +122,13 @@ async fn main() -> anyhow::Result<()> {
     };
 
     // Send the request
-    provider_handle.send(request).await;
-
-    tracing::info!("Request sent, waiting for response...\n");
     print!("Response: ");
     use std::io::Write;
     std::io::stdout().flush().ok();
 
-    // Wait for response to complete
+    provider_handle.send(request).await;
+
+    // Wait for streaming response to complete
     tokio::time::sleep(Duration::from_secs(5)).await;
 
     // Graceful shutdown - this triggers after_stop on the collector
