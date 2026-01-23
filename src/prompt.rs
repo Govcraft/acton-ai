@@ -154,6 +154,8 @@ pub struct PromptBuilder<'a> {
     user_content: String,
     /// Optional system prompt
     system_prompt: Option<String>,
+    /// Optional conversation history (replaces user_content when set)
+    conversation_history: Option<Vec<Message>>,
     /// Callback for stream start
     on_start: Option<StartCallback>,
     /// Callback for each token
@@ -176,6 +178,7 @@ impl<'a> PromptBuilder<'a> {
             runtime,
             user_content,
             system_prompt: None,
+            conversation_history: None,
             on_start: None,
             on_token: None,
             on_end: None,
@@ -201,6 +204,44 @@ impl<'a> PromptBuilder<'a> {
     #[must_use]
     pub fn system(mut self, prompt: impl Into<String>) -> Self {
         self.system_prompt = Some(prompt.into());
+        self
+    }
+
+    /// Sets conversation history for multi-turn conversations.
+    ///
+    /// When set, this replaces the initial user content passed to `prompt()`.
+    /// Use this for multi-turn conversations where you need to include
+    /// prior exchanges between the user and assistant.
+    ///
+    /// The system prompt (if set via `.system()`) is automatically prepended
+    /// to the conversation history.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::prelude::*;
+    ///
+    /// // Build conversation history
+    /// let mut history = vec![
+    ///     Message::user("What is Rust?"),
+    ///     Message::assistant("Rust is a systems programming language..."),
+    /// ];
+    ///
+    /// // Add new user message
+    /// history.push(Message::user("How does ownership work?"));
+    ///
+    /// // Send with full history
+    /// let response = runtime
+    ///     .prompt("")  // Ignored when messages() is set
+    ///     .system("You are a helpful Rust expert.")
+    ///     .messages(history)
+    ///     .on_token(|t| print!("{t}"))
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn messages(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
+        self.conversation_history = Some(messages.into_iter().collect());
         self
     }
 
@@ -494,6 +535,7 @@ impl<'a> PromptBuilder<'a> {
             runtime,
             user_content,
             system_prompt,
+            conversation_history,
             on_start,
             on_token,
             on_end,
@@ -506,7 +548,13 @@ impl<'a> PromptBuilder<'a> {
         if let Some(ref system) = system_prompt {
             messages.push(Message::system(system));
         }
-        messages.push(Message::user(&user_content));
+
+        // Use conversation history if provided, otherwise use user_content
+        if let Some(history) = conversation_history {
+            messages.extend(history);
+        } else {
+            messages.push(Message::user(&user_content));
+        }
 
         // Collect tool definitions
         let tool_definitions: Vec<ToolDefinition> =
