@@ -458,6 +458,148 @@ impl fmt::Display for MultiAgentError {
 
 impl std::error::Error for MultiAgentError {}
 
+// =============================================================================
+// ActonAI High-Level API Error
+// =============================================================================
+
+/// Errors that can occur when using the high-level ActonAI API.
+///
+/// This error type covers all operations in the simplified facade API,
+/// including launch, prompt execution, and stream handling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActonAIError {
+    /// The specific error that occurred
+    pub kind: ActonAIErrorKind,
+}
+
+/// Specific high-level API error types.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActonAIErrorKind {
+    /// Configuration error during builder setup
+    Configuration {
+        /// Description of what was invalid
+        field: String,
+        /// Why it was invalid
+        reason: String,
+    },
+    /// Failed to launch the runtime
+    LaunchFailed {
+        /// Reason for the failure
+        reason: String,
+    },
+    /// Prompt execution failed
+    PromptFailed {
+        /// Reason for the failure
+        reason: String,
+    },
+    /// Stream processing error
+    StreamError {
+        /// Description of the error
+        reason: String,
+    },
+    /// LLM provider error
+    ProviderError {
+        /// Error from the LLM provider
+        reason: String,
+    },
+    /// Runtime was shut down
+    RuntimeShutdown,
+}
+
+impl ActonAIError {
+    /// Creates a new ActonAIError with the given kind.
+    #[must_use]
+    pub fn new(kind: ActonAIErrorKind) -> Self {
+        Self { kind }
+    }
+
+    /// Creates a configuration error.
+    #[must_use]
+    pub fn configuration(field: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::Configuration {
+            field: field.into(),
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a launch failed error.
+    #[must_use]
+    pub fn launch_failed(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::LaunchFailed {
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a prompt failed error.
+    #[must_use]
+    pub fn prompt_failed(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::PromptFailed {
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a stream error.
+    #[must_use]
+    pub fn stream_error(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::StreamError {
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a provider error.
+    #[must_use]
+    pub fn provider_error(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::ProviderError {
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a runtime shutdown error.
+    #[must_use]
+    pub fn runtime_shutdown() -> Self {
+        Self::new(ActonAIErrorKind::RuntimeShutdown)
+    }
+
+    /// Returns true if this error indicates a configuration problem.
+    #[must_use]
+    pub fn is_configuration(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::Configuration { .. })
+    }
+
+    /// Returns true if this error indicates the runtime was shut down.
+    #[must_use]
+    pub fn is_runtime_shutdown(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::RuntimeShutdown)
+    }
+}
+
+impl fmt::Display for ActonAIError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.kind {
+            ActonAIErrorKind::Configuration { field, reason } => {
+                write!(f, "configuration error for '{}': {}", field, reason)
+            }
+            ActonAIErrorKind::LaunchFailed { reason } => {
+                write!(f, "failed to launch runtime: {}", reason)
+            }
+            ActonAIErrorKind::PromptFailed { reason } => {
+                write!(f, "prompt execution failed: {}", reason)
+            }
+            ActonAIErrorKind::StreamError { reason } => {
+                write!(f, "stream error: {}", reason)
+            }
+            ActonAIErrorKind::ProviderError { reason } => {
+                write!(f, "LLM provider error: {}", reason)
+            }
+            ActonAIErrorKind::RuntimeShutdown => {
+                write!(f, "runtime has been shut down")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ActonAIError {}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -563,6 +705,95 @@ mod tests {
         assert_eq!(error1, error2);
 
         let error3 = KernelError::spawn_failed("different");
+        assert_ne!(error1, error3);
+    }
+
+    // ActonAIError tests
+    #[test]
+    fn acton_ai_error_configuration_display() {
+        let error = ActonAIError::configuration("app_name", "cannot be empty");
+
+        let message = error.to_string();
+        assert!(message.contains("app_name"));
+        assert!(message.contains("cannot be empty"));
+    }
+
+    #[test]
+    fn acton_ai_error_launch_failed_display() {
+        let error = ActonAIError::launch_failed("failed to spawn kernel");
+
+        let message = error.to_string();
+        assert!(message.contains("failed to launch"));
+        assert!(message.contains("kernel"));
+    }
+
+    #[test]
+    fn acton_ai_error_prompt_failed_display() {
+        let error = ActonAIError::prompt_failed("timeout waiting for response");
+
+        let message = error.to_string();
+        assert!(message.contains("prompt execution failed"));
+        assert!(message.contains("timeout"));
+    }
+
+    #[test]
+    fn acton_ai_error_stream_error_display() {
+        let error = ActonAIError::stream_error("connection reset");
+
+        let message = error.to_string();
+        assert!(message.contains("stream error"));
+        assert!(message.contains("connection reset"));
+    }
+
+    #[test]
+    fn acton_ai_error_provider_error_display() {
+        let error = ActonAIError::provider_error("rate limit exceeded");
+
+        let message = error.to_string();
+        assert!(message.contains("LLM provider"));
+        assert!(message.contains("rate limit"));
+    }
+
+    #[test]
+    fn acton_ai_error_runtime_shutdown_display() {
+        let error = ActonAIError::runtime_shutdown();
+
+        let message = error.to_string();
+        assert!(message.contains("shut down"));
+    }
+
+    #[test]
+    fn acton_ai_error_is_configuration() {
+        let error = ActonAIError::configuration("field", "reason");
+        assert!(error.is_configuration());
+
+        let other = ActonAIError::runtime_shutdown();
+        assert!(!other.is_configuration());
+    }
+
+    #[test]
+    fn acton_ai_error_is_runtime_shutdown() {
+        let error = ActonAIError::runtime_shutdown();
+        assert!(error.is_runtime_shutdown());
+
+        let other = ActonAIError::prompt_failed("test");
+        assert!(!other.is_runtime_shutdown());
+    }
+
+    #[test]
+    fn acton_ai_errors_are_clone() {
+        let error1 = ActonAIError::runtime_shutdown();
+        let error2 = error1.clone();
+        assert_eq!(error1, error2);
+    }
+
+    #[test]
+    fn acton_ai_errors_are_eq() {
+        let error1 = ActonAIError::runtime_shutdown();
+        let error2 = ActonAIError::runtime_shutdown();
+        assert_eq!(error1, error2);
+
+        let error3 = ActonAIError::prompt_failed("test");
         assert_ne!(error1, error3);
     }
 }

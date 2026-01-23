@@ -222,6 +222,186 @@ pub struct LLMRequest {
     pub tools: Option<Vec<ToolDefinition>>,
 }
 
+impl LLMRequest {
+    /// Creates a simple request with just user content.
+    ///
+    /// IDs are generated internally - users don't need to manage them.
+    /// This is the simplest way to create an LLM request.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use acton_ai::messages::LLMRequest;
+    ///
+    /// let request = LLMRequest::simple("What is the capital of France?");
+    /// assert!(!request.messages.is_empty());
+    /// ```
+    #[must_use]
+    pub fn simple(content: impl Into<String>) -> Self {
+        Self {
+            correlation_id: CorrelationId::new(),
+            agent_id: AgentId::new(),
+            messages: vec![Message::user(content)],
+            tools: None,
+        }
+    }
+
+    /// Creates a request with a system prompt and user content.
+    ///
+    /// IDs are generated internally.
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use acton_ai::messages::LLMRequest;
+    ///
+    /// let request = LLMRequest::with_system(
+    ///     "You are a helpful assistant.",
+    ///     "What is 2 + 2?"
+    /// );
+    /// assert_eq!(request.messages.len(), 2);
+    /// ```
+    #[must_use]
+    pub fn with_system(system: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            correlation_id: CorrelationId::new(),
+            agent_id: AgentId::new(),
+            messages: vec![Message::system(system), Message::user(content)],
+            tools: None,
+        }
+    }
+
+    /// Creates a builder for advanced request configuration.
+    ///
+    /// Use the builder when you need to:
+    /// - Set explicit correlation or agent IDs (for tracking/persistence)
+    /// - Add multiple messages
+    /// - Include tool definitions
+    ///
+    /// # Example
+    ///
+    /// ```
+    /// use acton_ai::messages::LLMRequest;
+    ///
+    /// let request = LLMRequest::builder()
+    ///     .system("You are a helpful assistant.")
+    ///     .user("Hello!")
+    ///     .build();
+    /// ```
+    #[must_use]
+    pub fn builder() -> LLMRequestBuilder {
+        LLMRequestBuilder::default()
+    }
+}
+
+/// Builder for constructing LLM requests with advanced options.
+///
+/// Use `LLMRequest::builder()` to create an instance.
+///
+/// # Example
+///
+/// ```
+/// use acton_ai::messages::LLMRequest;
+/// use acton_ai::types::CorrelationId;
+///
+/// let request = LLMRequest::builder()
+///     .correlation_id(CorrelationId::new())
+///     .system("You are an expert.")
+///     .user("Explain Rust ownership.")
+///     .build();
+/// ```
+#[derive(Default)]
+pub struct LLMRequestBuilder {
+    correlation_id: Option<CorrelationId>,
+    agent_id: Option<AgentId>,
+    messages: Vec<Message>,
+    tools: Option<Vec<ToolDefinition>>,
+}
+
+impl LLMRequestBuilder {
+    /// Sets an explicit correlation ID.
+    ///
+    /// Use this when you need to track requests across systems
+    /// or match requests to responses manually.
+    #[must_use]
+    pub fn correlation_id(mut self, id: CorrelationId) -> Self {
+        self.correlation_id = Some(id);
+        self
+    }
+
+    /// Sets an explicit agent ID.
+    ///
+    /// Use this in multi-agent scenarios where you need to
+    /// identify which agent made the request.
+    #[must_use]
+    pub fn agent_id(mut self, id: AgentId) -> Self {
+        self.agent_id = Some(id);
+        self
+    }
+
+    /// Adds a system message.
+    #[must_use]
+    pub fn system(mut self, content: impl Into<String>) -> Self {
+        self.messages.push(Message::system(content));
+        self
+    }
+
+    /// Adds a user message.
+    #[must_use]
+    pub fn user(mut self, content: impl Into<String>) -> Self {
+        self.messages.push(Message::user(content));
+        self
+    }
+
+    /// Adds an assistant message.
+    #[must_use]
+    pub fn assistant(mut self, content: impl Into<String>) -> Self {
+        self.messages.push(Message::assistant(content));
+        self
+    }
+
+    /// Adds a custom message.
+    #[must_use]
+    pub fn message(mut self, message: Message) -> Self {
+        self.messages.push(message);
+        self
+    }
+
+    /// Adds multiple messages.
+    #[must_use]
+    pub fn messages(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
+        self.messages.extend(messages);
+        self
+    }
+
+    /// Sets the tool definitions available to the LLM.
+    #[must_use]
+    pub fn tools(mut self, tools: Vec<ToolDefinition>) -> Self {
+        self.tools = Some(tools);
+        self
+    }
+
+    /// Adds a single tool definition.
+    #[must_use]
+    pub fn tool(mut self, tool: ToolDefinition) -> Self {
+        self.tools.get_or_insert_with(Vec::new).push(tool);
+        self
+    }
+
+    /// Builds the LLM request.
+    ///
+    /// IDs are auto-generated if not explicitly set.
+    #[must_use]
+    pub fn build(self) -> LLMRequest {
+        LLMRequest {
+            correlation_id: self.correlation_id.unwrap_or_default(),
+            agent_id: self.agent_id.unwrap_or_default(),
+            messages: self.messages,
+            tools: self.tools,
+        }
+    }
+}
+
 /// Complete response from the LLM (non-streaming).
 #[acton_message]
 #[derive(Serialize, Deserialize)]
@@ -717,5 +897,149 @@ mod tests {
             let deserialized: StopReason = serde_json::from_str(&json).unwrap();
             assert_eq!(reason, deserialized);
         }
+    }
+
+    // LLMRequest convenience method tests
+    #[test]
+    fn llm_request_simple_creates_user_message() {
+        let request = LLMRequest::simple("Hello");
+
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].role, MessageRole::User);
+        assert_eq!(request.messages[0].content, "Hello");
+        assert!(request.tools.is_none());
+    }
+
+    #[test]
+    fn llm_request_simple_generates_ids() {
+        let request1 = LLMRequest::simple("Hello");
+        let request2 = LLMRequest::simple("World");
+
+        assert_ne!(request1.correlation_id, request2.correlation_id);
+        assert_ne!(request1.agent_id, request2.agent_id);
+    }
+
+    #[test]
+    fn llm_request_with_system_creates_two_messages() {
+        let request = LLMRequest::with_system("Be helpful", "Hello");
+
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, MessageRole::System);
+        assert_eq!(request.messages[0].content, "Be helpful");
+        assert_eq!(request.messages[1].role, MessageRole::User);
+        assert_eq!(request.messages[1].content, "Hello");
+    }
+
+    #[test]
+    fn llm_request_builder_basic() {
+        let request = LLMRequest::builder()
+            .user("Hello")
+            .build();
+
+        assert_eq!(request.messages.len(), 1);
+        assert_eq!(request.messages[0].content, "Hello");
+    }
+
+    #[test]
+    fn llm_request_builder_with_system_and_user() {
+        let request = LLMRequest::builder()
+            .system("Be concise")
+            .user("What is 2+2?")
+            .build();
+
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[0].role, MessageRole::System);
+        assert_eq!(request.messages[1].role, MessageRole::User);
+    }
+
+    #[test]
+    fn llm_request_builder_with_explicit_ids() {
+        let corr_id = CorrelationId::new();
+        let agent_id = AgentId::new();
+
+        let request = LLMRequest::builder()
+            .correlation_id(corr_id.clone())
+            .agent_id(agent_id.clone())
+            .user("Hello")
+            .build();
+
+        assert_eq!(request.correlation_id, corr_id);
+        assert_eq!(request.agent_id, agent_id);
+    }
+
+    #[test]
+    fn llm_request_builder_with_tools() {
+        let tool = ToolDefinition {
+            name: "calculator".to_string(),
+            description: "Math".to_string(),
+            input_schema: serde_json::json!({}),
+        };
+
+        let request = LLMRequest::builder()
+            .user("Calculate 2+2")
+            .tool(tool.clone())
+            .build();
+
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 1);
+        assert_eq!(request.tools.as_ref().unwrap()[0].name, "calculator");
+    }
+
+    #[test]
+    fn llm_request_builder_with_multiple_tools() {
+        let tools = vec![
+            ToolDefinition {
+                name: "calc".to_string(),
+                description: "Math".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+            ToolDefinition {
+                name: "search".to_string(),
+                description: "Search".to_string(),
+                input_schema: serde_json::json!({}),
+            },
+        ];
+
+        let request = LLMRequest::builder()
+            .user("Hello")
+            .tools(tools)
+            .build();
+
+        assert!(request.tools.is_some());
+        assert_eq!(request.tools.as_ref().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn llm_request_builder_with_assistant() {
+        let request = LLMRequest::builder()
+            .user("Hello")
+            .assistant("Hi there!")
+            .user("How are you?")
+            .build();
+
+        assert_eq!(request.messages.len(), 3);
+        assert_eq!(request.messages[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn llm_request_builder_with_custom_message() {
+        let custom_msg = Message::tool("tc_123", "Result: 4");
+
+        let request = LLMRequest::builder()
+            .user("Calculate 2+2")
+            .message(custom_msg)
+            .build();
+
+        assert_eq!(request.messages.len(), 2);
+        assert_eq!(request.messages[1].role, MessageRole::Tool);
+    }
+
+    #[test]
+    fn llm_request_builder_generates_ids_when_not_set() {
+        let request1 = LLMRequest::builder().user("Hello").build();
+        let request2 = LLMRequest::builder().user("World").build();
+
+        assert_ne!(request1.correlation_id, request2.correlation_id);
+        assert_ne!(request1.agent_id, request2.agent_id);
     }
 }

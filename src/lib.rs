@@ -11,7 +11,36 @@
 //! - **Tool Registry**: Registers and executes tools via supervised child actors
 //! - **Memory Store**: Persistence via Turso/libSQL
 //!
-//! ## Quick Start
+//! ## Quick Start (High-Level API)
+//!
+//! The simplest way to use acton-ai is via the `ActonAI` facade:
+//!
+//! ```rust,ignore
+//! use acton_ai::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), ActonAIError> {
+//!     let runtime = ActonAI::builder()
+//!         .app_name("my-app")
+//!         .ollama("qwen2.5:7b")
+//!         .launch()
+//!         .await?;
+//!
+//!     runtime
+//!         .prompt("What is the capital of France?")
+//!         .system("Be concise.")
+//!         .on_token(|t| print!("{t}"))
+//!         .collect()
+//!         .await?;
+//!
+//!     println!();
+//!     Ok(())
+//! }
+//! ```
+//!
+//! ## Advanced Usage (Low-Level API)
+//!
+//! For full control over the actor system:
 //!
 //! ```rust,ignore
 //! use acton_ai::prelude::*;
@@ -30,15 +59,24 @@
 
 pub mod agent;
 pub mod error;
+pub mod facade;
 pub mod kernel;
 pub mod llm;
 pub mod memory;
 pub mod messages;
+pub mod prompt;
+pub mod stream;
 pub mod tools;
 pub mod types;
 
 /// Prelude module for convenient imports
 pub mod prelude {
+    // High-level API (recommended for most use cases)
+    pub use crate::error::{ActonAIError, ActonAIErrorKind};
+    pub use crate::facade::{ActonAI, ActonAIBuilder};
+    pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
+
+    // Low-level API (for advanced use cases)
     pub use crate::agent::{
         Agent, AgentConfig, AgentState, DelegatedTask, DelegatedTaskState, DelegationTracker,
         IncomingTaskInfo, InitAgent,
