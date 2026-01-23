@@ -141,12 +141,12 @@ async fn main() -> anyhow::Result<()> {
         .with_tool_callback(
             calculator,
             |args| async move {
-                let expression = args
-                    .get("expression")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        ToolError::validation_failed("calculator", "missing 'expression'")
-                    })?;
+                let expression =
+                    args.get("expression")
+                        .and_then(|v| v.as_str())
+                        .ok_or_else(|| {
+                            ToolError::validation_failed("calculator", "missing 'expression'")
+                        })?;
 
                 let result = evaluate_expression(expression)
                     .map_err(|e| ToolError::execution_failed("calculator", e))?;
@@ -173,11 +173,9 @@ async fn main() -> anyhow::Result<()> {
                     "unix_timestamp": now.timestamp()
                 }))
             },
-            |result| {
-                match result {
-                    Ok(value) => eprintln!("\n[Time returned: {value}]"),
-                    Err(e) => eprintln!("\n[Time error: {e}]"),
-                }
+            |result| match result {
+                Ok(value) => eprintln!("\n[Time returned: {value}]"),
+                Err(e) => eprintln!("\n[Time error: {e}]"),
             },
         )
         .on_token(|token| {
