@@ -1,13 +1,22 @@
 //! Example: Multi-Turn Conversation with Tools
 //!
-//! This example demonstrates multi-turn conversation with history management
-//! using the high-level ActonAI `PromptBuilder` API. It showcases:
+//! This example demonstrates multi-turn conversation using the `Conversation`
+//! abstraction which provides automatic history management.
+//!
+//! ## Features Demonstrated
 //!
 //! 1. Setting up ActonAI runtime with Ollama and built-in tools
-//! 2. Using the fluent `.messages()` API for conversation history
-//! 3. Streaming responses with `.on_token()` callback
+//! 2. Using the `Conversation` API for automatic history management
+//! 3. Streaming responses with `send_streaming()`
 //! 4. Built-in tools (bash, read_file, etc.) for agentic capabilities
-//! 5. Using a custom tool for graceful exit (LLM recognizes exit intent)
+//! 5. Per-message customization with `send_with()` for exit detection
+//!
+//! ## Key Benefits of Conversation API
+//!
+//! - **No manual history tracking**: Messages are automatically added to history
+//! - **No cloning**: History is managed internally, no `.clone()` needed
+//! - **No empty strings**: No confusing `.prompt("")` for continuations
+//! - **Auto-builtins**: When configured with `with_builtins()`, tools are available
 //!
 //! # Configuration
 //!
@@ -73,13 +82,13 @@ async fn main() -> Result<(), ActonAIError> {
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
 
     eprintln!("Connecting to Ollama at {ollama_url} with model {model}");
-    eprintln!("Say goodbye to end the conversation.\n");
 
     // Launch ActonAI runtime with built-in tools
+    // Note: with_builtins() auto-enables builtins on all prompts/conversations
     let runtime = ActonAI::builder()
         .app_name("conversation-example")
         .ollama_at(&ollama_url, &model)
-        .with_builtins() // Enable all built-in tools (bash, read_file, etc.)
+        .with_builtins() // Auto-enables built-in tools on every prompt
         .launch()
         .await?;
 
@@ -104,14 +113,17 @@ async fn main() -> Result<(), ActonAIError> {
         }),
     };
 
-    // System prompt for the assistant
-    let system_prompt = "You are a helpful assistant with access to tools including bash, \
-                         read_file, write_file, glob, grep, and more. Be conversational and \
-                         remember our previous exchanges. Use tools when appropriate to help \
-                         the user. When the user wants to leave, use the exit_conversation tool.";
-
-    // Conversation history
-    let mut history: Vec<Message> = Vec::new();
+    // Create a managed conversation with system prompt
+    // History is automatically tracked - no manual Vec<Message> needed!
+    let mut conv = runtime
+        .conversation()
+        .system(
+            "You are a helpful assistant with access to tools including bash, \
+             read_file, write_file, glob, grep, and more. Be conversational and \
+             remember our previous exchanges. Use tools when appropriate to help \
+             the user. When the user wants to leave, use the exit_conversation tool.",
+        )
+        .build();
 
     // Main conversation loop
     loop {
@@ -123,35 +135,32 @@ async fn main() -> Result<(), ActonAIError> {
             continue;
         }
 
-        // Add user message to history
-        history.push(Message::user(&input));
-
-        // Send request with built-in tools and exit tool
         print!("Assistant: ");
-        let response = runtime
-            .prompt("")
-            .system(system_prompt)
-            .messages(history.clone())
-            .use_builtins() // Make built-in tools available to the LLM
-            .with_tool_callback(
-                exit_tool.clone(),
-                {
-                    let shutdown = shutdown.clone();
-                    move |_args| {
-                        let shutdown = shutdown.clone();
-                        async move {
-                            shutdown.store(true, Ordering::SeqCst);
-                            Ok(serde_json::json!({"status": "goodbye"}))
-                        }
-                    }
-                },
-                |_result| {},
-            )
-            .on_token(|token| {
-                print!("{token}");
-                std::io::stdout().flush().ok();
+
+        // Use send_with() for per-message customization (adding exit tool + streaming)
+        // History is automatically managed - no need to push/clone messages!
+        let _response = conv
+            .send_with(&input, |builder| {
+                builder
+                    .with_tool_callback(
+                        exit_tool.clone(),
+                        {
+                            let shutdown = shutdown.clone();
+                            move |_args| {
+                                let shutdown = shutdown.clone();
+                                async move {
+                                    shutdown.store(true, Ordering::SeqCst);
+                                    Ok(serde_json::json!({"status": "goodbye"}))
+                                }
+                            }
+                        },
+                        |_result| {},
+                    )
+                    .on_token(|token| {
+                        print!("{token}");
+                        std::io::stdout().flush().ok();
+                    })
             })
-            .collect()
             .await?;
         println!();
 
@@ -160,8 +169,8 @@ async fn main() -> Result<(), ActonAIError> {
             break;
         }
 
-        // Add assistant response to history
-        history.push(Message::assistant(&response.text));
+        // Note: No need to manually add assistant response to history!
+        // The Conversation abstraction handles this automatically.
     }
 
     // Graceful shutdown

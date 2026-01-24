@@ -58,6 +58,7 @@
 //! ```
 
 pub mod agent;
+pub mod conversation;
 pub mod error;
 pub mod facade;
 pub mod kernel;
@@ -72,6 +73,7 @@ pub mod types;
 /// Prelude module for convenient imports
 pub mod prelude {
     // High-level API (recommended for most use cases)
+    pub use crate::conversation::{Conversation, ConversationBuilder};
     pub use crate::error::{ActonAIError, ActonAIErrorKind};
     pub use crate::facade::{ActonAI, ActonAIBuilder};
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};

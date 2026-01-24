@@ -27,9 +27,11 @@
 //! }
 //! ```
 
+use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::kernel::{Kernel, KernelConfig};
 use crate::llm::{LLMProvider, ProviderConfig};
+use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
 #[cfg(feature = "hyperlight")]
@@ -68,6 +70,8 @@ pub struct ActonAI {
     provider_handle: ActorHandle,
     /// Built-in tools (if enabled)
     builtins: Option<BuiltinTools>,
+    /// Whether to automatically enable builtins on each prompt
+    auto_builtins: bool,
     /// Whether the runtime has been shut down
     is_shutdown: bool,
 }
@@ -77,6 +81,7 @@ impl std::fmt::Debug for ActonAI {
         f.debug_struct("ActonAI")
             .field("is_shutdown", &self.is_shutdown)
             .field("has_builtins", &self.builtins.is_some())
+            .field("auto_builtins", &self.auto_builtins)
             .finish_non_exhaustive()
     }
 }
@@ -100,6 +105,11 @@ impl ActonAI {
 
     /// Creates a prompt builder for sending a message to the LLM.
     ///
+    /// If built-in tools were configured with [`with_builtins`](ActonAIBuilder::with_builtins)
+    /// or [`with_builtin_tools`](ActonAIBuilder::with_builtin_tools), they are automatically
+    /// enabled on the prompt. Use [`manual_builtins`](ActonAIBuilder::manual_builtins) during
+    /// builder configuration to disable auto-enabling.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -112,7 +122,11 @@ impl ActonAI {
     /// ```
     #[must_use]
     pub fn prompt(&self, content: impl Into<String>) -> PromptBuilder<'_> {
-        PromptBuilder::new(self, content.into())
+        let mut builder = PromptBuilder::new(self, content.into());
+        if self.auto_builtins && self.builtins.is_some() {
+            builder = builder.use_builtins();
+        }
+        builder
     }
 
     /// Returns a reference to the underlying actor runtime.
@@ -161,6 +175,82 @@ impl ActonAI {
     #[must_use]
     pub fn has_builtins(&self) -> bool {
         self.builtins.is_some()
+    }
+
+    /// Returns whether builtins are automatically enabled on each prompt.
+    ///
+    /// When true, [`prompt()`](Self::prompt), [`continue_with()`](Self::continue_with),
+    /// and [`conversation()`](Self::conversation) automatically add builtins without
+    /// requiring [`use_builtins()`](crate::prompt::PromptBuilder::use_builtins).
+    #[must_use]
+    pub fn is_auto_builtins(&self) -> bool {
+        self.auto_builtins
+    }
+
+    /// Continues a conversation from existing messages.
+    ///
+    /// This is a clearer alternative to `.prompt("").messages(...)` when you want
+    /// to continue a conversation without adding a new user message. The provided
+    /// messages become the conversation history.
+    ///
+    /// If [`with_builtins`](ActonAIBuilder::with_builtins) was configured, builtins
+    /// are automatically enabled (unless [`manual_builtins`](ActonAIBuilder::manual_builtins)
+    /// was used).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let history = vec![
+    ///     Message::user("What is Rust?"),
+    ///     Message::assistant("Rust is a systems programming language..."),
+    ///     Message::user("How does ownership work?"),
+    /// ];
+    ///
+    /// let response = runtime
+    ///     .continue_with(history)
+    ///     .system("Be concise.")
+    ///     .on_token(|t| print!("{t}"))
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn continue_with(&self, messages: impl IntoIterator<Item = Message>) -> PromptBuilder<'_> {
+        let mut builder = PromptBuilder::new(self, String::new());
+        builder = builder.messages(messages);
+        if self.auto_builtins && self.builtins.is_some() {
+            builder = builder.use_builtins();
+        }
+        builder
+    }
+
+    /// Starts a managed conversation session.
+    ///
+    /// This returns a [`ConversationBuilder`] that can be used to configure
+    /// and create a [`Conversation`](crate::conversation::Conversation) with
+    /// automatic history management.
+    ///
+    /// Using `Conversation` eliminates the boilerplate of manually tracking
+    /// conversation history - messages are automatically added to history
+    /// after each exchange.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut conv = runtime.conversation()
+    ///     .system("You are a helpful assistant.")
+    ///     .build();
+    ///
+    /// // Each send() automatically manages history
+    /// let response = conv.send("What is Rust?").await?;
+    /// println!("Assistant: {}", response.text);
+    ///
+    /// // Conversation remembers context
+    /// let response = conv.send("How does ownership work?").await?;
+    /// println!("Assistant: {}", response.text);
+    /// ```
+    #[must_use]
+    pub fn conversation(&self) -> ConversationBuilder<'_> {
+        ConversationBuilder::new(self)
     }
 
     /// Shuts down the runtime gracefully.
@@ -225,6 +315,7 @@ pub struct ActonAIBuilder {
     app_name: Option<String>,
     provider_config: Option<ProviderConfig>,
     builtins: BuiltinToolsConfig,
+    auto_builtins: bool,
     #[cfg(feature = "hyperlight")]
     sandbox_mode: SandboxMode,
 }
@@ -371,7 +462,7 @@ impl ActonAIBuilder {
         self
     }
 
-    /// Enables all built-in tools.
+    /// Enables all built-in tools with automatic enabling on each prompt.
     ///
     /// Built-in tools include:
     /// - `read_file`: Read file contents with line numbers
@@ -384,6 +475,14 @@ impl ActonAIBuilder {
     /// - `calculate`: Evaluate mathematical expressions
     /// - `web_fetch`: Fetch content from URLs
     ///
+    /// When using this method, builtins are automatically enabled on every prompt
+    /// created via [`prompt()`](ActonAI::prompt), [`continue_with()`](ActonAI::continue_with),
+    /// or [`conversation()`](ActonAI::conversation). You don't need to call
+    /// [`use_builtins()`](crate::prompt::PromptBuilder::use_builtins) on each prompt.
+    ///
+    /// Use [`manual_builtins()`](Self::manual_builtins) after this to opt out of
+    /// auto-enabling while still having builtins available.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -393,16 +492,61 @@ impl ActonAIBuilder {
     ///     .with_builtins()
     ///     .launch()
     ///     .await?;
+    ///
+    /// // Builtins are automatically available - no need for .use_builtins()
+    /// runtime
+    ///     .prompt("List files in the current directory")
+    ///     .collect()
+    ///     .await?;
     /// ```
     #[must_use]
     pub fn with_builtins(mut self) -> Self {
         self.builtins = BuiltinToolsConfig::All;
+        self.auto_builtins = true;
         self
     }
 
-    /// Enables specific built-in tools by name.
+    /// Disables auto-enabling of builtins on each prompt.
+    ///
+    /// When called after [`with_builtins()`](Self::with_builtins) or
+    /// [`with_builtin_tools()`](Self::with_builtin_tools), this opts out of
+    /// automatically adding builtins to each prompt. You'll need to manually
+    /// call [`use_builtins()`](crate::prompt::PromptBuilder::use_builtins) on
+    /// prompts where you want builtins available.
+    ///
+    /// This is useful when you only want builtins on specific prompts rather
+    /// than all prompts.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtins()
+    ///     .manual_builtins()  // Opt out of auto-enable
+    ///     .launch()
+    ///     .await?;
+    ///
+    /// // Must explicitly enable builtins
+    /// runtime
+    ///     .prompt("List files")
+    ///     .use_builtins()  // Now required
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn manual_builtins(mut self) -> Self {
+        self.auto_builtins = false;
+        self
+    }
+
+    /// Enables specific built-in tools by name with automatic enabling on each prompt.
     ///
     /// See [`with_builtins`](Self::with_builtins) for the list of available tools.
+    ///
+    /// Like `with_builtins()`, this automatically enables the selected tools on every
+    /// prompt. Use [`manual_builtins()`](Self::manual_builtins) to opt out.
     ///
     /// # Example
     ///
@@ -413,10 +557,17 @@ impl ActonAIBuilder {
     ///     .with_builtin_tools(&["read_file", "write_file", "glob"])
     ///     .launch()
     ///     .await?;
+    ///
+    /// // Selected tools are automatically available
+    /// runtime
+    ///     .prompt("Read the README")
+    ///     .collect()
+    ///     .await?;
     /// ```
     #[must_use]
     pub fn with_builtin_tools(mut self, tools: &[&str]) -> Self {
         self.builtins = BuiltinToolsConfig::Select(tools.iter().map(|s| (*s).to_string()).collect());
+        self.auto_builtins = true;
         self
     }
 
@@ -613,8 +764,17 @@ impl ActonAIBuilder {
             runtime,
             provider_handle,
             builtins,
+            auto_builtins: self.auto_builtins,
             is_shutdown: false,
         })
+    }
+
+    /// Returns whether auto-builtins is currently enabled.
+    ///
+    /// This is useful for testing or debugging.
+    #[must_use]
+    pub fn is_auto_builtins(&self) -> bool {
+        self.auto_builtins
     }
 }
 
@@ -715,5 +875,29 @@ mod tests {
         let err = result.unwrap_err();
         assert!(err.is_configuration());
         assert!(err.to_string().contains("provider"));
+    }
+
+    #[test]
+    fn with_builtins_enables_auto_builtins() {
+        let builder = ActonAI::builder().with_builtins();
+        assert!(builder.is_auto_builtins());
+    }
+
+    #[test]
+    fn with_builtin_tools_enables_auto_builtins() {
+        let builder = ActonAI::builder().with_builtin_tools(&["bash", "read_file"]);
+        assert!(builder.is_auto_builtins());
+    }
+
+    #[test]
+    fn manual_builtins_disables_auto_builtins() {
+        let builder = ActonAI::builder().with_builtins().manual_builtins();
+        assert!(!builder.is_auto_builtins());
+    }
+
+    #[test]
+    fn default_builder_has_no_auto_builtins() {
+        let builder = ActonAI::builder();
+        assert!(!builder.is_auto_builtins());
     }
 }
