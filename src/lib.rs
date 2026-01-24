@@ -71,6 +71,9 @@ pub mod stream;
 pub mod tools;
 pub mod types;
 
+#[cfg(feature = "agent-skills")]
+pub mod skills;
+
 /// Prelude module for convenient imports
 pub mod prelude {
     // High-level API (recommended for most use cases)
@@ -116,4 +119,13 @@ pub mod prelude {
 
     // Re-export acton-reactive prelude
     pub use acton_reactive::prelude::*;
+
+    // Agent Skills (feature-gated)
+    #[cfg(feature = "agent-skills")]
+    pub use crate::skills::{LoadedSkill, SkillInfo, SkillRegistry, SkillsError};
+    #[cfg(feature = "agent-skills")]
+    pub use crate::tools::builtins::{
+        spawn_skill_tool_actors, skill_tool_names, ActivateSkillTool, ActivateSkillToolActor,
+        ListSkillsTool, ListSkillsToolActor,
+    };
 }

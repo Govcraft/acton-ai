@@ -2,7 +2,10 @@
 //!
 //! Searches file contents with regex support.
 
+use crate::messages::ToolDefinition;
+use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +17,12 @@ use walkdir::WalkDir;
 /// Searches file contents using regex patterns.
 #[derive(Debug, Default, Clone)]
 pub struct GrepTool;
+
+/// Grep tool actor state.
+///
+/// This actor wraps the `GrepTool` executor for per-agent tool spawning.
+#[acton_actor]
+pub struct GrepToolActor;
 
 /// Arguments for the grep tool.
 #[derive(Debug, Deserialize)]
@@ -324,6 +333,46 @@ impl ToolExecutorTrait for GrepTool {
         })?;
 
         Ok(())
+    }
+}
+
+impl ToolActor for GrepToolActor {
+    fn name() -> &'static str {
+        "grep"
+    }
+
+    fn definition() -> ToolDefinition {
+        GrepTool::config().definition
+    }
+
+    async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
+        let mut builder = runtime.new_actor_with_name::<Self>("grep_tool".to_string());
+
+        builder.act_on::<ExecuteToolDirect>(|actor, envelope| {
+            let msg = envelope.message();
+            let correlation_id = msg.correlation_id.clone();
+            let tool_call_id = msg.tool_call_id.clone();
+            let args = msg.args.clone();
+            let broker = actor.broker().clone();
+
+            Reply::pending(async move {
+                let tool = GrepTool::new();
+                let result = tool.execute(args).await;
+
+                let response = match result {
+                    Ok(value) => {
+                        let result_str = serde_json::to_string(&value)
+                            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+                        ToolActorResponse::success(correlation_id, tool_call_id, result_str)
+                    }
+                    Err(e) => ToolActorResponse::error(correlation_id, tool_call_id, e.to_string()),
+                };
+
+                broker.broadcast(response).await;
+            })
+        });
+
+        builder.start().await
     }
 }
 

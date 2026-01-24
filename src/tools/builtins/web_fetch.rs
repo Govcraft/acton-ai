@@ -2,7 +2,10 @@
 //!
 //! Fetches content from URLs.
 
+use crate::messages::ToolDefinition;
+use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::*;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -20,6 +23,12 @@ pub struct WebFetchTool {
     /// Maximum response size in bytes
     max_response_size: usize,
 }
+
+/// Web fetch tool actor state.
+///
+/// This actor wraps the `WebFetchTool` executor for per-agent tool spawning.
+#[acton_actor]
+pub struct WebFetchToolActor;
 
 impl Default for WebFetchTool {
     fn default() -> Self {
@@ -309,6 +318,46 @@ impl ToolExecutorTrait for WebFetchTool {
         Self::validate_url(&args.url)?;
 
         Ok(())
+    }
+}
+
+impl ToolActor for WebFetchToolActor {
+    fn name() -> &'static str {
+        "web_fetch"
+    }
+
+    fn definition() -> ToolDefinition {
+        WebFetchTool::config().definition
+    }
+
+    async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
+        let mut builder = runtime.new_actor_with_name::<Self>("web_fetch_tool".to_string());
+
+        builder.act_on::<ExecuteToolDirect>(|actor, envelope| {
+            let msg = envelope.message();
+            let correlation_id = msg.correlation_id.clone();
+            let tool_call_id = msg.tool_call_id.clone();
+            let args = msg.args.clone();
+            let broker = actor.broker().clone();
+
+            Reply::pending(async move {
+                let tool = WebFetchTool::new();
+                let result = tool.execute(args).await;
+
+                let response = match result {
+                    Ok(value) => {
+                        let result_str = serde_json::to_string(&value)
+                            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+                        ToolActorResponse::success(correlation_id, tool_call_id, result_str)
+                    }
+                    Err(e) => ToolActorResponse::error(correlation_id, tool_call_id, e.to_string()),
+                };
+
+                broker.broadcast(response).await;
+            })
+        });
+
+        builder.start().await
     }
 }
 

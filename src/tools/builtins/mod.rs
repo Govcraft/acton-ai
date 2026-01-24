@@ -71,18 +71,31 @@ mod read_file;
 mod web_fetch;
 mod write_file;
 
-// Re-export tool implementations
-pub use bash::BashTool;
-pub use calculate::CalculateTool;
-pub use edit_file::EditFileTool;
-pub use glob::GlobTool;
-pub use grep::GrepTool;
-pub use list_directory::ListDirectoryTool;
-pub use read_file::ReadFileTool;
-pub use web_fetch::WebFetchTool;
-pub use write_file::WriteFileTool;
+#[cfg(feature = "agent-skills")]
+mod skill_activate;
+#[cfg(feature = "agent-skills")]
+mod skill_list;
 
+// Re-export tool implementations
+pub use bash::{BashTool, BashToolActor};
+pub use calculate::{CalculateTool, CalculateToolActor};
+pub use edit_file::{EditFileTool, EditFileToolActor};
+pub use glob::{GlobTool, GlobToolActor};
+pub use grep::{GrepTool, GrepToolActor};
+pub use list_directory::{ListDirectoryTool, ListDirectoryToolActor};
+pub use read_file::{ReadFileTool, ReadFileToolActor};
+pub use web_fetch::{WebFetchTool, WebFetchToolActor};
+pub use write_file::{WriteFileTool, WriteFileToolActor};
+
+#[cfg(feature = "agent-skills")]
+pub use skill_activate::{ActivateSkillTool, ActivateSkillToolActor};
+#[cfg(feature = "agent-skills")]
+pub use skill_list::{ListSkillsTool, ListSkillsToolActor};
+
+use crate::messages::ToolDefinition;
+use crate::tools::actor::ToolActor;
 use crate::tools::{BoxedToolExecutor, ToolConfig, ToolError, ToolErrorKind};
+use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -239,6 +252,159 @@ impl BuiltinTools {
         self.configs.insert(name.to_string(), config);
         self.executors.insert(name.to_string(), Arc::new(executor));
     }
+}
+
+/// Spawns a builtin tool actor by name.
+///
+/// Returns the actor handle and tool definition, or an error if the tool name
+/// is unknown.
+///
+/// # Arguments
+///
+/// * `runtime` - The actor runtime to spawn the tool in
+/// * `tool_name` - Name of the builtin tool to spawn
+///
+/// # Returns
+///
+/// A tuple of (ActorHandle, ToolDefinition) on success, or ToolError if the
+/// tool name is not recognized.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::tools::builtins::spawn_tool_actor;
+///
+/// let (handle, definition) = spawn_tool_actor(&mut runtime, "read_file").await?;
+/// ```
+pub async fn spawn_tool_actor(
+    runtime: &mut ActorRuntime,
+    tool_name: &str,
+) -> Result<(ActorHandle, ToolDefinition), ToolError> {
+    match tool_name {
+        "read_file" => {
+            let handle = ReadFileToolActor::spawn(runtime).await;
+            let definition = ReadFileToolActor::definition();
+            Ok((handle, definition))
+        }
+        "write_file" => {
+            let handle = WriteFileToolActor::spawn(runtime).await;
+            let definition = WriteFileToolActor::definition();
+            Ok((handle, definition))
+        }
+        "edit_file" => {
+            let handle = EditFileToolActor::spawn(runtime).await;
+            let definition = EditFileToolActor::definition();
+            Ok((handle, definition))
+        }
+        "list_directory" => {
+            let handle = ListDirectoryToolActor::spawn(runtime).await;
+            let definition = ListDirectoryToolActor::definition();
+            Ok((handle, definition))
+        }
+        "glob" => {
+            let handle = GlobToolActor::spawn(runtime).await;
+            let definition = GlobToolActor::definition();
+            Ok((handle, definition))
+        }
+        "grep" => {
+            let handle = GrepToolActor::spawn(runtime).await;
+            let definition = GrepToolActor::definition();
+            Ok((handle, definition))
+        }
+        "bash" => {
+            let handle = BashToolActor::spawn(runtime).await;
+            let definition = BashToolActor::definition();
+            Ok((handle, definition))
+        }
+        "calculate" => {
+            let handle = CalculateToolActor::spawn(runtime).await;
+            let definition = CalculateToolActor::definition();
+            Ok((handle, definition))
+        }
+        "web_fetch" => {
+            let handle = WebFetchToolActor::spawn(runtime).await;
+            let definition = WebFetchToolActor::definition();
+            Ok((handle, definition))
+        }
+        _ => Err(ToolError::not_found(tool_name)),
+    }
+}
+
+/// Returns the tool definition for a builtin tool by name.
+///
+/// # Arguments
+///
+/// * `tool_name` - Name of the builtin tool
+///
+/// # Returns
+///
+/// The tool definition, or an error if the tool name is not recognized.
+pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError> {
+    match tool_name {
+        "read_file" => Ok(ReadFileToolActor::definition()),
+        "write_file" => Ok(WriteFileToolActor::definition()),
+        "edit_file" => Ok(EditFileToolActor::definition()),
+        "list_directory" => Ok(ListDirectoryToolActor::definition()),
+        "glob" => Ok(GlobToolActor::definition()),
+        "grep" => Ok(GrepToolActor::definition()),
+        "bash" => Ok(BashToolActor::definition()),
+        "calculate" => Ok(CalculateToolActor::definition()),
+        "web_fetch" => Ok(WebFetchToolActor::definition()),
+        _ => Err(ToolError::not_found(tool_name)),
+    }
+}
+
+/// Spawns all skill-related tool actors.
+///
+/// This spawns the `list_skills` and `activate_skill` tool actors, which are
+/// only available when the `agent-skills` feature is enabled.
+///
+/// # Arguments
+///
+/// * `runtime` - The actor runtime to spawn the tools in
+/// * `registry` - The skill registry to use for the skill tools
+///
+/// # Returns
+///
+/// A vector of (name, handle, definition) tuples for the spawned skill tools.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::tools::builtins::spawn_skill_tool_actors;
+/// use acton_ai::skills::SkillRegistry;
+/// use std::sync::{Arc, RwLock};
+///
+/// let registry = Arc::new(RwLock::new(SkillRegistry::new()));
+/// let skill_tools = spawn_skill_tool_actors(&mut runtime, registry).await;
+/// ```
+#[cfg(feature = "agent-skills")]
+pub async fn spawn_skill_tool_actors(
+    runtime: &mut ActorRuntime,
+    registry: std::sync::Arc<std::sync::RwLock<crate::skills::SkillRegistry>>,
+) -> Vec<(String, ActorHandle, ToolDefinition)> {
+    let mut tools = Vec::new();
+
+    // Spawn list_skills tool
+    let list_handle = ListSkillsToolActor::spawn_with_registry(runtime, registry.clone()).await;
+    let list_def = ListSkillsTool::config().definition;
+    tools.push(("list_skills".to_string(), list_handle, list_def));
+
+    // Spawn activate_skill tool
+    let activate_handle = ActivateSkillToolActor::spawn_with_registry(runtime, registry).await;
+    let activate_def = ActivateSkillTool::config().definition;
+    tools.push(("activate_skill".to_string(), activate_handle, activate_def));
+
+    tools
+}
+
+/// Returns the names of all skill-related tools.
+///
+/// Only available when the `agent-skills` feature is enabled.
+#[cfg(feature = "agent-skills")]
+#[must_use]
+pub fn skill_tool_names() -> Vec<&'static str> {
+    vec!["list_skills", "activate_skill"]
 }
 
 #[cfg(test)]

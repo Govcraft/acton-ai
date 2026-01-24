@@ -11,6 +11,7 @@ categories = ["asynchronous", "concurrency"]
 [features]
 default = []
 hyperlight = ["dep:hyperlight-host"]
+agent-skills = ["dep:agent-skills"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
@@ -51,6 +52,7 @@ url = "2"
 
 # Sandboxing (optional)
 hyperlight-host = { version = "0.12", optional = true }
+agent-skills = { version = "0.2.0", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"

@@ -9,8 +9,9 @@ use crate::llm::StreamAccumulator;
 use crate::messages::{
     AgentStatusResponse, GetAgentStatus, GetStatus, IncomingAgentMessage, IncomingTask, LLMRequest,
     LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, TaskAccepted, TaskCompleted, TaskFailed, UserPrompt,
+    StopReason, TaskAccepted, TaskCompleted, TaskFailed, ToolDefinition, UserPrompt,
 };
+use crate::tools::actor::{ExecuteToolDirect, ToolActorResponse};
 use crate::types::{AgentId, CorrelationId};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -29,6 +30,16 @@ pub struct PendingLLMRequest {
 pub struct InitAgent {
     /// The agent configuration
     pub config: AgentConfig,
+}
+
+/// Message to register tool actors with an agent.
+///
+/// This should be sent after the agent is initialized but before prompts are sent.
+/// The caller is responsible for spawning the tool actors.
+#[acton_message]
+pub struct RegisterToolActors {
+    /// Tool actors to register: (name, handle, definition)
+    pub tools: Vec<(String, ActorHandle, ToolDefinition)>,
 }
 
 /// The Agent actor state.
@@ -58,6 +69,10 @@ pub struct Agent {
     pub stream_accumulator: StreamAccumulator,
     /// Tracker for delegated tasks (both outgoing and incoming)
     pub delegation_tracker: DelegationTracker,
+    /// Handles to tool actors owned by this agent
+    pub tool_handles: HashMap<String, ActorHandle>,
+    /// Tool definitions for tools available to this agent
+    pub tool_definitions: Vec<ToolDefinition>,
 }
 
 impl Agent {
@@ -206,12 +221,16 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         }
         messages.extend(actor.model.conversation.clone());
 
-        // Create LLM request
+        // Create LLM request with tools if available
         let llm_request = LLMRequest {
             correlation_id: prompt.correlation_id.clone(),
             agent_id: actor.model.id.clone().unwrap_or_default(),
             messages,
-            tools: None, // Tools will be added in Phase 3
+            tools: if actor.model.tool_definitions.is_empty() {
+                None
+            } else {
+                Some(actor.model.tool_definitions.clone())
+            },
         };
 
         // Broadcast LLM request via broker for LLM Provider to pick up
@@ -364,6 +383,51 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 ));
                 // Transition to Executing state for tool calls
                 actor.model.state = AgentState::Executing;
+
+                // Execute tool calls
+                let tool_calls = stream.tool_calls.clone();
+                let tool_handles = actor.model.tool_handles.clone();
+                let corr_id = msg.correlation_id.clone();
+                let corr_id_str = corr_id.to_string();
+
+                // Track pending tool calls
+                for tc in &tool_calls {
+                    actor
+                        .model
+                        .pending_tools
+                        .insert(tc.id.clone(), corr_id_str.clone());
+                }
+
+                // Don't remove from pending_llm yet - we'll need to continue the loop
+                // Actually, we already removed it above. Let's re-add it for the loop.
+                actor.model.pending_llm.insert(
+                    corr_id_str.clone(),
+                    PendingLLMRequest {
+                        correlation_id: Some(corr_id.clone()),
+                        original_prompt: String::new(),
+                    },
+                );
+
+                // Execute each tool call
+                return Reply::try_pending(async move {
+                    for tc in tool_calls {
+                        if let Some(handle) = tool_handles.get(&tc.name) {
+                            let exec_msg = ExecuteToolDirect::new(
+                                corr_id.clone(),
+                                tc.id.clone(),
+                                tc.arguments.clone(),
+                            );
+                            handle.send(exec_msg).await;
+                        } else {
+                            tracing::warn!(
+                                tool_name = %tc.name,
+                                tool_call_id = %tc.id,
+                                "Tool not found for execution"
+                            );
+                        }
+                    }
+                    Ok::<(), crate::error::AgentError>(())
+                });
             } else {
                 actor
                     .model
@@ -600,6 +664,126 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 error = %msg.error,
                 "Delegated task failed"
             );
+        }
+
+        Reply::ready()
+    });
+
+    // =========================================================================
+    // Per-Agent Tool Handlers
+    // =========================================================================
+
+    // Handle registration of tool actors
+    builder.mutate_on::<RegisterToolActors>(|actor, envelope| {
+        let msg = envelope.message();
+
+        for (name, handle, definition) in &msg.tools {
+            actor
+                .model
+                .tool_handles
+                .insert(name.clone(), handle.clone());
+            actor.model.tool_definitions.push(definition.clone());
+
+            tracing::debug!(
+                agent_id = ?actor.model.id,
+                tool_name = %name,
+                "Tool actor registered"
+            );
+        }
+
+        tracing::info!(
+            agent_id = ?actor.model.id,
+            tool_count = msg.tools.len(),
+            "Tool actors registered"
+        );
+
+        Reply::ready()
+    });
+
+    // Handle tool execution responses
+    builder.mutate_on::<ToolActorResponse>(|actor, envelope| {
+        let msg = envelope.message();
+        let tool_call_id = &msg.tool_call_id;
+
+        // Check if this response is for a pending tool call
+        if !actor.model.pending_tools.contains_key(tool_call_id) {
+            return Reply::ready();
+        }
+
+        let corr_id_str = actor.model.pending_tools.remove(tool_call_id);
+
+        match &msg.result {
+            Ok(content) => {
+                tracing::debug!(
+                    agent_id = ?actor.model.id,
+                    tool_call_id = %tool_call_id,
+                    content_len = content.len(),
+                    "Tool execution succeeded"
+                );
+
+                // Add tool result to conversation
+                actor.model.add_message(Message::tool(
+                    tool_call_id.clone(),
+                    content.clone(),
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    agent_id = ?actor.model.id,
+                    tool_call_id = %tool_call_id,
+                    error = %error,
+                    "Tool execution failed"
+                );
+
+                // Add error result to conversation
+                actor.model.add_message(Message::tool(
+                    tool_call_id.clone(),
+                    format!("Error: {error}"),
+                ));
+            }
+        }
+
+        // If no more pending tool calls, transition back to Thinking
+        // to continue the reasoning loop
+        if actor.model.pending_tools.is_empty() && actor.model.state == AgentState::Executing {
+            actor.model.state = AgentState::Thinking;
+
+            // Build conversation messages including system prompt and tools
+            let mut messages = Vec::new();
+            if !actor.model.system_prompt.is_empty() {
+                messages.push(Message::system(&actor.model.system_prompt));
+            }
+            messages.extend(actor.model.conversation.clone());
+
+            // Create LLM request to continue reasoning
+            if let Some(corr_id_str) = corr_id_str {
+                if let Ok(correlation_id) = corr_id_str.parse::<CorrelationId>() {
+                    let llm_request = LLMRequest {
+                        correlation_id: correlation_id.clone(),
+                        agent_id: actor.model.id.clone().unwrap_or_default(),
+                        messages,
+                        tools: if actor.model.tool_definitions.is_empty() {
+                            None
+                        } else {
+                            Some(actor.model.tool_definitions.clone())
+                        },
+                    };
+
+                    // Re-add to pending
+                    actor.model.pending_llm.insert(
+                        corr_id_str,
+                        PendingLLMRequest {
+                            correlation_id: Some(correlation_id),
+                            original_prompt: String::new(),
+                        },
+                    );
+
+                    let broker = actor.broker().clone();
+                    return Reply::pending(async move {
+                        broker.broadcast(llm_request).await;
+                    });
+                }
+            }
         }
 
         Reply::ready()

@@ -4,9 +4,32 @@
 //!
 //! - **Tool Registry**: Central actor that manages tool registration and dispatch
 //! - **Tool Executor**: Supervised child actors for executing individual tools
+//! - **Tool Actors**: Per-agent tool actors for isolated tool execution
 //! - **Sandbox**: Interface for sandboxed code execution (Hyperlight integration)
 //!
 //! ## Architecture
+//!
+//! ### Per-Agent Tool Actors (Recommended)
+//!
+//! ```text
+//! +-------------------------------------------------------------+
+//! |                      Agent Actor                             |
+//! |                                                              |
+//! |  tool_handles: HashMap<String, ActorHandle>                 |
+//! |                                                              |
+//! +-------------------------------------------------------------+
+//!                            |
+//!                            | supervises
+//!                            v
+//! +-------------------------------------------------------------+
+//! |                   Tool Actor (per tool)                      |
+//! |                                                              |
+//! |  ExecuteToolDirect --> execute(args) --> ToolActorResponse  |
+//! |                                                              |
+//! +-------------------------------------------------------------+
+//! ```
+//!
+//! ### Global Tool Registry (Legacy)
 //!
 //! ```text
 //! +-------------------------------------------------------------+
@@ -18,20 +41,23 @@
 //! |  ListTools --> Returns Vec<ToolDefinition>                  |
 //! |                                                              |
 //! +-------------------------------------------------------------+
-//!                            |
-//!                            | supervises (RestartPolicy::Temporary)
-//!                            v
-//! +-------------------------------------------------------------+
-//! |                   Tool Executor Actor                        |
-//! |                                                              |
-//! |  Execute --> executor.execute(args) --> ToolResponse        |
-//! |              or sandbox.execute(code, args)                  |
-//! |                                                              |
-//! |  before_stop: cleanup sandbox                                |
-//! +-------------------------------------------------------------+
 //! ```
 //!
 //! ## Usage
+//!
+//! ### Per-Agent Tools (Recommended)
+//!
+//! ```rust,ignore
+//! use acton_ai::prelude::*;
+//!
+//! // Configure agent with specific tools
+//! let config = AgentConfig::new("You are helpful.")
+//!     .with_tools(&["read_file", "write_file", "glob"]);
+//!
+//! // Tools are spawned automatically when the agent initializes
+//! ```
+//!
+//! ### Global Registry (Legacy)
 //!
 //! ```rust,ignore
 //! use acton_ai::prelude::*;
@@ -49,15 +75,9 @@
 //!     )),
 //!     executor: Arc::new(Box::new(CalculatorExecutor)),
 //! }).await;
-//!
-//! // Execute a tool (usually triggered by Agent)
-//! registry.send(ExecuteTool {
-//!     correlation_id: CorrelationId::new(),
-//!     tool_call: ToolCall { ... },
-//!     requesting_agent: agent_id,
-//! }).await;
 //! ```
 
+pub mod actor;
 pub mod builtins;
 pub mod definition;
 pub mod error;
@@ -66,6 +86,7 @@ pub mod registry;
 pub mod sandbox;
 
 // Re-exports
+pub use actor::{ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync};
 pub use crate::messages::ToolDefinition;
 pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExecutorTrait};
 pub use error::{ToolError, ToolErrorKind};
