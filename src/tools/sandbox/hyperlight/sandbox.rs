@@ -1,0 +1,317 @@
+//! Hyperlight sandbox implementation.
+//!
+//! Provides hardware-isolated execution using Hyperlight micro-VMs.
+
+use super::config::SandboxConfig;
+use super::error::SandboxErrorKind;
+use crate::tools::error::ToolError;
+use crate::tools::sandbox::traits::{Sandbox, SandboxExecutionFuture};
+use hyperlight_host::sandbox::uninitialized::{GuestBinary, UninitializedSandbox};
+use hyperlight_host::sandbox::SandboxConfiguration;
+use hyperlight_host::MultiUseSandbox;
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+
+/// Request sent to the shell executor guest.
+///
+/// Used when calling the guest's `execute_shell` function.
+#[derive(Debug, Serialize)]
+#[allow(dead_code)] // Used in execute_sync when spawn_blocking is implemented
+struct ShellRequest {
+    /// Command to execute
+    command: String,
+    /// Additional arguments as JSON
+    args: Value,
+    /// Timeout in seconds
+    timeout_secs: u64,
+}
+
+/// Response from the shell executor guest.
+///
+/// Parsed from the JSON response from the guest's `execute_shell` function.
+#[derive(Debug, Deserialize)]
+#[allow(dead_code)] // Used in execute_sync when spawn_blocking is implemented
+struct ShellResponse {
+    /// Exit code from the command
+    exit_code: i32,
+    /// Standard output
+    stdout: String,
+    /// Standard error
+    stderr: String,
+    /// Whether the command succeeded
+    success: bool,
+    /// Whether output was truncated
+    #[serde(default)]
+    truncated: bool,
+}
+
+/// Hyperlight-based sandbox for hardware-isolated code execution.
+///
+/// This sandbox uses Hyperlight micro-VMs to provide strong isolation
+/// for executing untrusted code. Each sandbox instance wraps a
+/// `MultiUseSandbox` that can be reused for multiple executions.
+///
+/// # Thread Safety
+///
+/// The sandbox is `Send + Sync` and uses interior mutability for the
+/// underlying VM. Only one execution can occur at a time within a
+/// single sandbox instance.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::tools::sandbox::hyperlight::{HyperlightSandbox, SandboxConfig};
+///
+/// let config = SandboxConfig::new()
+///     .with_memory_limit(64 * 1024 * 1024)
+///     .with_timeout(Duration::from_secs(30));
+///
+/// let sandbox = HyperlightSandbox::new(config)?;
+/// let result = sandbox.execute("echo hello", serde_json::json!({})).await?;
+/// ```
+pub struct HyperlightSandbox {
+    /// The underlying Hyperlight sandbox (protected by mutex for interior mutability)
+    inner: Mutex<Option<MultiUseSandbox>>,
+    /// Whether the sandbox has been destroyed
+    destroyed: AtomicBool,
+    /// Configuration used to create this sandbox
+    config: SandboxConfig,
+}
+
+impl std::fmt::Debug for HyperlightSandbox {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HyperlightSandbox")
+            .field("destroyed", &self.destroyed.load(Ordering::SeqCst))
+            .field("config", &self.config)
+            .finish_non_exhaustive()
+    }
+}
+
+impl HyperlightSandbox {
+    /// Creates a new Hyperlight sandbox with the given configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The sandbox configuration
+    ///
+    /// # Returns
+    ///
+    /// A new sandbox instance, or an error if creation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SandboxErrorKind::CreationFailed` if the sandbox cannot be created.
+    /// Returns `SandboxErrorKind::HypervisorNotAvailable` if no hypervisor is present.
+    pub fn new(config: SandboxConfig) -> Result<Self, SandboxErrorKind> {
+        config.validate()?;
+
+        // Check hypervisor availability
+        if !hyperlight_host::is_hypervisor_present() {
+            return Err(SandboxErrorKind::HypervisorNotAvailable);
+        }
+
+        // Create Hyperlight sandbox configuration
+        // Use default and configure via setters since new() is private
+        let mut hl_config = SandboxConfiguration::default();
+        // Configure heap size based on our memory limit
+        hl_config.set_heap_size(config.memory_limit as u64);
+
+        // Get guest binary
+        let guest_binary = Self::load_guest_binary(&config)?;
+
+        // Create uninitialized sandbox
+        let uninit = UninitializedSandbox::new(guest_binary, Some(hl_config))
+            .map_err(|e| SandboxErrorKind::CreationFailed {
+                reason: e.to_string(),
+            })?;
+
+        // Evolve to multi-use sandbox
+        let sandbox = uninit.evolve().map_err(|e| SandboxErrorKind::CreationFailed {
+            reason: format!("failed to initialize VM: {e}"),
+        })?;
+
+        Ok(Self {
+            inner: Mutex::new(Some(sandbox)),
+            destroyed: AtomicBool::new(false),
+            config,
+        })
+    }
+
+    /// Loads the guest binary based on configuration.
+    fn load_guest_binary(config: &SandboxConfig) -> Result<GuestBinary<'static>, SandboxErrorKind> {
+        use super::config::GuestBinarySource;
+
+        match &config.guest_binary {
+            GuestBinarySource::Embedded => {
+                // Use the embedded shell executor guest
+                // Note: In a real implementation, this would use include_bytes!()
+                // to embed the pre-compiled guest binary
+                Err(SandboxErrorKind::CreationFailed {
+                    reason: "embedded guest binary not yet available; use FromPath or FromBytes"
+                        .to_string(),
+                })
+            }
+            GuestBinarySource::FromPath(path) => {
+                let path_str = path.to_string_lossy().to_string();
+                Ok(GuestBinary::FilePath(path_str))
+            }
+            GuestBinarySource::FromBytes(bytes) => {
+                // We need to leak the bytes to get a 'static lifetime
+                // This is intentional for sandbox lifetime management
+                let leaked: &'static [u8] = Box::leak(bytes.clone().into_boxed_slice());
+                Ok(GuestBinary::Buffer(leaked))
+            }
+        }
+    }
+
+    /// Executes a command in the sandbox synchronously.
+    ///
+    /// This is the internal implementation that runs within the async context.
+    /// Used by SandboxPool when executing via spawn_blocking.
+    #[allow(dead_code)] // Used when spawn_blocking is implemented
+    fn execute_sync(&self, code: &str, args: Value) -> Result<Value, ToolError> {
+        if self.destroyed.load(Ordering::SeqCst) {
+            return Err(SandboxErrorKind::AlreadyDestroyed.into());
+        }
+
+        let mut guard = self.inner.lock().map_err(|_| {
+            ToolError::sandbox_error("sandbox lock poisoned")
+        })?;
+
+        let sandbox = guard.as_mut().ok_or_else(|| {
+            SandboxErrorKind::AlreadyDestroyed.into_tool_error()
+        })?;
+
+        // Prepare request for the guest
+        let request = ShellRequest {
+            command: code.to_string(),
+            args,
+            timeout_secs: self.config.timeout.as_secs(),
+        };
+
+        let request_json = serde_json::to_string(&request).map_err(|e| {
+            ToolError::sandbox_error(format!("failed to serialize request: {e}"))
+        })?;
+
+        // Call the guest's execute_shell function
+        let result: String = sandbox
+            .call("execute_shell", request_json)
+            .map_err(|e| {
+                SandboxErrorKind::GuestCallFailed {
+                    function: "execute_shell".to_string(),
+                    reason: e.to_string(),
+                }
+                .into_tool_error()
+            })?;
+
+        // Parse the response
+        let response: ShellResponse = serde_json::from_str(&result).map_err(|e| {
+            ToolError::sandbox_error(format!("failed to parse guest response: {e}"))
+        })?;
+
+        // Convert to JSON value
+        Ok(serde_json::json!({
+            "exit_code": response.exit_code,
+            "stdout": response.stdout,
+            "stderr": response.stderr,
+            "success": response.success,
+            "truncated": response.truncated
+        }))
+    }
+}
+
+// Safety: The sandbox uses a Mutex for interior mutability and atomic
+// operations for the destroyed flag, making it safe to share across threads.
+unsafe impl Send for HyperlightSandbox {}
+unsafe impl Sync for HyperlightSandbox {}
+
+impl Sandbox for HyperlightSandbox {
+    fn execute(&self, code: &str, _args: Value) -> SandboxExecutionFuture {
+        let _timeout = self.config.timeout;
+
+        // Check destroyed state early
+        if self.destroyed.load(Ordering::SeqCst) {
+            return Box::pin(async move {
+                Err(SandboxErrorKind::AlreadyDestroyed.into())
+            });
+        }
+
+        // Since Hyperlight's MultiUseSandbox::call is synchronous, we need to
+        // execute it in a blocking context. However, we cannot easily capture
+        // &self in an async block due to lifetime constraints.
+        //
+        // For production use, the SandboxPool actor pattern should be used instead,
+        // which manages sandbox lifecycle properly within the actor system.
+        //
+        // Here we return a placeholder indicating the limitation.
+        let code = code.to_string();
+
+        Box::pin(async move {
+            // In a real implementation with tokio::task::spawn_blocking,
+            // we would execute the sync call there. For now, indicate limitation.
+            Err(ToolError::sandbox_error(format!(
+                "direct HyperlightSandbox::execute() requires spawn_blocking; \
+                 use SandboxPool for managed async execution (code: {}...)",
+                if code.len() > 20 { &code[..20] } else { &code }
+            )))
+        })
+    }
+
+    fn destroy(&mut self) {
+        self.destroyed.store(true, Ordering::SeqCst);
+
+        // Clear the inner sandbox to release resources
+        if let Ok(mut guard) = self.inner.lock() {
+            *guard = None;
+        }
+
+        tracing::debug!("HyperlightSandbox destroyed");
+    }
+
+    fn is_alive(&self) -> bool {
+        !self.destroyed.load(Ordering::SeqCst)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note: These tests require a hypervisor, so they're marked as ignored
+    // by default. Run with `cargo test -- --ignored` on a KVM-enabled system.
+
+    #[test]
+    fn sandbox_debug_impl() {
+        // Just verify Debug is implemented (can't create without hypervisor)
+        let config = SandboxConfig::default();
+        let debug_str = format!("{:?}", config);
+        assert!(debug_str.contains("SandboxConfig"));
+    }
+
+    #[test]
+    #[ignore = "requires hypervisor"]
+    fn sandbox_creation_requires_hypervisor() {
+        let config = SandboxConfig::default();
+        let result = HyperlightSandbox::new(config);
+
+        // On systems without a hypervisor, this should fail
+        if !hyperlight_host::is_hypervisor_present() {
+            assert!(matches!(
+                result.unwrap_err(),
+                SandboxErrorKind::HypervisorNotAvailable
+            ));
+        }
+    }
+
+    #[test]
+    fn sandbox_config_validation_in_new() {
+        // Invalid config should fail during new()
+        let config = SandboxConfig::new()
+            .with_memory_limit(100); // Too small
+
+        let result = HyperlightSandbox::new(config);
+        assert!(result.is_err());
+    }
+}

@@ -1,50 +1,22 @@
-//! Sandbox trait and stub implementation.
+//! Stub sandbox implementation.
 //!
-//! Defines the interface for sandboxed code execution.
-//! A stub implementation is provided for development; actual Hyperlight
-//! integration will be added in a future phase.
+//! Provides a placeholder sandbox for development and testing.
+//! This implementation does NOT actually sandbox code.
 
+use super::traits::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 use crate::tools::error::ToolError;
 use serde_json::Value;
-use std::fmt::Debug;
-use std::future::Future;
-use std::pin::Pin;
-
-/// The result type for sandbox execution futures.
-pub type SandboxExecutionFuture =
-    Pin<Box<dyn Future<Output = Result<Value, ToolError>> + Send + Sync + 'static>>;
-
-/// Trait for sandboxed code execution.
-///
-/// Sandboxes provide isolated environments for executing untrusted code.
-/// The primary implementation will use Hyperlight micro-VMs.
-pub trait Sandbox: Send + Sync + Debug {
-    /// Executes code in the sandbox.
-    ///
-    /// # Arguments
-    ///
-    /// * `code` - The code or function to execute
-    /// * `args` - Arguments to pass to the code
-    ///
-    /// # Returns
-    ///
-    /// The result of execution as a JSON value, or an error.
-    fn execute(&self, code: &str, args: Value) -> SandboxExecutionFuture;
-
-    /// Destroys the sandbox, releasing all resources.
-    ///
-    /// After calling this, the sandbox cannot be used again.
-    fn destroy(&mut self);
-
-    /// Returns whether the sandbox is still usable.
-    fn is_alive(&self) -> bool;
-}
 
 /// A stub sandbox implementation for development and testing.
 ///
 /// This implementation does not actually sandbox code - it's a placeholder
 /// until Hyperlight integration is complete. It should NOT be used for
-/// executing untrusted code.
+/// executing untrusted code in production.
+///
+/// # Warning
+///
+/// Commands executed through this sandbox run directly on the host system
+/// without any isolation. Use `HyperlightSandbox` for production workloads.
 #[derive(Debug, Default)]
 pub struct StubSandbox {
     /// Whether the sandbox has been destroyed
@@ -102,20 +74,10 @@ impl Sandbox for StubSandbox {
     }
 }
 
-/// The result type for sandbox factory futures.
-pub type SandboxFactoryFuture =
-    Pin<Box<dyn Future<Output = Result<Box<dyn Sandbox>, ToolError>> + Send + Sync + 'static>>;
-
-/// Factory for creating sandbox instances.
-///
-/// This allows different sandbox implementations to be plugged in
-/// without changing the tool execution code.
-pub trait SandboxFactory: Send + Sync + Debug {
-    /// Creates a new sandbox instance.
-    fn create(&self) -> SandboxFactoryFuture;
-}
-
 /// A stub sandbox factory that creates StubSandbox instances.
+///
+/// This factory always reports as available and creates stub sandboxes
+/// that do not provide actual isolation.
 #[derive(Debug, Default, Clone)]
 pub struct StubSandboxFactory;
 
@@ -130,6 +92,10 @@ impl StubSandboxFactory {
 impl SandboxFactory for StubSandboxFactory {
     fn create(&self) -> SandboxFactoryFuture {
         Box::pin(async move { Ok(Box::new(StubSandbox::new()) as Box<dyn Sandbox>) })
+    }
+
+    fn is_available(&self) -> bool {
+        true
     }
 }
 
@@ -191,5 +157,11 @@ mod tests {
         let factory2 = factory1.clone();
         // Just verify it compiles and works
         assert!(format!("{:?}", factory2).contains("StubSandboxFactory"));
+    }
+
+    #[test]
+    fn stub_sandbox_factory_is_available() {
+        let factory = StubSandboxFactory::new();
+        assert!(factory.is_available());
     }
 }

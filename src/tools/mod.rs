@@ -71,8 +71,8 @@ pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExe
 pub use error::{ToolError, ToolErrorKind};
 pub use executor::{Execute, InitExecutor, ToolExecutor};
 pub use registry::{
-    InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics, ToolListResponse,
-    ToolRegistry, UnregisterTool,
+    ConfigureSandbox, InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics,
+    ToolListResponse, ToolRegistry, UnregisterTool,
 };
 pub use sandbox::{
     Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture, StubSandbox,

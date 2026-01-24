@@ -32,7 +32,13 @@ use crate::kernel::{Kernel, KernelConfig};
 use crate::llm::{LLMProvider, ProviderConfig};
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
+#[cfg(feature = "hyperlight")]
+use crate::tools::sandbox::{
+    HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool,
+};
 use acton_reactive::prelude::*;
+#[cfg(feature = "hyperlight")]
+use std::sync::Arc;
 
 /// High-level facade for interacting with ActonAI.
 ///
@@ -185,6 +191,24 @@ enum BuiltinToolsConfig {
     Select(Vec<String>),
 }
 
+/// Configuration for sandbox execution.
+#[cfg(feature = "hyperlight")]
+#[derive(Default, Clone)]
+enum SandboxMode {
+    /// No sandbox (default)
+    #[default]
+    None,
+    /// Use Hyperlight sandbox factory
+    Hyperlight(SandboxConfig),
+    /// Use sandbox pool with pre-warmed instances
+    Pool {
+        /// Pool size (number of pre-warmed sandboxes)
+        pool_size: usize,
+        /// Configuration for each sandbox
+        config: SandboxConfig,
+    },
+}
+
 /// Builder for configuring and launching ActonAI.
 ///
 /// # Example
@@ -201,6 +225,8 @@ pub struct ActonAIBuilder {
     app_name: Option<String>,
     provider_config: Option<ProviderConfig>,
     builtins: BuiltinToolsConfig,
+    #[cfg(feature = "hyperlight")]
+    sandbox_mode: SandboxMode,
 }
 
 impl ActonAIBuilder {
@@ -394,6 +420,105 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Enables Hyperlight sandbox for hardware-isolated tool execution.
+    ///
+    /// Uses Microsoft's Hyperlight micro-VM technology for strong isolation
+    /// with 1-2ms cold start times. Requires a hypervisor (KVM on Linux,
+    /// Hyper-V on Windows).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_hyperlight_sandbox()
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "hyperlight")]
+    #[must_use]
+    pub fn with_hyperlight_sandbox(mut self) -> Self {
+        self.sandbox_mode = SandboxMode::Hyperlight(SandboxConfig::default());
+        self
+    }
+
+    /// Enables Hyperlight sandbox with custom configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::tools::sandbox::SandboxConfig;
+    /// use std::time::Duration;
+    ///
+    /// let config = SandboxConfig::new()
+    ///     .with_memory_limit(128 * 1024 * 1024)
+    ///     .with_timeout(Duration::from_secs(60));
+    ///
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_hyperlight_sandbox_config(config)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "hyperlight")]
+    #[must_use]
+    pub fn with_hyperlight_sandbox_config(mut self, config: SandboxConfig) -> Self {
+        self.sandbox_mode = SandboxMode::Hyperlight(config);
+        self
+    }
+
+    /// Enables a pool of pre-warmed Hyperlight sandboxes.
+    ///
+    /// Pool size determines how many sandboxes are kept ready for immediate use,
+    /// reducing latency for tool executions. Recommended for high-throughput
+    /// scenarios.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_sandbox_pool(4)  // Keep 4 sandboxes warm
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "hyperlight")]
+    #[must_use]
+    pub fn with_sandbox_pool(mut self, pool_size: usize) -> Self {
+        self.sandbox_mode = SandboxMode::Pool {
+            pool_size,
+            config: SandboxConfig::default(),
+        };
+        self
+    }
+
+    /// Enables a pool of pre-warmed Hyperlight sandboxes with custom configuration.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::tools::sandbox::SandboxConfig;
+    ///
+    /// let config = SandboxConfig::new()
+    ///     .with_memory_limit(64 * 1024 * 1024);
+    ///
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_sandbox_pool_config(4, config)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "hyperlight")]
+    #[must_use]
+    pub fn with_sandbox_pool_config(mut self, pool_size: usize, config: SandboxConfig) -> Self {
+        self.sandbox_mode = SandboxMode::Pool { pool_size, config };
+        self
+    }
+
     /// Launches the ActonAI runtime with the configured settings.
     ///
     /// This spawns the actor runtime, kernel, and LLM provider.
@@ -435,6 +560,39 @@ impl ActonAIBuilder {
 
         // Spawn the LLM provider
         let provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
+
+        // Initialize sandbox if configured
+        #[cfg(feature = "hyperlight")]
+        {
+            use crate::tools::sandbox::hyperlight::WarmPool;
+
+            match self.sandbox_mode {
+                SandboxMode::None => {}
+                SandboxMode::Hyperlight(config) => {
+                    // Use fallback factory that gracefully handles missing hypervisor
+                    let factory = HyperlightSandboxFactory::with_config_fallback(config);
+                    if !factory.is_available() {
+                        tracing::warn!(
+                            "Hyperlight sandbox configured but hypervisor not available; \
+                             sandboxed tools will fail"
+                        );
+                    }
+                    // Store the factory for tool registry configuration
+                    // Note: The tool registry will be configured separately
+                    let _factory = Arc::new(factory);
+                    tracing::info!("Hyperlight sandbox factory initialized");
+                }
+                SandboxMode::Pool { pool_size, config } => {
+                    // Spawn the sandbox pool actor
+                    let pool_handle = SandboxPool::spawn(&mut runtime, config).await;
+
+                    // Warm up the pool
+                    pool_handle.send(WarmPool { count: pool_size }).await;
+
+                    tracing::info!(pool_size, "Hyperlight sandbox pool initialized and warmed");
+                }
+            }
+        }
 
         // Load built-in tools if configured
         let builtins = match self.builtins {

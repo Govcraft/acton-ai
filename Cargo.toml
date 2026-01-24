@@ -8,6 +8,10 @@ repository = "https://github.com/rodzilla/acton-ai"
 keywords = ["ai", "agents", "actors", "llm", "async"]
 categories = ["asynchronous", "concurrency"]
 
+[features]
+default = []
+hyperlight = ["dep:hyperlight-host"]
+
 [dependencies]
 # Actor framework (re-exports tokio)
 acton-reactive = "7"
@@ -41,6 +45,9 @@ walkdir = "2"
 fasteval = "0.2"
 regex = "1"
 url = "2"
+
+# Sandboxing (optional)
+hyperlight-host = { version = "0.12", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"

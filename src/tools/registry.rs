@@ -6,6 +6,7 @@
 use crate::messages::{ExecuteTool, ToolDefinition, ToolResponse};
 use crate::tools::definition::{BoxedToolExecutor, ToolConfig};
 use crate::tools::error::{ToolError, ToolErrorKind};
+use crate::tools::sandbox::SandboxFactory;
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -34,6 +35,13 @@ pub struct UnregisterTool {
 #[acton_message]
 pub struct ListTools;
 
+/// Message to configure the sandbox factory for sandboxed tool execution.
+#[acton_message]
+pub struct ConfigureSandbox {
+    /// The sandbox factory to use for sandboxed tools
+    pub factory: Arc<dyn SandboxFactory>,
+}
+
 /// Response containing the list of registered tools.
 #[acton_message]
 pub struct ToolListResponse {
@@ -48,6 +56,8 @@ pub struct ToolListResponse {
 pub struct ToolRegistry {
     /// Registered tools by name
     pub tools: HashMap<String, RegisteredTool>,
+    /// Optional sandbox factory for sandboxed tool execution
+    pub sandbox_factory: Option<Arc<dyn SandboxFactory>>,
     /// Whether the registry is shutting down
     pub shutting_down: bool,
     /// Metrics
@@ -137,6 +147,18 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
     // Handle initialization
     builder.mutate_on::<InitToolRegistry>(|_actor, _envelope| {
         tracing::info!("Tool Registry initialized");
+        Reply::ready()
+    });
+
+    // Handle sandbox factory configuration
+    builder.mutate_on::<ConfigureSandbox>(|actor, envelope| {
+        let factory = envelope.message().factory.clone();
+        let available = factory.is_available();
+        actor.model.sandbox_factory = Some(factory);
+        tracing::info!(
+            sandbox_available = available,
+            "Sandbox factory configured"
+        );
         Reply::ready()
     });
 
@@ -236,11 +258,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
             };
 
             let executor = registered.executor.clone();
+            let is_sandboxed = registered.config.sandboxed;
+            let sandbox_factory = actor.model.sandbox_factory.clone();
             let broker = actor.broker().clone();
 
             // Execute the tool
-            // For now, execute inline. In a future enhancement, we could
-            // spawn a supervised ToolExecutor child actor for long-running tools.
             Reply::try_pending(async move {
                 // Validate arguments
                 if let Err(e) = executor.validate_args(&args) {
@@ -254,36 +276,106 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
                     return Err(e);
                 }
 
-                // Execute
-                match executor.execute(args).await {
-                    Ok(result) => {
-                        let result_str = serde_json::to_string(&result)
-                            .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
-
-                        broker
-                            .broadcast(ToolResponse {
-                                correlation_id,
-                                tool_call_id,
-                                result: Ok(result_str),
-                            })
-                            .await;
-                        Ok(())
-                    }
-                    Err(e) => {
+                // Check if sandboxed execution is required
+                if is_sandboxed {
+                    let Some(factory) = sandbox_factory else {
+                        // No sandbox factory configured - return error
+                        let err = ToolError::sandbox_error(
+                            "tool requires sandbox but no sandbox factory is configured"
+                        );
                         broker
                             .broadcast(ToolResponse {
                                 correlation_id: correlation_id.clone(),
-                                tool_call_id,
-                                result: Err(e.to_string()),
+                                tool_call_id: tool_call_id.clone(),
+                                result: Err(err.to_string()),
                             })
                             .await;
-                        Err(ToolError::with_correlation(
-                            correlation_id,
-                            ToolErrorKind::ExecutionFailed {
-                                tool_name,
-                                reason: e.to_string(),
-                            },
-                        ))
+                        return Err(err);
+                    };
+
+                    // Create sandbox and execute
+                    match factory.create().await {
+                        Ok(mut sandbox) => {
+                            // Execute in sandbox
+                            match sandbox.execute(&tool_name, args).await {
+                                Ok(result) => {
+                                    let result_str = serde_json::to_string(&result)
+                                        .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+
+                                    sandbox.destroy();
+
+                                    broker
+                                        .broadcast(ToolResponse {
+                                            correlation_id,
+                                            tool_call_id,
+                                            result: Ok(result_str),
+                                        })
+                                        .await;
+                                    Ok(())
+                                }
+                                Err(e) => {
+                                    sandbox.destroy();
+
+                                    broker
+                                        .broadcast(ToolResponse {
+                                            correlation_id: correlation_id.clone(),
+                                            tool_call_id,
+                                            result: Err(e.to_string()),
+                                        })
+                                        .await;
+                                    Err(ToolError::with_correlation(
+                                        correlation_id,
+                                        ToolErrorKind::ExecutionFailed {
+                                            tool_name,
+                                            reason: e.to_string(),
+                                        },
+                                    ))
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            broker
+                                .broadcast(ToolResponse {
+                                    correlation_id: correlation_id.clone(),
+                                    tool_call_id,
+                                    result: Err(e.to_string()),
+                                })
+                                .await;
+                            Err(e)
+                        }
+                    }
+                } else {
+                    // Non-sandboxed execution - execute inline
+                    match executor.execute(args).await {
+                        Ok(result) => {
+                            let result_str = serde_json::to_string(&result)
+                                .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
+
+                            broker
+                                .broadcast(ToolResponse {
+                                    correlation_id,
+                                    tool_call_id,
+                                    result: Ok(result_str),
+                                })
+                                .await;
+                            Ok(())
+                        }
+                        Err(e) => {
+                            broker
+                                .broadcast(ToolResponse {
+                                    correlation_id: correlation_id.clone(),
+                                    tool_call_id,
+                                    result: Err(e.to_string()),
+                                })
+                                .await;
+                            Err(ToolError::with_correlation(
+                                correlation_id,
+                                ToolErrorKind::ExecutionFailed {
+                                    tool_name,
+                                    reason: e.to_string(),
+                                },
+                            ))
+                        }
                     }
                 }
             })
