@@ -42,13 +42,25 @@ fn summarize_tool_result(tool_name: &str, result: &Result<serde_json::Value, Str
     match result {
         Ok(value) => match tool_name {
             "web_fetch" => {
-                let status = value.get("status_code").and_then(|v| v.as_i64()).unwrap_or(0);
-                let size = value.get("body_length").and_then(|v| v.as_i64()).unwrap_or(0);
+                let status = value
+                    .get("status_code")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                let size = value
+                    .get("body_length")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
                 format!("(HTTP {} - {} bytes)", status, size)
             }
             "calculate" => {
-                let expr = value.get("expression").and_then(|v| v.as_str()).unwrap_or("?");
-                let result = value.get("formatted").and_then(|v| v.as_str()).unwrap_or("?");
+                let expr = value
+                    .get("expression")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
+                let result = value
+                    .get("formatted")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("?");
                 format!("({} = {})", expr, result)
             }
             _ => "(OK)".to_string(),
