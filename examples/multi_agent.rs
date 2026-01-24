@@ -64,12 +64,19 @@ async fn main() -> anyhow::Result<()> {
         "[Researcher]".blue().bold(),
         "Fetching population data from the web...".dimmed()
     );
+
+    // Build the research prompt dynamically from the user's question
+    let research_prompt = format!(
+        "The user asked: \"{}\"\n\n\
+         Find the population data needed to answer this question. \
+         Use the web_fetch tool to fetch from https://restcountries.com/v3.1/name/{{country}} \
+         (replace {{country}} with the appropriate country name from the question). \
+         Extract the population from the JSON response.",
+        user_question
+    );
+
     let research_result = runtime
-        .prompt(
-            "Find the current population of France. \
-             Use the web_fetch tool to fetch https://restcountries.com/v3.1/name/france \
-             and extract the population from the JSON response.",
-        )
+        .prompt(&research_prompt)
         .system(
             "You are a research specialist. Your job is to find factual information. \
              Use the web_fetch tool to retrieve data from URLs. \
