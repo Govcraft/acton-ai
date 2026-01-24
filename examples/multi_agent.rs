@@ -54,7 +54,7 @@ async fn main() -> anyhow::Result<()> {
         .await?;
 
     // The user's question
-    let user_question = "What is the population of France, and what's 15% of that number?";
+    let user_question = "What is the population of USA, and what's 15% of that number?";
     println!("{} {}\n", "User:".white().bold(), user_question);
 
     // === Step 1: Researcher Agent ===
@@ -99,10 +99,11 @@ async fn main() -> anyhow::Result<()> {
         "Calculating 15% of the population...".dimmed()
     );
     let analysis_prompt = format!(
-        "Based on this research: '{}'\n\
-         Calculate 15% of France's population using the calculate tool. \
-         Use the actual number (e.g., 67750000 * 0.15).",
-        research_result.text
+        "The user's original question: \"{}\"\n\n\
+         Research findings: '{}'\n\n\
+         Calculate 15% of the population mentioned in the research using the calculate tool. \
+         Use the actual number from the research (e.g., population * 0.15).",
+        user_question, research_result.text
     );
 
     let analysis_result = runtime
