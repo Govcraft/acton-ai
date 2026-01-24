@@ -2,8 +2,8 @@
 //!
 //! Lists directory contents with metadata.
 
-use acton_reactive::prelude::tokio;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::tokio;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -50,7 +50,8 @@ impl ListDirectoryTool {
 
         ToolConfig::new(ToolDefinition {
             name: "list_directory".to_string(),
-            description: "List directory contents with metadata (type, size, modified time).".to_string(),
+            description: "List directory contents with metadata (type, size, modified time)."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -74,8 +75,9 @@ impl ListDirectoryTool {
 impl ToolExecutorTrait for ListDirectoryTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: ListDirectoryArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("list_directory", format!("invalid arguments: {e}")))?;
+            let args: ListDirectoryArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("list_directory", format!("invalid arguments: {e}"))
+            })?;
 
             let path = Path::new(&args.path);
 
@@ -102,9 +104,12 @@ impl ToolExecutorTrait for ListDirectoryTool {
             }
 
             // Read directory entries
-            let mut read_dir = tokio::fs::read_dir(path)
-                .await
-                .map_err(|e| ToolError::execution_failed("list_directory", format!("failed to read directory: {e}")))?;
+            let mut read_dir = tokio::fs::read_dir(path).await.map_err(|e| {
+                ToolError::execution_failed(
+                    "list_directory",
+                    format!("failed to read directory: {e}"),
+                )
+            })?;
 
             let mut entries = Vec::new();
 
@@ -122,13 +127,10 @@ impl ToolExecutorTrait for ListDirectoryTool {
                     _ => "file",
                 };
 
-                let size = metadata.as_ref().and_then(|m| {
-                    if m.is_file() {
-                        Some(m.len())
-                    } else {
-                        None
-                    }
-                });
+                let size =
+                    metadata
+                        .as_ref()
+                        .and_then(|m| if m.is_file() { Some(m.len()) } else { None });
 
                 let modified = metadata
                     .as_ref()
@@ -155,11 +157,15 @@ impl ToolExecutorTrait for ListDirectoryTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: ListDirectoryArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("list_directory", format!("invalid arguments: {e}")))?;
+        let args: ListDirectoryArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("list_directory", format!("invalid arguments: {e}"))
+        })?;
 
         if args.path.is_empty() {
-            return Err(ToolError::validation_failed("list_directory", "path cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "list_directory",
+                "path cannot be empty",
+            ));
         }
 
         Ok(())
@@ -190,7 +196,10 @@ mod tests {
         assert_eq!(result["count"], 3);
 
         let entries = result["entries"].as_array().unwrap();
-        let names: Vec<&str> = entries.iter().map(|e| e["name"].as_str().unwrap()).collect();
+        let names: Vec<&str> = entries
+            .iter()
+            .map(|e| e["name"].as_str().unwrap())
+            .collect();
 
         assert!(names.contains(&"file1.txt"));
         assert!(names.contains(&"file2.txt"));
@@ -306,6 +315,9 @@ mod tests {
 
         let schema = &config.definition.input_schema;
         assert!(schema["properties"]["path"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("path")));
     }
 }

@@ -65,8 +65,9 @@ impl CalculateTool {
 impl ToolExecutorTrait for CalculateTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: CalculateArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("calculate", format!("invalid arguments: {e}")))?;
+            let args: CalculateArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("calculate", format!("invalid arguments: {e}"))
+            })?;
 
             // Validate empty expression early
             if args.expression.is_empty() {
@@ -81,13 +82,16 @@ impl ToolExecutorTrait for CalculateTool {
 
             // Create a callback that provides user variables
             // fasteval has built-in functions (sin, cos, log, etc.) by default
-            let mut namespace = |name: &str, _args: Vec<f64>| -> Option<f64> {
-                user_vars.get(name).copied()
-            };
+            let mut namespace =
+                |name: &str, _args: Vec<f64>| -> Option<f64> { user_vars.get(name).copied() };
 
             // Evaluate the expression
-            let result = ez_eval(&args.expression, &mut namespace)
-                .map_err(|e| ToolError::validation_failed("calculate", format!("failed to evaluate expression: {e}")))?;
+            let result = ez_eval(&args.expression, &mut namespace).map_err(|e| {
+                ToolError::validation_failed(
+                    "calculate",
+                    format!("failed to evaluate expression: {e}"),
+                )
+            })?;
 
             // Check for special values
             let (result_str, is_special) = if result.is_nan() {
@@ -118,8 +122,9 @@ impl ToolExecutorTrait for CalculateTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: CalculateArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("calculate", format!("invalid arguments: {e}")))?;
+        let args: CalculateArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("calculate", format!("invalid arguments: {e}"))
+        })?;
 
         if args.expression.is_empty() {
             return Err(ToolError::validation_failed(
@@ -186,10 +191,7 @@ mod tests {
     async fn calculate_power() {
         let tool = CalculateTool::new();
 
-        let result = tool
-            .execute(json!({"expression": "2 ^ 10"}))
-            .await
-            .unwrap();
+        let result = tool.execute(json!({"expression": "2 ^ 10"})).await.unwrap();
         assert_eq!(result["result"], 1024.0);
     }
 

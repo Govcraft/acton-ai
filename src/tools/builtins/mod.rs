@@ -105,15 +105,39 @@ impl BuiltinTools {
         let mut registry = Self::default();
 
         // Register all tools
-        registry.register("read_file", ReadFileTool::config(), Box::new(ReadFileTool::new()));
-        registry.register("write_file", WriteFileTool::config(), Box::new(WriteFileTool::new()));
-        registry.register("edit_file", EditFileTool::config(), Box::new(EditFileTool::new()));
-        registry.register("list_directory", ListDirectoryTool::config(), Box::new(ListDirectoryTool::new()));
+        registry.register(
+            "read_file",
+            ReadFileTool::config(),
+            Box::new(ReadFileTool::new()),
+        );
+        registry.register(
+            "write_file",
+            WriteFileTool::config(),
+            Box::new(WriteFileTool::new()),
+        );
+        registry.register(
+            "edit_file",
+            EditFileTool::config(),
+            Box::new(EditFileTool::new()),
+        );
+        registry.register(
+            "list_directory",
+            ListDirectoryTool::config(),
+            Box::new(ListDirectoryTool::new()),
+        );
         registry.register("glob", GlobTool::config(), Box::new(GlobTool::new()));
         registry.register("grep", GrepTool::config(), Box::new(GrepTool::new()));
         registry.register("bash", BashTool::config(), Box::new(BashTool::new()));
-        registry.register("calculate", CalculateTool::config(), Box::new(CalculateTool::new()));
-        registry.register("web_fetch", WebFetchTool::config(), Box::new(WebFetchTool::new()));
+        registry.register(
+            "calculate",
+            CalculateTool::config(),
+            Box::new(CalculateTool::new()),
+        );
+        registry.register(
+            "web_fetch",
+            WebFetchTool::config(),
+            Box::new(WebFetchTool::new()),
+        );
 
         registry
     }
@@ -152,7 +176,9 @@ impl BuiltinTools {
             })?;
 
             registry.configs.insert((*name).to_string(), config.clone());
-            registry.executors.insert((*name).to_string(), Arc::clone(executor));
+            registry
+                .executors
+                .insert((*name).to_string(), Arc::clone(executor));
         }
 
         Ok(registry)
@@ -225,8 +251,14 @@ mod tests {
         assert_eq!(tools.len(), 9);
 
         for name in BuiltinTools::available() {
-            assert!(tools.get_config(name).is_some(), "missing config for {name}");
-            assert!(tools.get_executor(name).is_some(), "missing executor for {name}");
+            assert!(
+                tools.get_config(name).is_some(),
+                "missing config for {name}"
+            );
+            assert!(
+                tools.get_executor(name).is_some(),
+                "missing executor for {name}"
+            );
         }
     }
 
@@ -286,7 +318,10 @@ mod tests {
     #[test]
     fn tool_configs_have_unique_names() {
         let tools = BuiltinTools::all();
-        let mut names: Vec<_> = tools.configs().map(|(_, c)| c.definition.name.clone()).collect();
+        let mut names: Vec<_> = tools
+            .configs()
+            .map(|(_, c)| c.definition.name.clone())
+            .collect();
         let original_len = names.len();
         names.sort();
         names.dedup();
@@ -309,10 +344,7 @@ mod tests {
         let tools = BuiltinTools::all();
         for (name, config) in tools.configs() {
             let schema = &config.definition.input_schema;
-            assert!(
-                schema.is_object(),
-                "tool {name} schema is not an object"
-            );
+            assert!(schema.is_object(), "tool {name} schema is not an object");
             assert!(
                 schema.get("type").is_some(),
                 "tool {name} schema missing type"

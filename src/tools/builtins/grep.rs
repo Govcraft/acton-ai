@@ -171,8 +171,9 @@ impl GrepTool {
 impl ToolExecutorTrait for GrepTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: GrepArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("grep", format!("invalid arguments: {e}")))?;
+            let args: GrepArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("grep", format!("invalid arguments: {e}"))
+            })?;
 
             // Build regex
             let pattern = if args.ignore_case.unwrap_or(false) {
@@ -181,15 +182,19 @@ impl ToolExecutorTrait for GrepTool {
                 args.pattern.clone()
             };
 
-            let regex = Regex::new(&pattern)
-                .map_err(|e| ToolError::validation_failed("grep", format!("invalid regex pattern: {e}")))?;
+            let regex = Regex::new(&pattern).map_err(|e| {
+                ToolError::validation_failed("grep", format!("invalid regex pattern: {e}"))
+            })?;
 
             // Determine search path
             let search_path = match &args.path {
                 Some(p) => {
                     let path = Path::new(p);
                     if !path.is_absolute() {
-                        return Err(ToolError::validation_failed("grep", "path must be absolute"));
+                        return Err(ToolError::validation_failed(
+                            "grep",
+                            "path must be absolute",
+                        ));
                     }
                     if !path.exists() {
                         return Err(ToolError::execution_failed(
@@ -200,7 +205,10 @@ impl ToolExecutorTrait for GrepTool {
                     path.to_path_buf()
                 }
                 None => std::env::current_dir().map_err(|e| {
-                    ToolError::execution_failed("grep", format!("failed to get current directory: {e}"))
+                    ToolError::execution_failed(
+                        "grep",
+                        format!("failed to get current directory: {e}"),
+                    )
                 })?,
             };
 
@@ -298,7 +306,10 @@ impl ToolExecutorTrait for GrepTool {
             .map_err(|e| ToolError::validation_failed("grep", format!("invalid arguments: {e}")))?;
 
         if args.pattern.is_empty() {
-            return Err(ToolError::validation_failed("grep", "pattern cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "grep",
+                "pattern cannot be empty",
+            ));
         }
 
         // Validate regex
@@ -308,8 +319,9 @@ impl ToolExecutorTrait for GrepTool {
             args.pattern
         };
 
-        Regex::new(&pattern)
-            .map_err(|e| ToolError::validation_failed("grep", format!("invalid regex pattern: {e}")))?;
+        Regex::new(&pattern).map_err(|e| {
+            ToolError::validation_failed("grep", format!("invalid regex pattern: {e}"))
+        })?;
 
         Ok(())
     }
@@ -324,7 +336,11 @@ mod tests {
     #[tokio::test]
     async fn grep_finds_matches() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("test.txt"), "hello world\nfoo bar\nhello again").unwrap();
+        fs::write(
+            dir.path().join("test.txt"),
+            "hello world\nfoo bar\nhello again",
+        )
+        .unwrap();
 
         let tool = GrepTool::new();
         let result = tool
@@ -374,7 +390,11 @@ mod tests {
     #[tokio::test]
     async fn grep_case_insensitive() {
         let dir = TempDir::new().unwrap();
-        fs::write(dir.path().join("test.txt"), "Hello World\nHELLO WORLD\nhello world").unwrap();
+        fs::write(
+            dir.path().join("test.txt"),
+            "Hello World\nHELLO WORLD\nhello world",
+        )
+        .unwrap();
 
         let tool = GrepTool::new();
         let result = tool

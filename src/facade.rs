@@ -35,9 +35,7 @@ use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
 #[cfg(feature = "hyperlight")]
-use crate::tools::sandbox::{
-    HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool,
-};
+use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
 use acton_reactive::prelude::*;
 #[cfg(feature = "hyperlight")]
 use std::sync::Arc;
@@ -566,7 +564,8 @@ impl ActonAIBuilder {
     /// ```
     #[must_use]
     pub fn with_builtin_tools(mut self, tools: &[&str]) -> Self {
-        self.builtins = BuiltinToolsConfig::Select(tools.iter().map(|s| (*s).to_string()).collect());
+        self.builtins =
+            BuiltinToolsConfig::Select(tools.iter().map(|s| (*s).to_string()).collect());
         self.auto_builtins = true;
         self
     }

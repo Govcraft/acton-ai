@@ -203,10 +203,7 @@ impl SandboxConfig {
         if self.memory_limit < MIN_MEMORY {
             return Err(SandboxErrorKind::InvalidConfiguration {
                 field: "memory_limit".to_string(),
-                reason: format!(
-                    "must be at least 1 MB, got {} bytes",
-                    self.memory_limit
-                ),
+                reason: format!("must be at least 1 MB, got {} bytes", self.memory_limit),
             });
         }
 

@@ -122,15 +122,18 @@ impl HyperlightSandbox {
         let guest_binary = Self::load_guest_binary(&config)?;
 
         // Create uninitialized sandbox
-        let uninit = UninitializedSandbox::new(guest_binary, Some(hl_config))
-            .map_err(|e| SandboxErrorKind::CreationFailed {
+        let uninit = UninitializedSandbox::new(guest_binary, Some(hl_config)).map_err(|e| {
+            SandboxErrorKind::CreationFailed {
                 reason: e.to_string(),
-            })?;
+            }
+        })?;
 
         // Evolve to multi-use sandbox
-        let sandbox = uninit.evolve().map_err(|e| SandboxErrorKind::CreationFailed {
-            reason: format!("failed to initialize VM: {e}"),
-        })?;
+        let sandbox = uninit
+            .evolve()
+            .map_err(|e| SandboxErrorKind::CreationFailed {
+                reason: format!("failed to initialize VM: {e}"),
+            })?;
 
         Ok(Self {
             inner: Mutex::new(Some(sandbox)),
@@ -176,13 +179,14 @@ impl HyperlightSandbox {
             return Err(SandboxErrorKind::AlreadyDestroyed.into());
         }
 
-        let mut guard = self.inner.lock().map_err(|_| {
-            ToolError::sandbox_error("sandbox lock poisoned")
-        })?;
+        let mut guard = self
+            .inner
+            .lock()
+            .map_err(|_| ToolError::sandbox_error("sandbox lock poisoned"))?;
 
-        let sandbox = guard.as_mut().ok_or_else(|| {
-            SandboxErrorKind::AlreadyDestroyed.into_tool_error()
-        })?;
+        let sandbox = guard
+            .as_mut()
+            .ok_or_else(|| SandboxErrorKind::AlreadyDestroyed.into_tool_error())?;
 
         // Prepare request for the guest
         let request = ShellRequest {
@@ -191,20 +195,17 @@ impl HyperlightSandbox {
             timeout_secs: self.config.timeout.as_secs(),
         };
 
-        let request_json = serde_json::to_string(&request).map_err(|e| {
-            ToolError::sandbox_error(format!("failed to serialize request: {e}"))
-        })?;
+        let request_json = serde_json::to_string(&request)
+            .map_err(|e| ToolError::sandbox_error(format!("failed to serialize request: {e}")))?;
 
         // Call the guest's execute_shell function
-        let result: String = sandbox
-            .call("execute_shell", request_json)
-            .map_err(|e| {
-                SandboxErrorKind::GuestCallFailed {
-                    function: "execute_shell".to_string(),
-                    reason: e.to_string(),
-                }
-                .into_tool_error()
-            })?;
+        let result: String = sandbox.call("execute_shell", request_json).map_err(|e| {
+            SandboxErrorKind::GuestCallFailed {
+                function: "execute_shell".to_string(),
+                reason: e.to_string(),
+            }
+            .into_tool_error()
+        })?;
 
         // Parse the response
         let response: ShellResponse = serde_json::from_str(&result).map_err(|e| {
@@ -233,9 +234,7 @@ impl Sandbox for HyperlightSandbox {
 
         // Check destroyed state early
         if self.destroyed.load(Ordering::SeqCst) {
-            return Box::pin(async move {
-                Err(SandboxErrorKind::AlreadyDestroyed.into())
-            });
+            return Box::pin(async move { Err(SandboxErrorKind::AlreadyDestroyed.into()) });
         }
 
         // Since Hyperlight's MultiUseSandbox::call is synchronous, we need to
@@ -308,8 +307,7 @@ mod tests {
     #[test]
     fn sandbox_config_validation_in_new() {
         // Invalid config should fail during new()
-        let config = SandboxConfig::new()
-            .with_memory_limit(100); // Too small
+        let config = SandboxConfig::new().with_memory_limit(100); // Too small
 
         let result = HyperlightSandbox::new(config);
         assert!(result.is_err());

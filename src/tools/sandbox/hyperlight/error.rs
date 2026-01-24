@@ -131,7 +131,11 @@ impl fmt::Display for SandboxErrorKind {
                 write!(f, "sandbox has already been destroyed")
             }
             Self::InvalidConfiguration { field, reason } => {
-                write!(f, "invalid sandbox configuration for '{}': {}", field, reason)
+                write!(
+                    f,
+                    "invalid sandbox configuration for '{}': {}",
+                    field, reason
+                )
             }
         }
     }

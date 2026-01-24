@@ -155,10 +155,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
         let factory = envelope.message().factory.clone();
         let available = factory.is_available();
         actor.model.sandbox_factory = Some(factory);
-        tracing::info!(
-            sandbox_available = available,
-            "Sandbox factory configured"
-        );
+        tracing::info!(sandbox_available = available, "Sandbox factory configured");
         Reply::ready()
     });
 
@@ -281,7 +278,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
                     let Some(factory) = sandbox_factory else {
                         // No sandbox factory configured - return error
                         let err = ToolError::sandbox_error(
-                            "tool requires sandbox but no sandbox factory is configured"
+                            "tool requires sandbox but no sandbox factory is configured",
                         );
                         broker
                             .broadcast(ToolResponse {

@@ -2,8 +2,8 @@
 //!
 //! Reads file contents and returns them with line numbers.
 
-use acton_reactive::prelude::tokio;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::tokio;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
@@ -93,9 +93,9 @@ impl ReadFileTool {
         const MAX_LINE_LENGTH: usize = 2000;
 
         // Read file content
-        let content = tokio::fs::read_to_string(path)
-            .await
-            .map_err(|e| ToolError::execution_failed("read_file", format!("failed to read file: {e}")))?;
+        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+            ToolError::execution_failed("read_file", format!("failed to read file: {e}"))
+        })?;
 
         let all_lines: Vec<&str> = content.lines().collect();
         let total_lines = all_lines.len();
@@ -108,18 +108,32 @@ impl ReadFileTool {
         let mut formatted = String::new();
         let line_num_width = end_idx.to_string().len().max(4);
 
-        for (idx, line) in all_lines.iter().enumerate().skip(start_idx).take(end_idx - start_idx) {
+        for (idx, line) in all_lines
+            .iter()
+            .enumerate()
+            .skip(start_idx)
+            .take(end_idx - start_idx)
+        {
             let line_num = idx + 1;
             let truncated_line = if line.len() > MAX_LINE_LENGTH {
                 format!("{}...", &line[..MAX_LINE_LENGTH])
             } else {
                 line.to_string()
             };
-            formatted.push_str(&format!("{:>width$}\t{}\n", line_num, truncated_line, width = line_num_width));
+            formatted.push_str(&format!(
+                "{:>width$}\t{}\n",
+                line_num,
+                truncated_line,
+                width = line_num_width
+            ));
         }
 
         let truncated = end_idx < total_lines;
-        let actual_end = if end_idx > start_idx { end_idx } else { start_line };
+        let actual_end = if end_idx > start_idx {
+            end_idx
+        } else {
+            start_line
+        };
 
         Ok(ReadFileResult {
             content: formatted,
@@ -134,8 +148,9 @@ impl ReadFileTool {
 impl ToolExecutorTrait for ReadFileTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: ReadFileArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("read_file", format!("invalid arguments: {e}")))?;
+            let args: ReadFileArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("read_file", format!("invalid arguments: {e}"))
+            })?;
 
             let path = Path::new(&args.path);
 
@@ -186,11 +201,15 @@ impl ToolExecutorTrait for ReadFileTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: ReadFileArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("read_file", format!("invalid arguments: {e}")))?;
+        let args: ReadFileArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("read_file", format!("invalid arguments: {e}"))
+        })?;
 
         if args.path.is_empty() {
-            return Err(ToolError::validation_failed("read_file", "path cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "read_file",
+                "path cannot be empty",
+            ));
         }
 
         Ok(())

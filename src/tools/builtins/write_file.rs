@@ -2,8 +2,8 @@
 //!
 //! Writes content to a file, creating parent directories if needed.
 
-use acton_reactive::prelude::tokio;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::tokio;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -59,8 +59,9 @@ impl WriteFileTool {
 impl ToolExecutorTrait for WriteFileTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: WriteFileArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("write_file", format!("invalid arguments: {e}")))?;
+            let args: WriteFileArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("write_file", format!("invalid arguments: {e}"))
+            })?;
 
             let path = Path::new(&args.path);
 
@@ -75,17 +76,20 @@ impl ToolExecutorTrait for WriteFileTool {
             // Create parent directories if they don't exist
             if let Some(parent) = path.parent() {
                 if !parent.exists() {
-                    tokio::fs::create_dir_all(parent)
-                        .await
-                        .map_err(|e| ToolError::execution_failed("write_file", format!("failed to create parent directories: {e}")))?;
+                    tokio::fs::create_dir_all(parent).await.map_err(|e| {
+                        ToolError::execution_failed(
+                            "write_file",
+                            format!("failed to create parent directories: {e}"),
+                        )
+                    })?;
                 }
             }
 
             // Write the file
             let bytes_written = args.content.len();
-            tokio::fs::write(path, &args.content)
-                .await
-                .map_err(|e| ToolError::execution_failed("write_file", format!("failed to write file: {e}")))?;
+            tokio::fs::write(path, &args.content).await.map_err(|e| {
+                ToolError::execution_failed("write_file", format!("failed to write file: {e}"))
+            })?;
 
             Ok(json!({
                 "success": true,
@@ -96,11 +100,15 @@ impl ToolExecutorTrait for WriteFileTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: WriteFileArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("write_file", format!("invalid arguments: {e}")))?;
+        let args: WriteFileArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("write_file", format!("invalid arguments: {e}"))
+        })?;
 
         if args.path.is_empty() {
-            return Err(ToolError::validation_failed("write_file", "path cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "write_file",
+                "path cannot be empty",
+            ));
         }
 
         Ok(())
@@ -220,7 +228,13 @@ mod tests {
         let schema = &config.definition.input_schema;
         assert!(schema["properties"]["path"].is_object());
         assert!(schema["properties"]["content"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("path")));
-        assert!(schema["required"].as_array().unwrap().contains(&json!("content")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("path")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("content")));
     }
 }

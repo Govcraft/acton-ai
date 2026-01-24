@@ -88,7 +88,9 @@ impl WebFetchTool {
 
         ToolConfig::new(ToolDefinition {
             name: "web_fetch".to_string(),
-            description: "Fetch content from a URL. Supports GET and POST methods with custom headers.".to_string(),
+            description:
+                "Fetch content from a URL. Supports GET and POST methods with custom headers."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -127,9 +129,8 @@ impl WebFetchTool {
     /// Validates and normalizes the URL.
     fn validate_url(url: &str) -> Result<String, ToolError> {
         // Parse the URL
-        let parsed = Url::parse(url).map_err(|e| {
-            ToolError::validation_failed("web_fetch", format!("invalid URL: {e}"))
-        })?;
+        let parsed = Url::parse(url)
+            .map_err(|e| ToolError::validation_failed("web_fetch", format!("invalid URL: {e}")))?;
 
         // Only allow http and https
         match parsed.scheme() {
@@ -175,12 +176,16 @@ impl ToolExecutorTrait for WebFetchTool {
         let max_size = self.max_response_size;
 
         Box::pin(async move {
-            let args: WebFetchArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("web_fetch", format!("invalid arguments: {e}")))?;
+            let args: WebFetchArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("web_fetch", format!("invalid arguments: {e}"))
+            })?;
 
             // Validate empty URL early
             if args.url.is_empty() {
-                return Err(ToolError::validation_failed("web_fetch", "url cannot be empty"));
+                return Err(ToolError::validation_failed(
+                    "web_fetch",
+                    "url cannot be empty",
+                ));
             }
 
             // Validate URL
@@ -204,10 +209,16 @@ impl ToolExecutorTrait for WebFetchTool {
                 let mut header_map = HeaderMap::new();
                 for (key, value) in headers {
                     let name = HeaderName::try_from(key.as_str()).map_err(|e| {
-                        ToolError::validation_failed("web_fetch", format!("invalid header name: {e}"))
+                        ToolError::validation_failed(
+                            "web_fetch",
+                            format!("invalid header name: {e}"),
+                        )
                     })?;
                     let val = HeaderValue::try_from(value.as_str()).map_err(|e| {
-                        ToolError::validation_failed("web_fetch", format!("invalid header value: {e}"))
+                        ToolError::validation_failed(
+                            "web_fetch",
+                            format!("invalid header value: {e}"),
+                        )
                     })?;
                     header_map.insert(name, val);
                 }
@@ -244,7 +255,9 @@ impl ToolExecutorTrait for WebFetchTool {
                 .headers()
                 .iter()
                 .filter_map(|(k, v)| {
-                    v.to_str().ok().map(|s| (k.as_str().to_string(), s.to_string()))
+                    v.to_str()
+                        .ok()
+                        .map(|s| (k.as_str().to_string(), s.to_string()))
                 })
                 .collect();
 
@@ -281,11 +294,15 @@ impl ToolExecutorTrait for WebFetchTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: WebFetchArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("web_fetch", format!("invalid arguments: {e}")))?;
+        let args: WebFetchArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("web_fetch", format!("invalid arguments: {e}"))
+        })?;
 
         if args.url.is_empty() {
-            return Err(ToolError::validation_failed("web_fetch", "url cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "web_fetch",
+                "url cannot be empty",
+            ));
         }
 
         // Validate URL format
@@ -362,7 +379,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("unsupported method"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported method"));
     }
 
     #[test]

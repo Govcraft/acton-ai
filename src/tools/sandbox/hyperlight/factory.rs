@@ -95,8 +95,8 @@ impl HyperlightSandboxFactory {
     /// the factory will report as unavailable.
     #[must_use]
     pub fn with_config_fallback(config: SandboxConfig) -> Self {
-        let hypervisor_available = hyperlight_host::is_hypervisor_present()
-            && config.validate().is_ok();
+        let hypervisor_available =
+            hyperlight_host::is_hypervisor_present() && config.validate().is_ok();
 
         Self {
             config,

@@ -63,8 +63,9 @@ impl GlobTool {
 impl ToolExecutorTrait for GlobTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: GlobArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("glob", format!("invalid arguments: {e}")))?;
+            let args: GlobArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("glob", format!("invalid arguments: {e}"))
+            })?;
 
             // Determine base path
             let base_path = match &args.path {
@@ -85,7 +86,10 @@ impl ToolExecutorTrait for GlobTool {
                     path.to_path_buf()
                 }
                 None => std::env::current_dir().map_err(|e| {
-                    ToolError::execution_failed("glob", format!("failed to get current directory: {e}"))
+                    ToolError::execution_failed(
+                        "glob",
+                        format!("failed to get current directory: {e}"),
+                    )
                 })?,
             };
 
@@ -94,8 +98,9 @@ impl ToolExecutorTrait for GlobTool {
             let pattern_str = full_pattern.to_string_lossy();
 
             // Execute glob
-            let paths = glob_match(&pattern_str)
-                .map_err(|e| ToolError::validation_failed("glob", format!("invalid glob pattern: {e}")))?;
+            let paths = glob_match(&pattern_str).map_err(|e| {
+                ToolError::validation_failed("glob", format!("invalid glob pattern: {e}"))
+            })?;
 
             let mut matches: Vec<String> = Vec::new();
             let mut truncated = false;
@@ -135,7 +140,10 @@ impl ToolExecutorTrait for GlobTool {
             .map_err(|e| ToolError::validation_failed("glob", format!("invalid arguments: {e}")))?;
 
         if args.pattern.is_empty() {
-            return Err(ToolError::validation_failed("glob", "pattern cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "glob",
+                "pattern cannot be empty",
+            ));
         }
 
         Ok(())
@@ -233,7 +241,10 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("invalid glob pattern"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("invalid glob pattern"));
     }
 
     #[tokio::test]
@@ -273,6 +284,9 @@ mod tests {
         let schema = &config.definition.input_schema;
         assert!(schema["properties"]["pattern"].is_object());
         assert!(schema["properties"]["path"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("pattern")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("pattern")));
     }
 }

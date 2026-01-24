@@ -97,7 +97,10 @@ impl std::fmt::Debug for PooledSandbox {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PooledSandbox")
             .field("index", &self.index)
-            .field("is_alive", &self.inner.as_ref().is_some_and(|s| s.is_alive()))
+            .field(
+                "is_alive",
+                &self.inner.as_ref().is_some_and(|s| s.is_alive()),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -118,9 +121,10 @@ impl PooledSandbox {
     ///
     /// Returns an error if the sandbox is not available or execution fails.
     pub async fn execute(&self, code: &str, args: Value) -> Result<Value, ToolError> {
-        let sandbox = self.inner.as_ref().ok_or_else(|| {
-            ToolError::sandbox_error("pooled sandbox is not available")
-        })?;
+        let sandbox = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| ToolError::sandbox_error("pooled sandbox is not available"))?;
 
         sandbox.execute(code, args).await
     }
@@ -150,7 +154,6 @@ struct PoolEntry {
     sandbox: Box<dyn Sandbox>,
     in_use: bool,
 }
-
 
 /// Actor that manages a pool of pre-warmed Hyperlight sandboxes.
 ///
@@ -205,10 +208,7 @@ impl SandboxPool {
                 Reply::ready()
             })
             .after_start(|actor| {
-                tracing::info!(
-                    target_size = actor.model.target_size,
-                    "Sandbox pool ready"
-                );
+                tracing::info!(target_size = actor.model.target_size, "Sandbox pool ready");
                 Reply::ready()
             })
             .before_stop(|actor| {
@@ -260,7 +260,8 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, SandboxPool>) {
             if entry.sandbox.is_alive() {
                 entry.in_use = false;
                 actor.model.metrics.in_use = actor.model.metrics.in_use.saturating_sub(1);
-                actor.model.metrics.available = actor.model.entries.iter().filter(|e| !e.in_use).count();
+                actor.model.metrics.available =
+                    actor.model.entries.iter().filter(|e| !e.in_use).count();
             } else {
                 // Remove dead sandbox
                 actor.model.entries.remove(index);

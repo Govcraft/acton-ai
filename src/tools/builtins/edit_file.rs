@@ -2,8 +2,8 @@
 //!
 //! Makes targeted string replacements in files.
 
-use acton_reactive::prelude::tokio;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::tokio;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -116,8 +116,9 @@ impl EditFileTool {
 impl ToolExecutorTrait for EditFileTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         Box::pin(async move {
-            let args: EditFileArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("edit_file", format!("invalid arguments: {e}")))?;
+            let args: EditFileArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("edit_file", format!("invalid arguments: {e}"))
+            })?;
 
             let path = Path::new(&args.path);
 
@@ -152,9 +153,9 @@ impl ToolExecutorTrait for EditFileTool {
             }
 
             // Read the file
-            let content = tokio::fs::read_to_string(path)
-                .await
-                .map_err(|e| ToolError::execution_failed("edit_file", format!("failed to read file: {e}")))?;
+            let content = tokio::fs::read_to_string(path).await.map_err(|e| {
+                ToolError::execution_failed("edit_file", format!("failed to read file: {e}"))
+            })?;
 
             // Count occurrences
             let match_count = content.matches(&args.old_string).count();
@@ -186,9 +187,9 @@ impl ToolExecutorTrait for EditFileTool {
             let diff = Self::generate_diff(&content, &new_content, &args.path);
 
             // Write the file
-            tokio::fs::write(path, &new_content)
-                .await
-                .map_err(|e| ToolError::execution_failed("edit_file", format!("failed to write file: {e}")))?;
+            tokio::fs::write(path, &new_content).await.map_err(|e| {
+                ToolError::execution_failed("edit_file", format!("failed to write file: {e}"))
+            })?;
 
             Ok(json!({
                 "success": true,
@@ -200,15 +201,22 @@ impl ToolExecutorTrait for EditFileTool {
     }
 
     fn validate_args(&self, args: &Value) -> Result<(), ToolError> {
-        let args: EditFileArgs = serde_json::from_value(args.clone())
-            .map_err(|e| ToolError::validation_failed("edit_file", format!("invalid arguments: {e}")))?;
+        let args: EditFileArgs = serde_json::from_value(args.clone()).map_err(|e| {
+            ToolError::validation_failed("edit_file", format!("invalid arguments: {e}"))
+        })?;
 
         if args.path.is_empty() {
-            return Err(ToolError::validation_failed("edit_file", "path cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "edit_file",
+                "path cannot be empty",
+            ));
         }
 
         if args.old_string.is_empty() {
-            return Err(ToolError::validation_failed("edit_file", "old_string cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "edit_file",
+                "old_string cannot be empty",
+            ));
         }
 
         Ok(())

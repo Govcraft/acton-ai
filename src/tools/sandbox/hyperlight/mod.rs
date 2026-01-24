@@ -62,7 +62,9 @@ mod pool;
 mod sandbox;
 
 // Re-export all public types
-pub use config::{GuestBinarySource, SandboxConfig, DEFAULT_MEMORY_LIMIT, DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT};
+pub use config::{
+    GuestBinarySource, SandboxConfig, DEFAULT_MEMORY_LIMIT, DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT,
+};
 pub use error::SandboxErrorKind;
 pub use factory::{AutoSandboxFactory, HyperlightSandboxFactory};
 pub use pool::{
