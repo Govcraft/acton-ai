@@ -4,10 +4,11 @@
 !.env.example
 !**/.env.example
 
-# Text and markdown files (except README.md)
+# Text and markdown files (except README.md and example skills)
 *.txt
 *.md
 !README.md
+!examples/skills/*.md
 
 # Rust
 /target/
