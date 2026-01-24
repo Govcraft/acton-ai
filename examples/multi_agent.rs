@@ -2,14 +2,14 @@
 //!
 //! A complete end-to-end example demonstrating:
 //! - Multi-agent collaboration with role-based specialists
-//! - Tool usage by specialist agents (building on `ollama_tools.rs`)
+//! - Built-in tool usage (web_fetch, calculate)
 //! - Sequential task delegation and result collection
 //! - LLM-powered task processing and synthesis
 //!
 //! ## Scenario
 //!
 //! A user asks a question. The coordinator orchestrates specialists:
-//! - **Researcher**: Uses `search_web` tool to find information
+//! - **Researcher**: Uses `web_fetch` tool to find information
 //! - **Analyst**: Uses `calculate` tool for numerical analysis
 //! - **Coordinator**: Synthesizes findings into a final answer
 //!
@@ -37,23 +37,6 @@ use acton_ai::prelude::*;
 use colored::Colorize;
 use std::io::Write;
 
-/// Mock web search function.
-///
-/// In production, this would call a real search API. For this example,
-/// it returns canned responses for known queries.
-fn search_web(query: &str) -> String {
-    let q = query.to_lowercase();
-    if q.contains("population") && q.contains("france") {
-        "France has a population of approximately 67.75 million people (2024).".into()
-    } else if q.contains("population") && q.contains("germany") {
-        "Germany has a population of approximately 84.4 million people (2024).".into()
-    } else if q.contains("population") && q.contains("japan") {
-        "Japan has a population of approximately 123.3 million people (2024).".into()
-    } else {
-        format!("Search results for: {query}")
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("{}", "Multi-Agent Research Team".cyan().bold());
@@ -62,70 +45,37 @@ async fn main() -> anyhow::Result<()> {
     eprintln!();
 
     // Launch ActonAI runtime from config file
-    // Register the calculate builtin for the analyst agent
+    // Register web_fetch and calculate builtins for the agents
     let runtime = ActonAI::builder()
         .app_name("multi-agent-research")
         .from_config()?
-        .with_builtin_tools(&["calculate"])
+        .with_builtin_tools(&["web_fetch", "calculate"])
         .launch()
         .await?;
-
-    // Define the search tool for the researcher agent
-    let search_tool = ToolDefinition {
-        name: "search_web".to_string(),
-        description: "Search the web for factual information. Use this to find data like \
-                      population statistics, facts, and current information."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The search query to find information"
-                }
-            },
-            "required": ["query"]
-        }),
-    };
 
     // The user's question
     let user_question = "What is the population of France, and what's 15% of that number?";
     println!("{} {}\n", "User:".white().bold(), user_question);
 
     // === Step 1: Researcher Agent ===
-    // The researcher uses the search_web tool to find factual information
+    // The researcher uses the web_fetch tool to find factual information
     println!(
         "{} {}",
         "[Researcher]".blue().bold(),
-        "Searching for population data...".dimmed()
+        "Fetching population data from the web...".dimmed()
     );
     let research_result = runtime
-        .prompt("Find the current population of France using the search_web tool.")
+        .prompt(
+            "Find the current population of France. \
+             Use the web_fetch tool to fetch https://restcountries.com/v3.1/name/france \
+             and extract the population from the JSON response.",
+        )
         .system(
             "You are a research specialist. Your job is to find factual information. \
-             ALWAYS use the search_web tool to look up data. \
-             After getting the search results, summarize the key facts found.",
+             Use the web_fetch tool to retrieve data from URLs. \
+             After getting the response, extract and summarize the key facts found.",
         )
-        .with_tool_callback(
-            search_tool,
-            |args| async move {
-                let query = args
-                    .get("query")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("population France");
-                let result = search_web(query);
-                Ok(serde_json::json!({ "result": result }))
-            },
-            |result| {
-                if let Ok(value) = result {
-                    eprintln!(
-                        "  {} {}",
-                        "[search_web]".yellow().dimmed(),
-                        value.to_string().yellow().dimmed()
-                    );
-                }
-            },
-        )
+        .use_builtins()
         .on_token(|token| {
             print!("{token}");
             std::io::stdout().flush().ok();
@@ -155,7 +105,7 @@ async fn main() -> anyhow::Result<()> {
              ALWAYS use the calculate tool for any math operations. \
              After getting the result, explain what the number means.",
         )
-        .use_builtins() // Use the built-in calculate tool
+        .use_builtins()
         .on_token(|token| {
             print!("{token}");
             std::io::stdout().flush().ok();
