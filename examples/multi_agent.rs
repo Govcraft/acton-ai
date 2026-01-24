@@ -54,43 +54,6 @@ fn search_web(query: &str) -> String {
     }
 }
 
-/// Simple expression evaluator for basic math operations.
-///
-/// Handles expressions like "67750000 * 0.15" with +, -, *, / operators.
-fn evaluate_expression(expr: &str) -> Result<f64, String> {
-    let expr = expr.trim();
-
-    // Try to parse as a simple number first
-    if let Ok(num) = expr.parse::<f64>() {
-        return Ok(num);
-    }
-
-    // Handle basic operations (right-to-left for correct precedence)
-    for op in ['+', '-', '*', '/'] {
-        if let Some(pos) = expr.rfind(op) {
-            if pos > 0 {
-                let left = evaluate_expression(&expr[..pos])?;
-                let right = evaluate_expression(&expr[pos + 1..])?;
-                return match op {
-                    '+' => Ok(left + right),
-                    '-' => Ok(left - right),
-                    '*' => Ok(left * right),
-                    '/' => {
-                        if right == 0.0 {
-                            Err("division by zero".to_string())
-                        } else {
-                            Ok(left / right)
-                        }
-                    }
-                    _ => unreachable!(),
-                };
-            }
-        }
-    }
-
-    Err(format!("cannot evaluate: {expr}"))
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("{}", "Multi-Agent Research Team".cyan().bold());
@@ -99,9 +62,11 @@ async fn main() -> anyhow::Result<()> {
     eprintln!();
 
     // Launch ActonAI runtime from config file
+    // Register the calculate builtin for the analyst agent
     let runtime = ActonAI::builder()
         .app_name("multi-agent-research")
         .from_config()?
+        .with_builtin_tools(&["calculate"])
         .launch()
         .await?;
 
@@ -120,23 +85,6 @@ async fn main() -> anyhow::Result<()> {
                 }
             },
             "required": ["query"]
-        }),
-    };
-
-    // Define the calculator tool for the analyst agent
-    let calc_tool = ToolDefinition {
-        name: "calculate".to_string(),
-        description: "Perform mathematical calculations. Use this for any arithmetic operations."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "expression": {
-                    "type": "string",
-                    "description": "The mathematical expression to evaluate (e.g., '67750000 * 0.15')"
-                }
-            },
-            "required": ["expression"]
         }),
     };
 
@@ -207,34 +155,7 @@ async fn main() -> anyhow::Result<()> {
              ALWAYS use the calculate tool for any math operations. \
              After getting the result, explain what the number means.",
         )
-        .with_tool_callback(
-            calc_tool,
-            |args| async move {
-                let expression =
-                    args.get("expression")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| {
-                            ToolError::validation_failed("calculate", "missing 'expression'")
-                        })?;
-
-                let result = evaluate_expression(expression)
-                    .map_err(|e| ToolError::execution_failed("calculate", e))?;
-
-                Ok(serde_json::json!({
-                    "expression": expression,
-                    "result": result
-                }))
-            },
-            |result| {
-                if let Ok(value) = result {
-                    eprintln!(
-                        "  {} {}",
-                        "[calculate]".yellow().dimmed(),
-                        value.to_string().yellow().dimmed()
-                    );
-                }
-            },
-        )
+        .use_builtins() // Use the built-in calculate tool
         .on_token(|token| {
             print!("{token}");
             std::io::stdout().flush().ok();
