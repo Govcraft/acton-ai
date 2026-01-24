@@ -18,11 +18,16 @@
 //!
 //! ## Configuration
 //!
-//! Set environment variables or create a `.env` file:
+//! Create an `acton-ai.toml` file in the project root or at
+//! `~/.config/acton-ai/config.toml`:
 //!
-//! ```bash
-//! export OLLAMA_URL="http://localhost:11434/v1"
-//! export OLLAMA_MODEL="qwen2.5:7b"  # 7b+ recommended for tool calling
+//! ```toml
+//! default_provider = "ollama"
+//!
+//! [providers.ollama]
+//! type = "ollama"
+//! model = "qwen2.5:7b"
+//! base_url = "http://localhost:11434/v1"
 //! ```
 //!
 //! ## Usage
@@ -32,27 +37,13 @@
 //! ```
 
 use acton_ai::agent::{Agent, AgentConfig, InitAgent, RegisterToolActors};
-use acton_ai::llm::{LLMProvider, ProviderConfig};
+use acton_ai::config;
+use acton_ai::llm::LLMProvider;
 use acton_ai::messages::ToolDefinition;
 use acton_ai::prelude::*;
 use acton_ai::tools::builtins::{get_tool_definition, spawn_tool_actor, BuiltinTools};
 use colored::Colorize;
 use std::time::Duration;
-
-/// Load environment variables from .env file if present.
-fn load_dotenv() {
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-                if !key.is_empty() && !key.starts_with('#') {
-                    std::env::set_var(key, value);
-                }
-            }
-        }
-    }
-}
 
 /// Print the list of tools available for an agent configuration.
 fn print_tools(name: &str, config: &AgentConfig) {
@@ -77,22 +68,9 @@ fn print_tools(name: &str, config: &AgentConfig) {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    load_dotenv();
-
-    // Get configuration from environment
-    let ollama_url =
-        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
-
     println!("{}", "Per-Agent Tools Demo".cyan().bold());
     println!("{}", "====================".dimmed());
-    eprintln!(
-        "{} {} {} {}",
-        "Connecting to Ollama at".dimmed(),
-        ollama_url.cyan(),
-        "with model".dimmed(),
-        model.cyan()
-    );
+    eprintln!("{}", "Loading configuration from acton-ai.toml...".dimmed());
     println!();
 
     // =========================================================================
@@ -178,8 +156,18 @@ async fn main() -> anyhow::Result<()> {
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
 
-    // Spawn the LLM provider
-    let provider_config = ProviderConfig::openai_compatible(&ollama_url, &model)
+    // Load configuration from acton-ai.toml and spawn the LLM provider
+    let acton_config = config::load()?;
+    let default_name = acton_config
+        .effective_default()
+        .ok_or_else(|| anyhow::anyhow!("No default provider configured"))?;
+    let named_config = acton_config
+        .providers
+        .get(default_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", default_name))?;
+
+    let provider_config = named_config
+        .to_provider_config()
         .with_timeout(Duration::from_secs(120))
         .with_max_tokens(512);
     let _provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;

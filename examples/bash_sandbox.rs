@@ -11,11 +11,16 @@
 //!
 //! # Configuration
 //!
-//! Set environment variables or create a `.env` file:
+//! Create an `acton-ai.toml` file in the project root or at
+//! `~/.config/acton-ai/config.toml`:
 //!
-//! ```bash
-//! export OLLAMA_URL="http://localhost:11434/v1"
-//! export OLLAMA_MODEL="qwen2.5:7b"
+//! ```toml
+//! default_provider = "ollama"
+//!
+//! [providers.ollama]
+//! type = "ollama"
+//! model = "qwen2.5:7b"
+//! base_url = "http://localhost:11434/v1"
 //! ```
 //!
 //! # Usage
@@ -33,41 +38,15 @@
 use acton_ai::prelude::*;
 use std::io::Write;
 
-/// Load environment variables from .env file if present.
-fn load_dotenv() {
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-                if !key.is_empty() && !key.starts_with('#') {
-                    std::env::set_var(key, value);
-                }
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    load_dotenv();
+    eprintln!("Loading configuration from acton-ai.toml...");
 
-    // Get configuration from environment
-    let ollama_url =
-        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
-
-    eprintln!("Connecting to Ollama at {ollama_url} with model {model}");
-
-    // Build the runtime with bash tool enabled
+    // Build the runtime with bash tool enabled from config file
     // The bash tool is marked as `sandboxed: true` by default
     let builder = ActonAI::builder()
         .app_name("bash-sandbox-example")
-        .provider(
-            ProviderConfig::openai_compatible(&ollama_url, &model)
-                .with_timeout(std::time::Duration::from_secs(120))
-                .with_max_tokens(512),
-        )
+        .from_config()?
         .with_builtin_tools(&["bash"]); // Enable only the bash tool
 
     // Configure sandbox based on feature flag

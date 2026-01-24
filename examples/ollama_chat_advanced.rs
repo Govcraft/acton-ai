@@ -9,11 +9,16 @@
 //!
 //! # Configuration
 //!
-//! Set environment variables or create a `.env` file:
+//! Create an `acton-ai.toml` file in the project root or at
+//! `~/.config/acton-ai/config.toml`:
 //!
-//! ```bash
-//! export OLLAMA_URL="http://localhost:11434/v1"
-//! export OLLAMA_MODEL="qwen2.5:7b"
+//! ```toml
+//! default_provider = "ollama"
+//!
+//! [providers.ollama]
+//! type = "ollama"
+//! model = "qwen2.5:7b"
+//! base_url = "http://localhost:11434/v1"
 //! ```
 //!
 //! # Usage
@@ -22,6 +27,7 @@
 //! cargo run --example ollama_chat_advanced
 //! ```
 
+use acton_ai::config;
 use acton_ai::prelude::*;
 use std::io::Write;
 use std::sync::Arc;
@@ -43,26 +49,8 @@ struct ResponseCollector {
     word_count: usize,
 }
 
-/// Load environment variables from .env file if present
-fn load_dotenv() {
-    if let Ok(contents) = std::fs::read_to_string(".env") {
-        for line in contents.lines() {
-            if let Some((key, value)) = line.split_once('=') {
-                let key = key.trim();
-                let value = value.trim().trim_matches('"');
-                if !key.is_empty() && !key.starts_with('#') {
-                    std::env::set_var(key, value);
-                }
-            }
-        }
-    }
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    // Load .env file if present
-    load_dotenv();
-
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
 
@@ -78,20 +66,23 @@ async fn main() -> anyhow::Result<()> {
 
     tracing::info!("Starting advanced Ollama chat example...");
 
-    // Configure for Ollama - URL and model from environment
-    let ollama_url =
-        std::env::var("OLLAMA_URL").unwrap_or_else(|_| "http://localhost:11434/v1".to_string());
-    let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
+    // Load configuration from acton-ai.toml
+    let acton_config = config::load()?;
+    let default_name = acton_config
+        .effective_default()
+        .ok_or_else(|| anyhow::anyhow!("No default provider configured"))?;
+    let named_config = acton_config
+        .providers
+        .get(default_name)
+        .ok_or_else(|| anyhow::anyhow!("Provider '{}' not found", default_name))?;
 
-    let provider_config = ProviderConfig::openai_compatible(&ollama_url, &model)
+    // Convert to ProviderConfig
+    let provider_config = named_config
+        .to_provider_config()
         .with_timeout(Duration::from_secs(120))
         .with_max_tokens(256);
 
-    tracing::info!(
-        "Connecting to Ollama at {} with model {}",
-        ollama_url,
-        model
-    );
+    tracing::info!("Using provider '{}' from config", default_name);
 
     // Notify to signal stream completion
     let stream_done = Arc::new(Notify::new());
