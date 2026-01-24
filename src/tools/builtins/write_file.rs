@@ -61,6 +61,7 @@ impl WriteFileTool {
                 "required": ["path", "content"]
             }),
         })
+        .with_sandbox(true) // File writes require sandbox for security
     }
 }
 
@@ -120,6 +121,10 @@ impl ToolExecutorTrait for WriteFileTool {
         }
 
         Ok(())
+    }
+
+    fn requires_sandbox(&self) -> bool {
+        true
     }
 }
 
@@ -284,5 +289,17 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("content")));
+    }
+
+    #[test]
+    fn write_file_requires_sandbox() {
+        let tool = WriteFileTool::new();
+        assert!(tool.requires_sandbox());
+    }
+
+    #[test]
+    fn write_file_config_is_sandboxed() {
+        let config = WriteFileTool::config();
+        assert!(config.sandboxed, "write_file tool should require sandbox");
     }
 }
