@@ -100,6 +100,7 @@ pub mod prelude {
         SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
+    pub use crate::tools::builtins::BuiltinTools;
     pub use crate::tools::{
         RegisterTool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind, ToolExecutorTrait,
         ToolRegistry,

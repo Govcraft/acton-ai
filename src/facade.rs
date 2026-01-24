@@ -31,6 +31,7 @@ use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::kernel::{Kernel, KernelConfig};
 use crate::llm::{LLMProvider, ProviderConfig};
 use crate::prompt::PromptBuilder;
+use crate::tools::builtins::BuiltinTools;
 use acton_reactive::prelude::*;
 
 /// High-level facade for interacting with ActonAI.
@@ -59,6 +60,8 @@ pub struct ActonAI {
     runtime: ActorRuntime,
     /// Handle to the LLM provider actor
     provider_handle: ActorHandle,
+    /// Built-in tools (if enabled)
+    builtins: Option<BuiltinTools>,
     /// Whether the runtime has been shut down
     is_shutdown: bool,
 }
@@ -67,6 +70,7 @@ impl std::fmt::Debug for ActonAI {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActonAI")
             .field("is_shutdown", &self.is_shutdown)
+            .field("has_builtins", &self.builtins.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -137,6 +141,22 @@ impl ActonAI {
         self.is_shutdown
     }
 
+    /// Returns a reference to the built-in tools, if enabled.
+    ///
+    /// Returns `None` if built-in tools were not configured with
+    /// [`with_builtins`](ActonAIBuilder::with_builtins) or
+    /// [`with_builtin_tools`](ActonAIBuilder::with_builtin_tools).
+    #[must_use]
+    pub fn builtins(&self) -> Option<&BuiltinTools> {
+        self.builtins.as_ref()
+    }
+
+    /// Returns whether built-in tools are enabled.
+    #[must_use]
+    pub fn has_builtins(&self) -> bool {
+        self.builtins.is_some()
+    }
+
     /// Shuts down the runtime gracefully.
     ///
     /// This stops all actors and releases resources.
@@ -151,6 +171,18 @@ impl ActonAI {
             .await
             .map_err(|e| ActonAIError::launch_failed(e.to_string()))
     }
+}
+
+/// Configuration for built-in tools.
+#[derive(Default, Clone)]
+enum BuiltinToolsConfig {
+    /// No built-in tools
+    #[default]
+    None,
+    /// All built-in tools
+    All,
+    /// Specific tools by name
+    Select(Vec<String>),
 }
 
 /// Builder for configuring and launching ActonAI.
@@ -168,6 +200,7 @@ impl ActonAI {
 pub struct ActonAIBuilder {
     app_name: Option<String>,
     provider_config: Option<ProviderConfig>,
+    builtins: BuiltinToolsConfig,
 }
 
 impl ActonAIBuilder {
@@ -312,6 +345,55 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Enables all built-in tools.
+    ///
+    /// Built-in tools include:
+    /// - `read_file`: Read file contents with line numbers
+    /// - `write_file`: Write content to files
+    /// - `edit_file`: Make targeted string replacements
+    /// - `list_directory`: List directory contents
+    /// - `glob`: Find files matching glob patterns
+    /// - `grep`: Search file contents with regex
+    /// - `bash`: Execute shell commands
+    /// - `calculate`: Evaluate mathematical expressions
+    /// - `web_fetch`: Fetch content from URLs
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtins()
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_builtins(mut self) -> Self {
+        self.builtins = BuiltinToolsConfig::All;
+        self
+    }
+
+    /// Enables specific built-in tools by name.
+    ///
+    /// See [`with_builtins`](Self::with_builtins) for the list of available tools.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtin_tools(&["read_file", "write_file", "glob"])
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_builtin_tools(mut self, tools: &[&str]) -> Self {
+        self.builtins = BuiltinToolsConfig::Select(tools.iter().map(|s| (*s).to_string()).collect());
+        self
+    }
+
     /// Launches the ActonAI runtime with the configured settings.
     ///
     /// This spawns the actor runtime, kernel, and LLM provider.
@@ -354,9 +436,25 @@ impl ActonAIBuilder {
         // Spawn the LLM provider
         let provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
 
+        // Load built-in tools if configured
+        let builtins = match self.builtins {
+            BuiltinToolsConfig::None => None,
+            BuiltinToolsConfig::All => Some(BuiltinTools::all()),
+            BuiltinToolsConfig::Select(ref tools) => {
+                let tool_refs: Vec<&str> = tools.iter().map(String::as_str).collect();
+                Some(BuiltinTools::select(&tool_refs).map_err(|e| {
+                    ActonAIError::new(ActonAIErrorKind::Configuration {
+                        field: "builtins".to_string(),
+                        reason: e.to_string(),
+                    })
+                })?)
+            }
+        };
+
         Ok(ActonAI {
             runtime,
             provider_handle,
+            builtins,
             is_shutdown: false,
         })
     }
