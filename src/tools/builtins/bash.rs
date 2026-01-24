@@ -2,8 +2,8 @@
 //!
 //! Executes shell commands with timeout and output capture.
 
-use acton_reactive::prelude::tokio;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
+use acton_reactive::prelude::tokio;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -72,7 +72,7 @@ impl BashTool {
 
         ToolConfig::new(ToolDefinition {
             name: "bash".to_string(),
-            description: "Execute a shell command and capture its output. Use for system operations, git commands, build tools, etc.".to_string(),
+            description: "Use to execute a shell command and capture its output. Use for system operations, git commands, build tools, and anything else that requires a shell.".to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -88,7 +88,7 @@ impl BashTool {
                     },
                     "cwd": {
                         "type": "string",
-                        "description": "Working directory for the command (default: current directory)"
+                        "description": "Absolute path to working directory. Only specify if you need a different directory than the current one."
                     }
                 },
                 "required": ["command"]
@@ -123,12 +123,16 @@ impl ToolExecutorTrait for BashTool {
         let max_timeout = self.max_timeout;
 
         Box::pin(async move {
-            let args: BashArgs = serde_json::from_value(args)
-                .map_err(|e| ToolError::validation_failed("bash", format!("invalid arguments: {e}")))?;
+            let args: BashArgs = serde_json::from_value(args).map_err(|e| {
+                ToolError::validation_failed("bash", format!("invalid arguments: {e}"))
+            })?;
 
             // Validate empty command early
             if args.command.is_empty() {
-                return Err(ToolError::validation_failed("bash", "command cannot be empty"));
+                return Err(ToolError::validation_failed(
+                    "bash",
+                    "command cannot be empty",
+                ));
             }
 
             // Validate and set timeout
@@ -235,11 +239,19 @@ impl ToolExecutorTrait for BashTool {
             .map_err(|e| ToolError::validation_failed("bash", format!("invalid arguments: {e}")))?;
 
         if args.command.is_empty() {
-            return Err(ToolError::validation_failed("bash", "command cannot be empty"));
+            return Err(ToolError::validation_failed(
+                "bash",
+                "command cannot be empty",
+            ));
         }
 
         // Basic safety check for obviously dangerous commands
-        let dangerous_patterns = ["rm -rf /", ":(){ :|:& };:", "mkfs.", "dd if=/dev/zero of=/dev/"];
+        let dangerous_patterns = [
+            "rm -rf /",
+            ":(){ :|:& };:",
+            "mkfs.",
+            "dd if=/dev/zero of=/dev/",
+        ];
         for pattern in &dangerous_patterns {
             if args.command.contains(pattern) {
                 return Err(ToolError::validation_failed(

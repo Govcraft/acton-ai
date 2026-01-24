@@ -94,6 +94,18 @@ where
     }
 }
 
+/// Adapter to wrap built-in tool executors as `ToolExecutorFn`.
+struct BuiltinToolExecutorAdapter {
+    executor: Arc<crate::tools::BoxedToolExecutor>,
+}
+
+impl ToolExecutorFn for BuiltinToolExecutorAdapter {
+    fn call(&self, args: serde_json::Value) -> ToolFuture {
+        let executor = Arc::clone(&self.executor);
+        Box::pin(async move { executor.execute(args).await })
+    }
+}
+
 /// A tool specification combining definition, executor, and optional result callback.
 pub struct ToolSpec {
     /// The tool definition sent to the LLM
@@ -490,6 +502,47 @@ impl<'a> PromptBuilder<'a> {
     #[must_use]
     pub fn max_tool_rounds(mut self, max: usize) -> Self {
         self.max_tool_rounds = max;
+        self
+    }
+
+    /// Enables the built-in tools configured on the runtime.
+    ///
+    /// This method adds all tools that were configured via
+    /// [`with_builtins`](crate::ActonAIBuilder::with_builtins) or
+    /// [`with_builtin_tools`](crate::ActonAIBuilder::with_builtin_tools)
+    /// to this prompt, making them available to the LLM.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtin_tools(&["bash", "read_file"])
+    ///     .launch()
+    ///     .await?;
+    ///
+    /// // The LLM can now use bash and read_file tools
+    /// runtime
+    ///     .prompt("List files in the current directory")
+    ///     .use_builtins()  // Enable the configured built-in tools
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn use_builtins(mut self) -> Self {
+        if let Some(builtins) = self.runtime.builtins() {
+            for (name, config) in builtins.configs() {
+                if let Some(executor) = builtins.get_executor(name) {
+                    let adapter = BuiltinToolExecutorAdapter { executor };
+                    self.tools.push(ToolSpec {
+                        definition: config.definition.clone(),
+                        executor: Arc::new(adapter),
+                        on_result: None,
+                    });
+                }
+            }
+        }
         self
     }
 

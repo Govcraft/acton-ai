@@ -1,12 +1,13 @@
-//! Example: Multi-Turn Conversation
+//! Example: Multi-Turn Conversation with Tools
 //!
 //! This example demonstrates multi-turn conversation with history management
 //! using the high-level ActonAI `PromptBuilder` API. It showcases:
 //!
-//! 1. Setting up ActonAI runtime with Ollama
+//! 1. Setting up ActonAI runtime with Ollama and built-in tools
 //! 2. Using the fluent `.messages()` API for conversation history
 //! 3. Streaming responses with `.on_token()` callback
-//! 4. Using a tool for graceful exit (LLM recognizes exit intent)
+//! 4. Built-in tools (bash, read_file, etc.) for agentic capabilities
+//! 5. Using a custom tool for graceful exit (LLM recognizes exit intent)
 //!
 //! # Configuration
 //!
@@ -74,10 +75,11 @@ async fn main() -> Result<(), ActonAIError> {
     eprintln!("Connecting to Ollama at {ollama_url} with model {model}");
     eprintln!("Say goodbye to end the conversation.\n");
 
-    // Launch ActonAI runtime
+    // Launch ActonAI runtime with built-in tools
     let runtime = ActonAI::builder()
         .app_name("conversation-example")
         .ollama_at(&ollama_url, &model)
+        .with_builtins() // Enable all built-in tools (bash, read_file, etc.)
         .launch()
         .await?;
 
@@ -103,9 +105,10 @@ async fn main() -> Result<(), ActonAIError> {
     };
 
     // System prompt for the assistant
-    let system_prompt = "You are a helpful assistant. Be conversational and remember our \
-                         previous exchanges. When the user wants to leave, use the \
-                         exit_conversation tool.";
+    let system_prompt = "You are a helpful assistant with access to tools including bash, \
+                         read_file, write_file, glob, grep, and more. Be conversational and \
+                         remember our previous exchanges. Use tools when appropriate to help \
+                         the user. When the user wants to leave, use the exit_conversation tool.";
 
     // Conversation history
     let mut history: Vec<Message> = Vec::new();
@@ -123,12 +126,13 @@ async fn main() -> Result<(), ActonAIError> {
         // Add user message to history
         history.push(Message::user(&input));
 
-        // Send request with exit tool - LLM will call it when user wants to leave
+        // Send request with built-in tools and exit tool
         print!("Assistant: ");
         let response = runtime
             .prompt("")
             .system(system_prompt)
             .messages(history.clone())
+            .use_builtins() // Make built-in tools available to the LLM
             .with_tool_callback(
                 exit_tool.clone(),
                 {
