@@ -35,6 +35,137 @@ use crate::stream::CollectedResponse;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Type alias for input mapper functions used in [`ChatConfig`].
+type InputMapperFn = Box<dyn FnMut(&str) -> String + Send>;
+
+/// Default system prompt used by [`Conversation::run_chat`] when no system prompt is set.
+///
+/// This prompt provides sensible defaults for a general-purpose chat assistant with
+/// tool access and exit detection.
+pub const DEFAULT_SYSTEM_PROMPT: &str = "\
+You are a helpful assistant with access to various tools. \
+Use tools when appropriate to help the user. \
+When the user wants to end the conversation (says goodbye, bye, quit, exit, etc.), \
+use the exit_conversation tool.";
+
+/// Configuration for the chat loop.
+///
+/// Created via [`ChatConfig::new()`] and passed to
+/// [`Conversation::run_chat_with()`](Conversation::run_chat_with).
+///
+/// For custom token handling (e.g., sending to a websocket), use the lower-level
+/// [`Conversation::send_streaming()`] API in your own loop instead.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::prelude::*;
+///
+/// conv.run_chat_with(
+///     ChatConfig::new()
+///         .user_prompt(">>> ")
+///         .assistant_prompt("AI: ")
+///         .map_input(|s| format!("[context] {}", s))
+/// ).await?;
+/// ```
+pub struct ChatConfig {
+    /// The prompt shown before user input (default: "You: ")
+    user_prompt: String,
+    /// The prefix shown before assistant responses (default: "Assistant: ")
+    assistant_prompt: String,
+    /// Optional function to transform user input before sending
+    input_mapper: Option<InputMapperFn>,
+}
+
+impl Default for ChatConfig {
+    fn default() -> Self {
+        Self {
+            user_prompt: "You: ".to_string(),
+            assistant_prompt: "Assistant: ".to_string(),
+            input_mapper: None,
+        }
+    }
+}
+
+impl ChatConfig {
+    /// Creates a new chat configuration with default settings.
+    ///
+    /// Default settings:
+    /// - User prompt: "You: "
+    /// - Assistant prompt: "Assistant: "
+    /// - Tokens printed to stdout
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let config = ChatConfig::new()
+    ///     .user_prompt(">>> ");
+    /// ```
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the prompt shown before user input.
+    ///
+    /// Default: "You: "
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// ChatConfig::new().user_prompt(">>> ")
+    /// ```
+    #[must_use]
+    pub fn user_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.user_prompt = prompt.into();
+        self
+    }
+
+    /// Sets the prefix shown before assistant responses.
+    ///
+    /// Default: "Assistant: "
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// ChatConfig::new().assistant_prompt("AI: ")
+    /// ```
+    #[must_use]
+    pub fn assistant_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.assistant_prompt = prompt.into();
+        self
+    }
+
+    /// Sets a function to transform user input before sending to the LLM.
+    ///
+    /// Use this to add context, preprocess input, or inject system information.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// ChatConfig::new()
+    ///     .map_input(|s| format!("[User context: admin] {}", s))
+    /// ```
+    #[must_use]
+    pub fn map_input<F>(mut self, f: F) -> Self
+    where
+        F: FnMut(&str) -> String + Send + 'static,
+    {
+        self.input_mapper = Some(Box::new(f));
+        self
+    }
+}
+
+impl std::fmt::Debug for ChatConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChatConfig")
+            .field("user_prompt", &self.user_prompt)
+            .field("assistant_prompt", &self.assistant_prompt)
+            .field("has_input_mapper", &self.input_mapper.is_some())
+            .finish()
+    }
+}
+
 /// Creates the exit tool definition for conversation termination.
 fn exit_tool_definition() -> ToolDefinition {
     ToolDefinition {
@@ -383,6 +514,127 @@ impl<'a> Conversation<'a> {
     pub fn is_exit_tool_enabled(&self) -> bool {
         self.exit_tool_enabled
     }
+
+    /// Runs a complete terminal chat loop.
+    ///
+    /// This method provides a minimal API for building terminal chat applications.
+    /// It handles:
+    /// - Reading input from stdin with "You: " prompt
+    /// - Sending to the LLM and streaming the response
+    /// - Printing "Assistant: " prefix before responses
+    /// - Streaming tokens to stdout
+    /// - Checking `should_exit()` and breaking when true
+    /// - Breaking on EOF (Ctrl+D)
+    ///
+    /// The exit tool is automatically enabled since the chat loop depends on it
+    /// for graceful termination. If no system prompt is set, a sensible default
+    /// is used (see [`DEFAULT_SYSTEM_PROMPT`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an LLM request fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// ActonAI::builder()
+    ///     .app_name("chat")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtins()
+    ///     .launch()
+    ///     .await?
+    ///     .conversation()
+    ///     .run_chat()
+    ///     .await?;
+    /// ```
+    pub async fn run_chat(&mut self) -> Result<(), ActonAIError> {
+        self.run_chat_with(ChatConfig::default()).await
+    }
+
+    /// Runs a complete terminal chat loop with custom configuration.
+    ///
+    /// Like [`run_chat`](Self::run_chat), but allows customization of prompts,
+    /// input transformation, and token handling via [`ChatConfig`].
+    ///
+    /// The exit tool is automatically enabled since the chat loop depends on it
+    /// for graceful termination. If no system prompt is set, a sensible default
+    /// is used (see [`DEFAULT_SYSTEM_PROMPT`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an LLM request fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// conv.run_chat_with(
+    ///     ChatConfig::new()
+    ///         .user_prompt(">>> ")
+    ///         .assistant_prompt("AI: ")
+    ///         .map_input(|s| format!("[context] {}", s))
+    ///         .on_token(|t| {
+    ///             print!("{t}");
+    ///             std::io::stdout().flush().ok();
+    ///         })
+    /// ).await?;
+    /// ```
+    pub async fn run_chat_with(&mut self, mut config: ChatConfig) -> Result<(), ActonAIError> {
+        use std::io::{BufRead, Write};
+
+        // Auto-enable exit tool since chat loop depends on it
+        if !self.exit_tool_enabled {
+            self.exit_tool_enabled = true;
+        }
+
+        // Use default system prompt if none is set
+        if self.system_prompt.is_none() {
+            self.system_prompt = Some(DEFAULT_SYSTEM_PROMPT.to_string());
+        }
+
+        let stdin = std::io::stdin();
+
+        loop {
+            // Print user prompt and flush
+            print!("{}", config.user_prompt);
+            std::io::stdout().flush().ok();
+
+            // Read input line
+            let mut input = String::new();
+            if stdin.lock().read_line(&mut input).unwrap_or(0) == 0 {
+                break; // EOF
+            }
+
+            let input = input.trim();
+            if input.is_empty() {
+                continue;
+            }
+
+            // Apply input mapper if present
+            let content = match config.input_mapper.as_mut() {
+                Some(mapper) => mapper(input),
+                None => input.to_string(),
+            };
+
+            // Print assistant prompt
+            print!("{}", config.assistant_prompt);
+            std::io::stdout().flush().ok();
+
+            // Stream response to stdout
+            self.send_streaming(&content, |token| {
+                print!("{token}");
+                std::io::stdout().flush().ok();
+            })
+            .await?;
+            println!();
+
+            // Check for exit
+            if self.should_exit() {
+                break;
+            }
+        }
+
+        Ok(())
+    }
 }
 
 impl std::fmt::Debug for Conversation<'_> {
@@ -391,7 +643,10 @@ impl std::fmt::Debug for Conversation<'_> {
             .field("history_len", &self.history.len())
             .field("has_system_prompt", &self.system_prompt.is_some())
             .field("exit_tool_enabled", &self.exit_tool_enabled)
-            .field("exit_requested", &self.exit_requested.load(Ordering::SeqCst))
+            .field(
+                "exit_requested",
+                &self.exit_requested.load(Ordering::SeqCst),
+            )
             .finish_non_exhaustive()
     }
 }
@@ -498,6 +753,38 @@ impl<'a> ConversationBuilder<'a> {
         self
     }
 
+    /// Explicitly disables the exit tool for this conversation.
+    ///
+    /// By default, [`run_chat`](Conversation::run_chat) auto-enables the exit tool.
+    /// Use this method if you want to build a conversation that will be used
+    /// with `run_chat` but you want to handle exit logic differently.
+    ///
+    /// Note: If you later call [`run_chat`](Conversation::run_chat) or
+    /// [`run_chat_with`](Conversation::run_chat_with), the exit tool will
+    /// still be auto-enabled since the chat loop depends on it.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let conv = runtime.conversation()
+    ///     .system("You are helpful.")
+    ///     .without_exit_tool()  // Don't enable exit tool by default
+    ///     .build();
+    ///
+    /// // Manual control over conversation
+    /// loop {
+    ///     let response = conv.send(&input).await?;
+    ///     if custom_exit_condition(&response) {
+    ///         break;
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn without_exit_tool(mut self) -> Self {
+        self.exit_tool_enabled = false;
+        self
+    }
+
     /// Builds the conversation.
     ///
     /// After calling this, you can use [`Conversation::send`] to interact
@@ -510,6 +797,67 @@ impl<'a> ConversationBuilder<'a> {
             self.history,
             self.exit_tool_enabled,
         )
+    }
+
+    /// Builds the conversation and immediately runs the chat loop.
+    ///
+    /// This is a convenience method that combines [`build()`](Self::build)
+    /// and [`Conversation::run_chat()`](Conversation::run_chat) into a single call.
+    ///
+    /// The exit tool is automatically enabled and a default system prompt
+    /// is used if none was set.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an LLM request fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Minimal chat - all defaults
+    /// ActonAI::builder()
+    ///     .app_name("chat")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_builtins()
+    ///     .launch()
+    ///     .await?
+    ///     .conversation()
+    ///     .run_chat()
+    ///     .await?;
+    ///
+    /// // Or with custom system prompt
+    /// runtime.conversation()
+    ///     .system("You are a coding assistant.")
+    ///     .run_chat()
+    ///     .await?;
+    /// ```
+    pub async fn run_chat(self) -> Result<(), ActonAIError> {
+        self.build().run_chat().await
+    }
+
+    /// Builds the conversation and immediately runs the chat loop with custom config.
+    ///
+    /// This is a convenience method that combines [`build()`](Self::build)
+    /// and [`Conversation::run_chat_with()`](Conversation::run_chat_with) into a single call.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an LLM request fails.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// runtime.conversation()
+    ///     .system("You are helpful.")
+    ///     .run_chat_with(
+    ///         ChatConfig::new()
+    ///             .user_prompt(">>> ")
+    ///             .assistant_prompt("AI: ")
+    ///     )
+    ///     .await?;
+    /// ```
+    pub async fn run_chat_with(self, config: ChatConfig) -> Result<(), ActonAIError> {
+        self.build().run_chat_with(config).await
     }
 }
 
@@ -553,5 +901,62 @@ mod tests {
 
         flag.store(false, Ordering::SeqCst);
         assert!(!flag.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn chat_config_default_values() {
+        let config = ChatConfig::new();
+        assert_eq!(config.user_prompt, "You: ");
+        assert_eq!(config.assistant_prompt, "Assistant: ");
+        assert!(config.input_mapper.is_none());
+    }
+
+    #[test]
+    fn chat_config_custom_user_prompt() {
+        let config = ChatConfig::new().user_prompt(">>> ");
+        assert_eq!(config.user_prompt, ">>> ");
+    }
+
+    #[test]
+    fn chat_config_custom_assistant_prompt() {
+        let config = ChatConfig::new().assistant_prompt("AI: ");
+        assert_eq!(config.assistant_prompt, "AI: ");
+    }
+
+    #[test]
+    fn chat_config_with_input_mapper() {
+        let mut config = ChatConfig::new().map_input(|s| format!("[test] {}", s));
+
+        let mapper = config.input_mapper.as_mut().unwrap();
+        assert_eq!(mapper("hello"), "[test] hello");
+    }
+
+    #[test]
+    fn chat_config_debug_impl() {
+        let config = ChatConfig::new()
+            .user_prompt("test> ")
+            .map_input(|s| s.to_string());
+
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("test> "));
+        assert!(debug.contains("has_input_mapper"));
+    }
+
+    #[test]
+    fn chat_config_chaining() {
+        let config = ChatConfig::new()
+            .user_prompt("U> ")
+            .assistant_prompt("A> ")
+            .map_input(|s| s.to_uppercase());
+
+        assert_eq!(config.user_prompt, "U> ");
+        assert_eq!(config.assistant_prompt, "A> ");
+        assert!(config.input_mapper.is_some());
+    }
+
+    #[test]
+    fn default_system_prompt_is_sensible() {
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("helpful"));
+        assert!(DEFAULT_SYSTEM_PROMPT.contains("exit_conversation"));
     }
 }
