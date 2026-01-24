@@ -298,7 +298,9 @@ api_key_env = "OPENAI_API_KEY"
         let paths = search_paths();
 
         assert!(!paths.is_empty());
-        assert!(paths.iter().any(|p| p.file_name() == Some(std::ffi::OsStr::new(LOCAL_CONFIG_NAME))));
+        assert!(paths
+            .iter()
+            .any(|p| p.file_name() == Some(std::ffi::OsStr::new(LOCAL_CONFIG_NAME))));
     }
 
     #[test]

@@ -69,12 +69,13 @@ impl SkillRegistry {
     /// Loads a single skill file.
     async fn load_skill_file(&mut self, path: &Path) -> Result<(), SkillsError> {
         // Read the file content
-        let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-            SkillsError::LoadFailed {
-                path: path.to_path_buf(),
-                reason: e.to_string(),
-            }
-        })?;
+        let content =
+            tokio::fs::read_to_string(path)
+                .await
+                .map_err(|e| SkillsError::LoadFailed {
+                    path: path.to_path_buf(),
+                    reason: e.to_string(),
+                })?;
 
         // Parse using agent-skills crate
         let skill = Skill::parse(&content).map_err(|e| SkillsError::InvalidFormat {
@@ -91,19 +92,21 @@ impl SkillRegistry {
 
     /// Recursively loads skills from a directory.
     async fn load_skill_directory(&mut self, dir: &Path) -> Result<(), SkillsError> {
-        let mut entries = tokio::fs::read_dir(dir).await.map_err(|e| {
-            SkillsError::LoadFailed {
+        let mut entries = tokio::fs::read_dir(dir)
+            .await
+            .map_err(|e| SkillsError::LoadFailed {
                 path: dir.to_path_buf(),
                 reason: e.to_string(),
-            }
-        })?;
+            })?;
 
-        while let Some(entry) = entries.next_entry().await.map_err(|e| {
-            SkillsError::LoadFailed {
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| SkillsError::LoadFailed {
                 path: dir.to_path_buf(),
                 reason: e.to_string(),
-            }
-        })? {
+            })?
+        {
             let path = entry.path();
 
             if path.is_dir() {
@@ -335,7 +338,10 @@ Content
         let result = SkillRegistry::from_paths(&[Path::new("/nonexistent/path")]).await;
 
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), SkillsError::PathNotFound { .. }));
+        assert!(matches!(
+            result.unwrap_err(),
+            SkillsError::PathNotFound { .. }
+        ));
     }
 
     #[tokio::test]

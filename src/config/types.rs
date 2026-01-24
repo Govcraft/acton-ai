@@ -372,8 +372,8 @@ mod tests {
 
     #[test]
     fn acton_ai_config_with_provider() {
-        let config = ActonAIConfig::new()
-            .with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"));
+        let config =
+            ActonAIConfig::new().with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"));
 
         assert_eq!(config.provider_count(), 1);
         assert!(config.providers.contains_key("ollama"));
@@ -381,8 +381,8 @@ mod tests {
 
     #[test]
     fn acton_ai_config_effective_default_single_provider() {
-        let config = ActonAIConfig::new()
-            .with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"));
+        let config =
+            ActonAIConfig::new().with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"));
 
         assert_eq!(config.effective_default(), Some("ollama"));
     }
@@ -391,7 +391,10 @@ mod tests {
     fn acton_ai_config_effective_default_explicit() {
         let config = ActonAIConfig::new()
             .with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"))
-            .with_provider("claude", NamedProviderConfig::anthropic("claude-sonnet-4-20250514"))
+            .with_provider(
+                "claude",
+                NamedProviderConfig::anthropic("claude-sonnet-4-20250514"),
+            )
             .with_default_provider("claude");
 
         assert_eq!(config.effective_default(), Some("claude"));
@@ -401,7 +404,10 @@ mod tests {
     fn acton_ai_config_effective_default_multiple_no_explicit() {
         let config = ActonAIConfig::new()
             .with_provider("ollama", NamedProviderConfig::ollama("qwen2.5:7b"))
-            .with_provider("claude", NamedProviderConfig::anthropic("claude-sonnet-4-20250514"));
+            .with_provider(
+                "claude",
+                NamedProviderConfig::anthropic("claude-sonnet-4-20250514"),
+            );
 
         // No default when multiple providers and none explicitly set
         assert!(config.effective_default().is_none());

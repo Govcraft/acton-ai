@@ -43,7 +43,10 @@ async fn main() -> Result<(), ActonAIError> {
     eprintln!();
 
     // Use the default provider
-    eprintln!("=== Using default provider ({}) ===", runtime.default_provider_name());
+    eprintln!(
+        "=== Using default provider ({}) ===",
+        runtime.default_provider_name()
+    );
     let response = runtime
         .prompt("What is 2 + 2? Answer in one word.")
         .on_token(|t| print!("{t}"))

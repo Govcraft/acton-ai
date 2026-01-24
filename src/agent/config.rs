@@ -288,8 +288,7 @@ mod tests {
 
     #[test]
     fn with_tools_sets_tool_list() {
-        let config = AgentConfig::new("Test")
-            .with_tools(&["read_file", "write_file", "glob"]);
+        let config = AgentConfig::new("Test").with_tools(&["read_file", "write_file", "glob"]);
 
         assert_eq!(config.tools.len(), 3);
         assert!(config.tools.contains(&"read_file".to_string()));
@@ -327,8 +326,7 @@ mod tests {
 
     #[test]
     fn serialization_roundtrip_with_tools() {
-        let config = AgentConfig::new("Test agent")
-            .with_tools(&["read_file", "bash"]);
+        let config = AgentConfig::new("Test agent").with_tools(&["read_file", "bash"]);
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: AgentConfig = serde_json::from_str(&json).unwrap();
@@ -344,10 +342,7 @@ mod tests {
         #[test]
         fn with_skill_paths_sets_paths() {
             let config = AgentConfig::new("Test")
-                .with_skill_paths(&[
-                    PathBuf::from("./skills"),
-                    PathBuf::from("./more-skills"),
-                ]);
+                .with_skill_paths(&[PathBuf::from("./skills"), PathBuf::from("./more-skills")]);
 
             assert_eq!(config.skill_paths.len(), 2);
             assert!(config.skill_paths.contains(&PathBuf::from("./skills")));
@@ -361,8 +356,12 @@ mod tests {
                 .with_skill_path("./skills/debugging");
 
             assert_eq!(config.skill_paths.len(), 2);
-            assert!(config.skill_paths.contains(&PathBuf::from("./skills/coding.md")));
-            assert!(config.skill_paths.contains(&PathBuf::from("./skills/debugging")));
+            assert!(config
+                .skill_paths
+                .contains(&PathBuf::from("./skills/coding.md")));
+            assert!(config
+                .skill_paths
+                .contains(&PathBuf::from("./skills/debugging")));
         }
 
         #[test]
@@ -373,8 +372,8 @@ mod tests {
 
         #[test]
         fn serialization_roundtrip_with_skill_paths() {
-            let config = AgentConfig::new("Test agent")
-                .with_skill_paths(&[PathBuf::from("./skills")]);
+            let config =
+                AgentConfig::new("Test agent").with_skill_paths(&[PathBuf::from("./skills")]);
 
             let json = serde_json::to_string(&config).unwrap();
             let deserialized: AgentConfig = serde_json::from_str(&json).unwrap();

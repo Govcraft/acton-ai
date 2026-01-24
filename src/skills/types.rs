@@ -103,18 +103,18 @@ impl fmt::Display for SkillsError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::LoadFailed { path, reason } => {
-                write!(f, "failed to load skill from {}: {}", path.display(), reason)
+                write!(
+                    f,
+                    "failed to load skill from {}: {}",
+                    path.display(),
+                    reason
+                )
             }
             Self::NotFound { name } => {
                 write!(f, "skill '{}' not found", name)
             }
             Self::InvalidFormat { path, reason } => {
-                write!(
-                    f,
-                    "invalid skill format in {}: {}",
-                    path.display(),
-                    reason
-                )
+                write!(f, "invalid skill format in {}: {}", path.display(), reason)
             }
             Self::PathNotFound { path } => {
                 write!(f, "skill path not found: {}", path.display())

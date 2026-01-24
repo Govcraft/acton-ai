@@ -86,8 +86,10 @@ pub mod registry;
 pub mod sandbox;
 
 // Re-exports
-pub use actor::{ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync};
 pub use crate::messages::ToolDefinition;
+pub use actor::{
+    ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync,
+};
 pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExecutorTrait};
 pub use error::{ToolError, ToolErrorKind};
 pub use executor::{Execute, InitExecutor, ToolExecutor};

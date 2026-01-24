@@ -83,9 +83,9 @@ use crate::tools::builtins::BuiltinTools;
 use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
+use std::path::Path;
 #[cfg(feature = "hyperlight")]
 use std::sync::Arc;
-use std::path::Path;
 
 /// The default provider name used when registering single providers.
 pub const DEFAULT_PROVIDER_NAME: &str = "default";
@@ -1069,7 +1069,11 @@ impl ActonAIBuilder {
                 reason: format!(
                     "default provider '{}' not found; available providers: {}",
                     name,
-                    self.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                    self.providers
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", ")
                 ),
             }));
         }
@@ -1249,8 +1253,7 @@ mod tests {
 
     #[test]
     fn resolve_default_single_provider() {
-        let builder = ActonAI::builder()
-            .provider_named("only-one", ProviderConfig::ollama("test"));
+        let builder = ActonAI::builder().provider_named("only-one", ProviderConfig::ollama("test"));
 
         let name = builder.resolve_default_provider_name().unwrap();
         assert_eq!(name, "only-one");
@@ -1270,7 +1273,7 @@ mod tests {
     #[test]
     fn resolve_default_uses_default_name() {
         let builder = ActonAI::builder()
-            .ollama("test")  // Registers as "default"
+            .ollama("test") // Registers as "default"
             .provider_named("other", ProviderConfig::anthropic("sk-test"));
 
         let name = builder.resolve_default_provider_name().unwrap();

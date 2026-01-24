@@ -722,10 +722,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                 );
 
                 // Add tool result to conversation
-                actor.model.add_message(Message::tool(
-                    tool_call_id.clone(),
-                    content.clone(),
-                ));
+                actor
+                    .model
+                    .add_message(Message::tool(tool_call_id.clone(), content.clone()));
             }
             Err(error) => {
                 tracing::warn!(
