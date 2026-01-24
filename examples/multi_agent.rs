@@ -37,6 +37,26 @@ use acton_ai::prelude::*;
 use colored::Colorize;
 use std::io::Write;
 
+/// Summarize a tool result for display.
+fn summarize_tool_result(tool_name: &str, result: &Result<serde_json::Value, String>) -> String {
+    match result {
+        Ok(value) => match tool_name {
+            "web_fetch" => {
+                let status = value.get("status_code").and_then(|v| v.as_i64()).unwrap_or(0);
+                let size = value.get("body_length").and_then(|v| v.as_i64()).unwrap_or(0);
+                format!("(HTTP {} - {} bytes)", status, size)
+            }
+            "calculate" => {
+                let expr = value.get("expression").and_then(|v| v.as_str()).unwrap_or("?");
+                let result = value.get("formatted").and_then(|v| v.as_str()).unwrap_or("?");
+                format!("({} = {})", expr, result)
+            }
+            _ => "(OK)".to_string(),
+        },
+        Err(e) => format!("(Error: {})", e),
+    }
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     println!("{}", "Multi-Agent Research Team".cyan().bold());
@@ -163,7 +183,8 @@ async fn main() -> anyhow::Result<()> {
         research_result.tool_calls.len().to_string().green()
     );
     for tc in &research_result.tool_calls {
-        println!("    - {} {}", tc.name.yellow(), format!("({:?})", tc.result).dimmed());
+        let result_summary = summarize_tool_result(&tc.name, &tc.result);
+        println!("    - {} {}", tc.name.yellow(), result_summary.dimmed());
     }
     println!(
         "  {} {} tool calls",
@@ -171,7 +192,8 @@ async fn main() -> anyhow::Result<()> {
         analysis_result.tool_calls.len().to_string().green()
     );
     for tc in &analysis_result.tool_calls {
-        println!("    - {} {}", tc.name.yellow(), format!("({:?})", tc.result).dimmed());
+        let result_summary = summarize_tool_result(&tc.name, &tc.result);
+        println!("    - {} {}", tc.name.yellow(), result_summary.dimmed());
     }
     println!(
         "  {} {} tool calls",
