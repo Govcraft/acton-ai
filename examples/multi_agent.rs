@@ -154,6 +154,33 @@ async fn main() -> anyhow::Result<()> {
 
     // === Summary ===
     println!("{}", "=========================".dimmed());
+
+    // Tool usage summary
+    println!("{}", "Tool usage:".cyan().bold());
+    println!(
+        "  {} {} tool calls",
+        "Research:".blue(),
+        research_result.tool_calls.len().to_string().green()
+    );
+    for tc in &research_result.tool_calls {
+        println!("    - {} {}", tc.name.yellow(), format!("({:?})", tc.result).dimmed());
+    }
+    println!(
+        "  {} {} tool calls",
+        "Analysis:".magenta(),
+        analysis_result.tool_calls.len().to_string().green()
+    );
+    for tc in &analysis_result.tool_calls {
+        println!("    - {} {}", tc.name.yellow(), format!("({:?})", tc.result).dimmed());
+    }
+    println!(
+        "  {} {} tool calls",
+        "Synthesis:".green(),
+        final_answer.tool_calls.len().to_string().green()
+    );
+    println!();
+
+    // Token usage summary
     println!("{}", "Token usage:".cyan().bold());
     println!(
         "  {}  {} tokens",
