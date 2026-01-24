@@ -29,9 +29,32 @@
 
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
-use crate::messages::Message;
+use crate::messages::{Message, ToolDefinition};
 use crate::prompt::PromptBuilder;
 use crate::stream::CollectedResponse;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+/// Creates the exit tool definition for conversation termination.
+fn exit_tool_definition() -> ToolDefinition {
+    ToolDefinition {
+        name: "exit_conversation".to_string(),
+        description: "Call this tool when the user wants to end the conversation, \
+                      say goodbye, or leave. Examples: 'bye', 'goodbye', 'I'm done', \
+                      'quit', 'exit', 'see ya', 'thanks, that's all'."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "farewell": {
+                    "type": "string",
+                    "description": "A friendly farewell message to the user"
+                }
+            },
+            "required": ["farewell"]
+        }),
+    }
+}
 
 /// A managed conversation with automatic history tracking.
 ///
@@ -64,15 +87,26 @@ pub struct Conversation<'a> {
     history: Vec<Message>,
     /// Optional system prompt
     system_prompt: Option<String>,
+    /// Exit flag - set when the exit tool is called
+    exit_requested: Arc<AtomicBool>,
+    /// Whether the exit tool is enabled
+    exit_tool_enabled: bool,
 }
 
 impl<'a> Conversation<'a> {
     /// Creates a new conversation.
-    fn new(runtime: &'a ActonAI, system_prompt: Option<String>, history: Vec<Message>) -> Self {
+    fn new(
+        runtime: &'a ActonAI,
+        system_prompt: Option<String>,
+        history: Vec<Message>,
+        exit_tool_enabled: bool,
+    ) -> Self {
         Self {
             runtime,
             history,
             system_prompt,
+            exit_requested: Arc::new(AtomicBool::new(false)),
+            exit_tool_enabled,
         }
     }
 
@@ -101,7 +135,10 @@ impl<'a> Conversation<'a> {
     /// let response = conv.send("What about Germany?").await?;
     /// println!("{}", response.text);  // "Berlin"
     /// ```
-    pub async fn send(&mut self, content: impl Into<String>) -> Result<CollectedResponse, ActonAIError> {
+    pub async fn send(
+        &mut self,
+        content: impl Into<String>,
+    ) -> Result<CollectedResponse, ActonAIError> {
         self.send_with(content, |b| b).await
     }
 
@@ -142,6 +179,22 @@ impl<'a> Conversation<'a> {
         // Apply system prompt if set
         if let Some(ref system) = self.system_prompt {
             builder = builder.system(system);
+        }
+
+        // Inject exit tool if enabled
+        if self.exit_tool_enabled {
+            let exit_flag = Arc::clone(&self.exit_requested);
+            builder = builder.with_tool_callback(
+                exit_tool_definition(),
+                move |_args| {
+                    let flag = Arc::clone(&exit_flag);
+                    async move {
+                        flag.store(true, Ordering::SeqCst);
+                        Ok(serde_json::json!({"status": "goodbye"}))
+                    }
+                },
+                |_result| {},
+            );
         }
 
         // Apply user customization
@@ -256,6 +309,80 @@ impl<'a> Conversation<'a> {
     pub fn clear_system_prompt(&mut self) {
         self.system_prompt = None;
     }
+
+    /// Returns `true` if the exit tool has been called.
+    ///
+    /// Use this to check if the conversation should end. The exit flag
+    /// is set when the LLM calls the `exit_conversation` tool, which
+    /// it does when the user indicates they want to leave.
+    ///
+    /// This method is only meaningful when the conversation was built
+    /// with [`with_exit_tool`](ConversationBuilder::with_exit_tool).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// loop {
+    ///     let response = conv.send(&input).await?;
+    ///
+    ///     if conv.should_exit() {
+    ///         println!("Goodbye!");
+    ///         break;
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn should_exit(&self) -> bool {
+        self.exit_requested.load(Ordering::SeqCst)
+    }
+
+    /// Clears the exit flag.
+    ///
+    /// Use this if you want to reset the conversation state and continue
+    /// after the exit tool was called. For example, you might ask for
+    /// confirmation before actually exiting.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if conv.should_exit() {
+    ///     println!("Are you sure you want to leave?");
+    ///     let confirmation = read_input();
+    ///     if confirmation != "yes" {
+    ///         conv.clear_exit();
+    ///         continue;
+    ///     }
+    /// }
+    /// ```
+    pub fn clear_exit(&mut self) {
+        self.exit_requested.store(false, Ordering::SeqCst);
+    }
+
+    /// Returns a clone of the exit flag `Arc<AtomicBool>`.
+    ///
+    /// This is useful if you need to share the exit state with other
+    /// components or check it from a different context.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let exit_flag = conv.exit_requested();
+    ///
+    /// // Check from another context
+    /// if exit_flag.load(Ordering::SeqCst) {
+    ///     // Handle exit
+    /// }
+    /// ```
+    #[must_use]
+    pub fn exit_requested(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.exit_requested)
+    }
+
+    /// Returns whether the exit tool is enabled for this conversation.
+    #[must_use]
+    pub fn is_exit_tool_enabled(&self) -> bool {
+        self.exit_tool_enabled
+    }
 }
 
 impl std::fmt::Debug for Conversation<'_> {
@@ -263,6 +390,8 @@ impl std::fmt::Debug for Conversation<'_> {
         f.debug_struct("Conversation")
             .field("history_len", &self.history.len())
             .field("has_system_prompt", &self.system_prompt.is_some())
+            .field("exit_tool_enabled", &self.exit_tool_enabled)
+            .field("exit_requested", &self.exit_requested.load(Ordering::SeqCst))
             .finish_non_exhaustive()
     }
 }
@@ -283,6 +412,8 @@ pub struct ConversationBuilder<'a> {
     runtime: &'a ActonAI,
     system_prompt: Option<String>,
     history: Vec<Message>,
+    /// Whether to enable the built-in exit tool
+    exit_tool_enabled: bool,
 }
 
 impl<'a> ConversationBuilder<'a> {
@@ -292,6 +423,7 @@ impl<'a> ConversationBuilder<'a> {
             runtime,
             system_prompt: None,
             history: Vec::new(),
+            exit_tool_enabled: false,
         }
     }
 
@@ -335,13 +467,49 @@ impl<'a> ConversationBuilder<'a> {
         self
     }
 
+    /// Enables the built-in exit tool for this conversation.
+    ///
+    /// When enabled, an `exit_conversation` tool is automatically available
+    /// to the LLM. When the LLM calls this tool (typically when the user
+    /// wants to end the conversation), the conversation's exit flag is set.
+    ///
+    /// Check the flag with [`Conversation::should_exit`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let mut conv = runtime.conversation()
+    ///     .system("Be helpful. Use exit_conversation when the user says goodbye.")
+    ///     .with_exit_tool()
+    ///     .build();
+    ///
+    /// loop {
+    ///     let input = read_input();
+    ///     conv.send_streaming(&input, |t| print!("{t}")).await?;
+    ///
+    ///     if conv.should_exit() {
+    ///         break;
+    ///     }
+    /// }
+    /// ```
+    #[must_use]
+    pub fn with_exit_tool(mut self) -> Self {
+        self.exit_tool_enabled = true;
+        self
+    }
+
     /// Builds the conversation.
     ///
     /// After calling this, you can use [`Conversation::send`] to interact
     /// with the LLM.
     #[must_use]
     pub fn build(self) -> Conversation<'a> {
-        Conversation::new(self.runtime, self.system_prompt, self.history)
+        Conversation::new(
+            self.runtime,
+            self.system_prompt,
+            self.history,
+            self.exit_tool_enabled,
+        )
     }
 }
 
@@ -350,19 +518,40 @@ impl std::fmt::Debug for ConversationBuilder<'_> {
         f.debug_struct("ConversationBuilder")
             .field("has_system_prompt", &self.system_prompt.is_some())
             .field("history_len", &self.history.len())
+            .field("exit_tool_enabled", &self.exit_tool_enabled)
             .finish_non_exhaustive()
     }
 }
 
 #[cfg(test)]
 mod tests {
-    // Note: Full integration tests require a running LLM.
-    // Unit tests for types are limited since they require ActonAI instances.
+    use super::*;
 
     #[test]
-    fn module_compiles() {
-        // This test verifies the module compiles correctly.
-        // Full integration tests are in examples/conversation.rs
-        assert!(true);
+    fn exit_tool_definition_has_required_fields() {
+        let def = exit_tool_definition();
+        assert_eq!(def.name, "exit_conversation");
+        assert!(def.description.contains("goodbye"));
+
+        // Check schema has farewell property
+        let props = def.input_schema.get("properties").unwrap();
+        assert!(props.get("farewell").is_some());
+
+        // Check farewell is required
+        let required = def.input_schema.get("required").unwrap();
+        let required_arr = required.as_array().unwrap();
+        assert!(required_arr.iter().any(|v| v.as_str() == Some("farewell")));
+    }
+
+    #[test]
+    fn exit_flag_atomic_operations() {
+        let flag = Arc::new(AtomicBool::new(false));
+        assert!(!flag.load(Ordering::SeqCst));
+
+        flag.store(true, Ordering::SeqCst);
+        assert!(flag.load(Ordering::SeqCst));
+
+        flag.store(false, Ordering::SeqCst);
+        assert!(!flag.load(Ordering::SeqCst));
     }
 }

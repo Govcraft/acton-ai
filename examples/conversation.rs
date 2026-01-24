@@ -1,7 +1,7 @@
 //! Example: Multi-Turn Conversation with Tools
 //!
 //! This example demonstrates multi-turn conversation using the `Conversation`
-//! abstraction which provides automatic history management.
+//! abstraction which provides automatic history management and built-in exit tool.
 //!
 //! ## Features Demonstrated
 //!
@@ -9,7 +9,7 @@
 //! 2. Using the `Conversation` API for automatic history management
 //! 3. Streaming responses with `send_streaming()`
 //! 4. Built-in tools (bash, read_file, etc.) for agentic capabilities
-//! 5. Per-message customization with `send_with()` for exit detection
+//! 5. Built-in exit tool with `with_exit_tool()` for graceful conversation termination
 //!
 //! ## Key Benefits of Conversation API
 //!
@@ -17,6 +17,7 @@
 //! - **No cloning**: History is managed internally, no `.clone()` needed
 //! - **No empty strings**: No confusing `.prompt("")` for continuations
 //! - **Auto-builtins**: When configured with `with_builtins()`, tools are available
+//! - **Built-in exit tool**: No manual `Arc<AtomicBool>` or tool definition needed
 //!
 //! # Configuration
 //!
@@ -39,8 +40,6 @@
 
 use acton_ai::prelude::*;
 use std::io::Write;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// Load environment variables from .env file if present.
 fn load_dotenv() {
@@ -82,6 +81,7 @@ async fn main() -> Result<(), ActonAIError> {
     let model = std::env::var("OLLAMA_MODEL").unwrap_or_else(|_| "qwen2.5:7b".to_string());
 
     eprintln!("Connecting to Ollama at {ollama_url} with model {model}");
+    eprintln!("Say goodbye to end the conversation.\n");
 
     // Launch ActonAI runtime with built-in tools
     // Note: with_builtins() auto-enables builtins on all prompts/conversations
@@ -92,29 +92,8 @@ async fn main() -> Result<(), ActonAIError> {
         .launch()
         .await?;
 
-    // Shutdown flag - set by the exit tool
-    let shutdown = Arc::new(AtomicBool::new(false));
-
-    // Exit tool definition - LLM calls this when user wants to leave
-    let exit_tool = ToolDefinition {
-        name: "exit_conversation".to_string(),
-        description: "Call this tool when the user wants to end the conversation, say goodbye, \
-                      or leave. Examples: 'bye', 'goodbye', 'I'm done', 'quit', 'exit', 'see ya'."
-            .to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "farewell": {
-                    "type": "string",
-                    "description": "A friendly farewell message to the user"
-                }
-            },
-            "required": ["farewell"]
-        }),
-    };
-
-    // Create a managed conversation with system prompt
-    // History is automatically tracked - no manual Vec<Message> needed!
+    // Create a managed conversation with system prompt and built-in exit tool
+    // No manual Arc<AtomicBool> or exit tool definition needed!
     let mut conv = runtime
         .conversation()
         .system(
@@ -123,6 +102,7 @@ async fn main() -> Result<(), ActonAIError> {
              remember our previous exchanges. Use tools when appropriate to help \
              the user. When the user wants to leave, use the exit_conversation tool.",
         )
+        .with_exit_tool() // Enable built-in exit tool
         .build();
 
     // Main conversation loop
@@ -137,40 +117,20 @@ async fn main() -> Result<(), ActonAIError> {
 
         print!("Assistant: ");
 
-        // Use send_with() for per-message customization (adding exit tool + streaming)
+        // Simply use send_streaming - exit tool is automatically injected
         // History is automatically managed - no need to push/clone messages!
         let _response = conv
-            .send_with(&input, |builder| {
-                builder
-                    .with_tool_callback(
-                        exit_tool.clone(),
-                        {
-                            let shutdown = shutdown.clone();
-                            move |_args| {
-                                let shutdown = shutdown.clone();
-                                async move {
-                                    shutdown.store(true, Ordering::SeqCst);
-                                    Ok(serde_json::json!({"status": "goodbye"}))
-                                }
-                            }
-                        },
-                        |_result| {},
-                    )
-                    .on_token(|token| {
-                        print!("{token}");
-                        std::io::stdout().flush().ok();
-                    })
+            .send_streaming(&input, |token| {
+                print!("{token}");
+                std::io::stdout().flush().ok();
             })
             .await?;
         println!();
 
-        // Check if exit was triggered
-        if shutdown.load(Ordering::SeqCst) {
+        // Check if exit was triggered - simple and clean!
+        if conv.should_exit() {
             break;
         }
-
-        // Note: No need to manually add assistant response to history!
-        // The Conversation abstraction handles this automatically.
     }
 
     // Graceful shutdown
