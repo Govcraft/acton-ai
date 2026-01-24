@@ -159,6 +159,17 @@ struct SharedCollectorState {
 ///     .collect()
 ///     .await?;
 /// ```
+///
+/// # Multi-Provider Example
+///
+/// ```rust,ignore
+/// // Use a specific provider for this prompt
+/// runtime
+///     .prompt("Complex reasoning task")
+///     .provider("claude")  // Use the "claude" provider
+///     .collect()
+///     .await?;
+/// ```
 pub struct PromptBuilder<'a> {
     /// Reference to the ActonAI runtime
     runtime: &'a ActonAI,
@@ -178,6 +189,8 @@ pub struct PromptBuilder<'a> {
     tools: Vec<ToolSpec>,
     /// Maximum tool execution rounds (default: 10)
     max_tool_rounds: usize,
+    /// Name of the provider to use (None = default provider)
+    provider_name: Option<String>,
 }
 
 impl<'a> PromptBuilder<'a> {
@@ -196,6 +209,7 @@ impl<'a> PromptBuilder<'a> {
             on_end: None,
             tools: Vec::new(),
             max_tool_rounds: 10,
+            provider_name: None,
         }
     }
 
@@ -505,6 +519,35 @@ impl<'a> PromptBuilder<'a> {
         self
     }
 
+    /// Sets the provider to use for this prompt.
+    ///
+    /// When multiple providers are configured, this selects which one
+    /// handles this specific prompt. If not called, the default provider
+    /// is used.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Use a specific provider for complex reasoning
+    /// runtime
+    ///     .prompt("Analyze this complex problem...")
+    ///     .provider("claude")
+    ///     .collect()
+    ///     .await?;
+    ///
+    /// // Use a fast/cheap provider for simple tasks
+    /// runtime
+    ///     .prompt("Summarize this text")
+    ///     .provider("fast")
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn provider(mut self, name: impl Into<String>) -> Self {
+        self.provider_name = Some(name.into());
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -594,7 +637,24 @@ impl<'a> PromptBuilder<'a> {
             on_end,
             mut tools,
             max_tool_rounds,
+            provider_name,
         } = self;
+
+        // Resolve the provider handle
+        let provider_handle = if let Some(ref name) = provider_name {
+            runtime.provider_handle_named(name).ok_or_else(|| {
+                ActonAIError::configuration(
+                    "provider",
+                    format!(
+                        "provider '{}' not found; available: {}",
+                        name,
+                        runtime.provider_names().collect::<Vec<_>>().join(", ")
+                    ),
+                )
+            })?
+        } else {
+            runtime.provider_handle()
+        };
 
         // Build the initial messages
         let mut messages = Vec::new();
@@ -652,6 +712,7 @@ impl<'a> PromptBuilder<'a> {
             // Collect stream response
             let (text, stop_reason, token_count, tool_calls) = collect_stream_round(
                 runtime,
+                &provider_handle,
                 &request,
                 correlation_id,
                 on_start.clone(),
@@ -725,6 +786,7 @@ impl<'a> PromptBuilder<'a> {
 /// Collects a single stream round.
 async fn collect_stream_round(
     runtime: &ActonAI,
+    provider_handle: &ActorHandle,
     request: &LLMRequest,
     correlation_id: CorrelationId,
     on_start: Option<Arc<std::sync::Mutex<StartCallback>>>,
@@ -827,7 +889,7 @@ async fn collect_stream_round(
     let collector_handle = collector.start().await;
 
     // Send the request to the provider
-    runtime.provider_handle().send(request.clone()).await;
+    provider_handle.send(request.clone()).await;
 
     // Wait for stream completion
     stream_done.notified().await;

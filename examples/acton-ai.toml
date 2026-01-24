@@ -1,0 +1,27 @@
+# Example configuration for multi-provider setup
+# Copy to ~/.config/acton-ai/config.toml or ./acton-ai.toml
+
+default_provider = "ollama"
+
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+# Change this to your Ollama server URL
+base_url = "http://100.64.0.13:11434/v1"
+timeout_secs = 300
+
+[providers.ollama.rate_limit]
+requests_per_minute = 1000
+tokens_per_minute = 1000000
+
+# Uncomment and add your API key to enable Claude
+# [providers.claude]
+# type = "anthropic"
+# model = "claude-sonnet-4-20250514"
+# api_key_env = "ANTHROPIC_API_KEY"
+
+# Uncomment and add your API key to enable OpenAI
+# [providers.fast]
+# type = "openai"
+# model = "gpt-4o-mini"
+# api_key_env = "OPENAI_API_KEY"

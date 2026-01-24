@@ -3,7 +3,7 @@
 //! This module provides a simplified API for common use cases, hiding the
 //! complexity of actor setup, kernel spawning, and provider configuration.
 //!
-//! # Example
+//! # Single Provider Example
 //!
 //! ```rust,ignore
 //! use acton_ai::prelude::*;
@@ -26,7 +26,52 @@
 //!     Ok(())
 //! }
 //! ```
+//!
+//! # Multi-Provider Example
+//!
+//! ```rust,ignore
+//! use acton_ai::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), ActonAIError> {
+//!     let runtime = ActonAI::builder()
+//!         .app_name("my-app")
+//!         .provider_named("claude", ProviderConfig::anthropic("sk-..."))
+//!         .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+//!         .default_provider("local")
+//!         .launch()
+//!         .await?;
+//!
+//!     // Use default provider (local)
+//!     runtime.prompt("Quick question").collect().await?;
+//!
+//!     // Use specific provider
+//!     runtime.prompt("Complex reasoning").provider("claude").collect().await?;
+//!
+//!     Ok(())
+//! }
+//! ```
+//!
+//! # Config File Example
+//!
+//! ```rust,ignore
+//! use acton_ai::prelude::*;
+//!
+//! #[tokio::main]
+//! async fn main() -> Result<(), ActonAIError> {
+//!     let runtime = ActonAI::builder()
+//!         .app_name("my-app")
+//!         .from_config()?  // Load providers from config file
+//!         .with_builtins()
+//!         .launch()
+//!         .await?;
+//!
+//!     runtime.prompt("Hello").collect().await?;
+//!     Ok(())
+//! }
+//! ```
 
+use crate::config::{self, ActonAIConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::kernel::{Kernel, KernelConfig};
@@ -37,16 +82,21 @@ use crate::tools::builtins::BuiltinTools;
 #[cfg(feature = "hyperlight")]
 use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
 use acton_reactive::prelude::*;
+use std::collections::HashMap;
 #[cfg(feature = "hyperlight")]
 use std::sync::Arc;
+use std::path::Path;
+
+/// The default provider name used when registering single providers.
+pub const DEFAULT_PROVIDER_NAME: &str = "default";
 
 /// High-level facade for interacting with ActonAI.
 ///
-/// `ActonAI` encapsulates the runtime, kernel, and LLM provider, providing
+/// `ActonAI` encapsulates the runtime, kernel, and LLM providers, providing
 /// a simplified API for common operations. It handles all the actor setup
 /// and subscription management automatically.
 ///
-/// # Example
+/// # Single Provider Example
 ///
 /// ```rust,ignore
 /// let runtime = ActonAI::builder()
@@ -61,11 +111,28 @@ use std::sync::Arc;
 ///     .collect()
 ///     .await?;
 /// ```
+///
+/// # Multi-Provider Example
+///
+/// ```rust,ignore
+/// let runtime = ActonAI::builder()
+///     .app_name("my-app")
+///     .provider_named("claude", ProviderConfig::anthropic("sk-..."))
+///     .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+///     .default_provider("local")
+///     .launch()
+///     .await?;
+///
+/// // Use specific provider
+/// runtime.prompt("Complex task").provider("claude").collect().await?;
+/// ```
 pub struct ActonAI {
     /// The underlying actor runtime
     runtime: ActorRuntime,
-    /// Handle to the LLM provider actor
-    provider_handle: ActorHandle,
+    /// Named LLM provider handles
+    providers: HashMap<String, ActorHandle>,
+    /// The name of the default provider
+    default_provider: String,
     /// Built-in tools (if enabled)
     builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
@@ -80,6 +147,8 @@ impl std::fmt::Debug for ActonAI {
             .field("is_shutdown", &self.is_shutdown)
             .field("has_builtins", &self.builtins.is_some())
             .field("auto_builtins", &self.auto_builtins)
+            .field("provider_count", &self.providers.len())
+            .field("default_provider", &self.default_provider)
             .finish_non_exhaustive()
     }
 }
@@ -144,13 +213,55 @@ impl ActonAI {
         &mut self.runtime
     }
 
-    /// Returns a clone of the LLM provider handle.
+    /// Returns a clone of the default LLM provider handle.
     ///
     /// This can be used to send requests directly to the provider
     /// for advanced use cases.
     #[must_use]
     pub fn provider_handle(&self) -> ActorHandle {
-        self.provider_handle.clone()
+        self.providers
+            .get(&self.default_provider)
+            .cloned()
+            .expect("default provider must exist")
+    }
+
+    /// Returns a clone of a named LLM provider handle.
+    ///
+    /// Returns `None` if no provider with the given name exists.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// if let Some(handle) = runtime.provider_handle_named("claude") {
+    ///     // Send requests directly to the claude provider
+    /// }
+    /// ```
+    #[must_use]
+    pub fn provider_handle_named(&self, name: &str) -> Option<ActorHandle> {
+        self.providers.get(name).cloned()
+    }
+
+    /// Returns the name of the default provider.
+    #[must_use]
+    pub fn default_provider_name(&self) -> &str {
+        &self.default_provider
+    }
+
+    /// Returns an iterator over the names of all registered providers.
+    pub fn provider_names(&self) -> impl Iterator<Item = &str> {
+        self.providers.keys().map(String::as_str)
+    }
+
+    /// Returns the number of registered providers.
+    #[must_use]
+    pub fn provider_count(&self) -> usize {
+        self.providers.len()
+    }
+
+    /// Returns true if a provider with the given name exists.
+    #[must_use]
+    pub fn has_provider(&self, name: &str) -> bool {
+        self.providers.contains_key(name)
     }
 
     /// Returns whether the runtime has been shut down.
@@ -299,7 +410,7 @@ enum SandboxMode {
 
 /// Builder for configuring and launching ActonAI.
 ///
-/// # Example
+/// # Single Provider Example
 ///
 /// ```rust,ignore
 /// let runtime = ActonAI::builder()
@@ -308,10 +419,35 @@ enum SandboxMode {
 ///     .launch()
 ///     .await?;
 /// ```
+///
+/// # Multi-Provider Example
+///
+/// ```rust,ignore
+/// let runtime = ActonAI::builder()
+///     .app_name("my-app")
+///     .provider_named("claude", ProviderConfig::anthropic("sk-..."))
+///     .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+///     .default_provider("local")
+///     .launch()
+///     .await?;
+/// ```
+///
+/// # Config File Example
+///
+/// ```rust,ignore
+/// let runtime = ActonAI::builder()
+///     .app_name("my-app")
+///     .from_config()?  // Load from config file
+///     .launch()
+///     .await?;
+/// ```
 #[derive(Default)]
 pub struct ActonAIBuilder {
     app_name: Option<String>,
-    provider_config: Option<ProviderConfig>,
+    /// Named provider configurations
+    providers: HashMap<String, ProviderConfig>,
+    /// The name of the default provider
+    default_provider_name: Option<String>,
     builtins: BuiltinToolsConfig,
     auto_builtins: bool,
     #[cfg(feature = "hyperlight")]
@@ -328,7 +464,144 @@ impl ActonAIBuilder {
         self
     }
 
+    // =========================================================================
+    // Multi-Provider API (new)
+    // =========================================================================
+
+    /// Registers a named provider configuration.
+    ///
+    /// This allows multiple providers to be configured, each with a unique name.
+    /// Use [`default_provider`](Self::default_provider) to set which provider is
+    /// used when none is specified.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .provider_named("claude", ProviderConfig::anthropic("sk-..."))
+    ///     .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+    ///     .default_provider("local")
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn provider_named(mut self, name: impl Into<String>, config: ProviderConfig) -> Self {
+        self.providers.insert(name.into(), config);
+        self
+    }
+
+    /// Sets the name of the default provider.
+    ///
+    /// The default provider is used when no provider is specified on a prompt.
+    /// If not set and only one provider exists, that provider becomes the default.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+    ///     .provider_named("cloud", ProviderConfig::anthropic("sk-..."))
+    ///     .default_provider("local")
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn default_provider(mut self, name: impl Into<String>) -> Self {
+        self.default_provider_name = Some(name.into());
+        self
+    }
+
+    /// Loads provider configurations from a config file.
+    ///
+    /// This searches for configuration in the following order:
+    /// 1. `./acton-ai.toml` (project-local)
+    /// 2. `~/.config/acton-ai/config.toml` (XDG config)
+    ///
+    /// If no config file is found, this is a no-op (returns Ok).
+    /// Providers loaded from config are merged with any already registered.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a config file exists but cannot be parsed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .from_config()?
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    pub fn from_config(self) -> Result<Self, ActonAIError> {
+        let config = config::load()?;
+        self.apply_config(config)
+    }
+
+    /// Loads provider configurations from a specific file path.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the file cannot be read or parsed.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .from_config_file("/etc/acton-ai/config.toml")?
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    pub fn from_config_file(self, path: impl AsRef<Path>) -> Result<Self, ActonAIError> {
+        let config = config::from_path(path.as_ref())?;
+        self.apply_config(config)
+    }
+
+    /// Attempts to load from config file, ignoring errors if no config exists.
+    ///
+    /// This is useful when config files are optional. Parse errors are still
+    /// returned as Err.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .try_from_config()?  // OK if no config file
+    ///     .ollama("qwen2.5:7b")  // Fallback provider
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    pub fn try_from_config(self) -> Result<Self, ActonAIError> {
+        self.from_config()
+    }
+
+    /// Applies an ActonAIConfig to this builder.
+    fn apply_config(mut self, config: ActonAIConfig) -> Result<Self, ActonAIError> {
+        // Convert and add each provider
+        for (name, provider_config) in config.providers {
+            let runtime_config = provider_config.to_provider_config();
+            self.providers.insert(name, runtime_config);
+        }
+
+        // Set default provider if specified and we don't have one
+        if self.default_provider_name.is_none() {
+            self.default_provider_name = config.default_provider;
+        }
+
+        Ok(self)
+    }
+
+    // =========================================================================
+    // Single-Provider API (backwards compatible)
+    // =========================================================================
+
     /// Configures for Ollama with the specified model.
+    ///
+    /// This registers the provider as "default". For multi-provider setups,
+    /// use [`provider_named`](Self::provider_named) instead.
     ///
     /// Ollama runs locally and doesn't require an API key.
     ///
@@ -342,14 +615,14 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn ollama(mut self, model: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::ollama(model));
-        self
+    pub fn ollama(self, model: impl Into<String>) -> Self {
+        self.provider_named(DEFAULT_PROVIDER_NAME, ProviderConfig::ollama(model))
     }
 
     /// Configures for Ollama with a custom URL and model.
     ///
     /// Use this when Ollama is running on a non-default address.
+    /// Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -361,14 +634,16 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn ollama_at(mut self, base_url: impl Into<String>, model: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::openai_compatible(base_url, model));
-        self
+    pub fn ollama_at(self, base_url: impl Into<String>, model: impl Into<String>) -> Self {
+        self.provider_named(
+            DEFAULT_PROVIDER_NAME,
+            ProviderConfig::openai_compatible(base_url, model),
+        )
     }
 
     /// Configures for Anthropic Claude with the specified API key.
     ///
-    /// Uses the default Claude model (claude-sonnet-4-20250514).
+    /// Uses the default Claude model. Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -380,12 +655,13 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn anthropic(mut self, api_key: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::anthropic(api_key));
-        self
+    pub fn anthropic(self, api_key: impl Into<String>) -> Self {
+        self.provider_named(DEFAULT_PROVIDER_NAME, ProviderConfig::anthropic(api_key))
     }
 
     /// Configures for Anthropic Claude with a specific model.
+    ///
+    /// Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -397,14 +673,16 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn anthropic_model(mut self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::anthropic(api_key).with_model(model));
-        self
+    pub fn anthropic_model(self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        self.provider_named(
+            DEFAULT_PROVIDER_NAME,
+            ProviderConfig::anthropic(api_key).with_model(model),
+        )
     }
 
     /// Configures for OpenAI with the specified API key.
     ///
-    /// Uses the default GPT model (gpt-4o).
+    /// Uses the default GPT model. Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -416,12 +694,13 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn openai(mut self, api_key: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::openai(api_key));
-        self
+    pub fn openai(self, api_key: impl Into<String>) -> Self {
+        self.provider_named(DEFAULT_PROVIDER_NAME, ProviderConfig::openai(api_key))
     }
 
     /// Configures for OpenAI with a specific model.
+    ///
+    /// Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -433,14 +712,17 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn openai_model(mut self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
-        self.provider_config = Some(ProviderConfig::openai(api_key).with_model(model));
-        self
+    pub fn openai_model(self, api_key: impl Into<String>, model: impl Into<String>) -> Self {
+        self.provider_named(
+            DEFAULT_PROVIDER_NAME,
+            ProviderConfig::openai(api_key).with_model(model),
+        )
     }
 
     /// Sets a custom provider configuration.
     ///
     /// Use this for advanced configuration or custom OpenAI-compatible providers.
+    /// Registers as "default" provider.
     ///
     /// # Example
     ///
@@ -455,9 +737,8 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn provider(mut self, config: ProviderConfig) -> Self {
-        self.provider_config = Some(config);
-        self
+    pub fn provider(self, config: ProviderConfig) -> Self {
+        self.provider_named(DEFAULT_PROVIDER_NAME, config)
     }
 
     /// Enables all built-in tools with automatic enabling on each prompt.
@@ -671,12 +952,14 @@ impl ActonAIBuilder {
 
     /// Launches the ActonAI runtime with the configured settings.
     ///
-    /// This spawns the actor runtime, kernel, and LLM provider.
+    /// This spawns the actor runtime, kernel, and LLM providers.
     ///
     /// # Errors
     ///
     /// Returns an error if:
     /// - No provider is configured
+    /// - Default provider is specified but doesn't exist
+    /// - Multiple providers exist but no default is specified
     /// - The runtime fails to launch
     ///
     /// # Example
@@ -689,15 +972,16 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     pub async fn launch(self) -> Result<ActonAI, ActonAIError> {
-        // Validate configuration
-        let provider_config = self.provider_config.ok_or_else(|| {
-            ActonAIError::new(ActonAIErrorKind::Configuration {
+        // Validate we have at least one provider
+        if self.providers.is_empty() {
+            return Err(ActonAIError::new(ActonAIErrorKind::Configuration {
                 field: "provider".to_string(),
-                reason:
-                    "no LLM provider configured; use ollama(), anthropic(), openai(), or provider()"
-                        .to_string(),
-            })
-        })?;
+                reason: "no LLM provider configured; use ollama(), anthropic(), openai(), provider(), provider_named(), or from_config()".to_string(),
+            }));
+        }
+
+        // Determine the default provider name
+        let default_provider_name = self.resolve_default_provider_name()?;
 
         let app_name = self.app_name.unwrap_or_else(|| "acton-ai".to_string());
 
@@ -708,8 +992,12 @@ impl ActonAIBuilder {
         let kernel_config = KernelConfig::default().with_app_name(&app_name);
         let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
 
-        // Spawn the LLM provider
-        let provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
+        // Spawn all LLM providers
+        let mut providers = HashMap::new();
+        for (name, config) in self.providers {
+            let handle = LLMProvider::spawn(&mut runtime, config).await;
+            providers.insert(name, handle);
+        }
 
         // Initialize sandbox if configured
         #[cfg(feature = "hyperlight")]
@@ -761,11 +1049,49 @@ impl ActonAIBuilder {
 
         Ok(ActonAI {
             runtime,
-            provider_handle,
+            providers,
+            default_provider: default_provider_name,
             builtins,
             auto_builtins: self.auto_builtins,
             is_shutdown: false,
         })
+    }
+
+    /// Resolves the default provider name from configuration.
+    fn resolve_default_provider_name(&self) -> Result<String, ActonAIError> {
+        // If explicitly set, validate it exists
+        if let Some(ref name) = self.default_provider_name {
+            if self.providers.contains_key(name) {
+                return Ok(name.clone());
+            }
+            return Err(ActonAIError::new(ActonAIErrorKind::Configuration {
+                field: "default_provider".to_string(),
+                reason: format!(
+                    "default provider '{}' not found; available providers: {}",
+                    name,
+                    self.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+                ),
+            }));
+        }
+
+        // If only one provider, use it as default
+        if self.providers.len() == 1 {
+            return Ok(self.providers.keys().next().unwrap().clone());
+        }
+
+        // Check if "default" provider exists (from single-provider API)
+        if self.providers.contains_key(DEFAULT_PROVIDER_NAME) {
+            return Ok(DEFAULT_PROVIDER_NAME.to_string());
+        }
+
+        // Multiple providers but no default specified
+        Err(ActonAIError::new(ActonAIErrorKind::Configuration {
+            field: "default_provider".to_string(),
+            reason: format!(
+                "multiple providers configured but no default specified; use default_provider() to set one; available: {}",
+                self.providers.keys().cloned().collect::<Vec<_>>().join(", ")
+            ),
+        }))
     }
 
     /// Returns whether auto-builtins is currently enabled.
@@ -784,7 +1110,7 @@ mod tests {
     #[test]
     fn builder_default_has_no_provider() {
         let builder = ActonAIBuilder::default();
-        assert!(builder.provider_config.is_none());
+        assert!(builder.providers.is_empty());
         assert!(builder.app_name.is_none());
     }
 
@@ -797,9 +1123,9 @@ mod tests {
     #[test]
     fn builder_ollama_sets_provider() {
         let builder = ActonAI::builder().ollama("llama3.2");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.model, "llama3.2");
         assert!(config.api_key.is_empty());
     }
@@ -807,9 +1133,9 @@ mod tests {
     #[test]
     fn builder_ollama_at_sets_custom_url() {
         let builder = ActonAI::builder().ollama_at("http://custom:11434/v1", "llama3.2");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.model, "llama3.2");
         assert_eq!(config.base_url, "http://custom:11434/v1");
     }
@@ -817,9 +1143,9 @@ mod tests {
     #[test]
     fn builder_anthropic_sets_provider() {
         let builder = ActonAI::builder().anthropic("sk-ant-test");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.api_key, "sk-ant-test");
         assert!(config.model.contains("claude"));
     }
@@ -827,9 +1153,9 @@ mod tests {
     #[test]
     fn builder_anthropic_model_sets_custom_model() {
         let builder = ActonAI::builder().anthropic_model("sk-ant-test", "claude-3-haiku");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.api_key, "sk-ant-test");
         assert_eq!(config.model, "claude-3-haiku");
     }
@@ -837,9 +1163,9 @@ mod tests {
     #[test]
     fn builder_openai_sets_provider() {
         let builder = ActonAI::builder().openai("sk-test");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.api_key, "sk-test");
         assert!(config.model.contains("gpt"));
     }
@@ -847,9 +1173,9 @@ mod tests {
     #[test]
     fn builder_openai_model_sets_custom_model() {
         let builder = ActonAI::builder().openai_model("sk-test", "gpt-4-turbo");
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.api_key, "sk-test");
         assert_eq!(config.model, "gpt-4-turbo");
     }
@@ -859,9 +1185,9 @@ mod tests {
         let custom_config =
             ProviderConfig::openai_compatible("http://custom:8080/v1", "custom-model");
         let builder = ActonAI::builder().provider(custom_config);
-        assert!(builder.provider_config.is_some());
+        assert!(!builder.providers.is_empty());
 
-        let config = builder.provider_config.unwrap();
+        let config = builder.providers.get(DEFAULT_PROVIDER_NAME).unwrap();
         assert_eq!(config.model, "custom-model");
         assert_eq!(config.base_url, "http://custom:8080/v1");
     }
@@ -898,5 +1224,77 @@ mod tests {
     fn default_builder_has_no_auto_builtins() {
         let builder = ActonAI::builder();
         assert!(!builder.is_auto_builtins());
+    }
+
+    // Multi-provider tests
+    #[test]
+    fn builder_provider_named_adds_named_provider() {
+        let builder = ActonAI::builder()
+            .provider_named("claude", ProviderConfig::anthropic("sk-test"))
+            .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"));
+
+        assert_eq!(builder.providers.len(), 2);
+        assert!(builder.providers.contains_key("claude"));
+        assert!(builder.providers.contains_key("local"));
+    }
+
+    #[test]
+    fn builder_default_provider_sets_name() {
+        let builder = ActonAI::builder()
+            .provider_named("claude", ProviderConfig::anthropic("sk-test"))
+            .default_provider("claude");
+
+        assert_eq!(builder.default_provider_name, Some("claude".to_string()));
+    }
+
+    #[test]
+    fn resolve_default_single_provider() {
+        let builder = ActonAI::builder()
+            .provider_named("only-one", ProviderConfig::ollama("test"));
+
+        let name = builder.resolve_default_provider_name().unwrap();
+        assert_eq!(name, "only-one");
+    }
+
+    #[test]
+    fn resolve_default_explicit() {
+        let builder = ActonAI::builder()
+            .provider_named("a", ProviderConfig::ollama("test-a"))
+            .provider_named("b", ProviderConfig::ollama("test-b"))
+            .default_provider("b");
+
+        let name = builder.resolve_default_provider_name().unwrap();
+        assert_eq!(name, "b");
+    }
+
+    #[test]
+    fn resolve_default_uses_default_name() {
+        let builder = ActonAI::builder()
+            .ollama("test")  // Registers as "default"
+            .provider_named("other", ProviderConfig::anthropic("sk-test"));
+
+        let name = builder.resolve_default_provider_name().unwrap();
+        assert_eq!(name, DEFAULT_PROVIDER_NAME);
+    }
+
+    #[test]
+    fn resolve_default_fails_multiple_no_explicit() {
+        let builder = ActonAI::builder()
+            .provider_named("a", ProviderConfig::ollama("test-a"))
+            .provider_named("b", ProviderConfig::ollama("test-b"));
+
+        let result = builder.resolve_default_provider_name();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn resolve_default_fails_invalid_name() {
+        let builder = ActonAI::builder()
+            .provider_named("actual", ProviderConfig::ollama("test"))
+            .default_provider("nonexistent");
+
+        let result = builder.resolve_default_provider_name();
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("nonexistent"));
     }
 }

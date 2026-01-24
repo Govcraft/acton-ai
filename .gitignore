@@ -12,3 +12,4 @@
 # Rust
 /target/
 Cargo.lock
+acton-ai.toml
