@@ -4,6 +4,7 @@
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
+use crate::tools::security::PathValidator;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 use acton_reactive::prelude::*;
 use glob::glob as glob_match;
@@ -76,7 +77,8 @@ impl ToolExecutorTrait for GlobTool {
                 ToolError::validation_failed("glob", format!("invalid arguments: {e}"))
             })?;
 
-            // Determine base path
+            // Determine and validate base path
+            let validator = PathValidator::new();
             let base_path = match &args.path {
                 Some(p) => {
                     let path = Path::new(p);
@@ -86,13 +88,10 @@ impl ToolExecutorTrait for GlobTool {
                             "path must be absolute",
                         ));
                     }
-                    if !path.exists() {
-                        return Err(ToolError::execution_failed(
-                            "glob",
-                            format!("directory does not exist: {p}"),
-                        ));
-                    }
-                    path.to_path_buf()
+                    // Validate the base path using PathValidator for security
+                    validator
+                        .validate_directory(path)
+                        .map_err(|e| ToolError::validation_failed("glob", e.to_string()))?
                 }
                 None => std::env::current_dir().map_err(|e| {
                     ToolError::execution_failed(
@@ -321,7 +320,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
+        // PathValidator returns "cannot resolve path" for non-existent directories
+        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
     }
 
     #[test]

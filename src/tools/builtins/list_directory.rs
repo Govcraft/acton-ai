@@ -4,6 +4,7 @@
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
+use crate::tools::security::PathValidator;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -89,7 +90,7 @@ impl ToolExecutorTrait for ListDirectoryTool {
 
             let path = Path::new(&args.path);
 
-            // Validate path
+            // Validate path is absolute
             if !path.is_absolute() {
                 return Err(ToolError::validation_failed(
                     "list_directory",
@@ -97,22 +98,14 @@ impl ToolExecutorTrait for ListDirectoryTool {
                 ));
             }
 
-            if !path.exists() {
-                return Err(ToolError::execution_failed(
-                    "list_directory",
-                    format!("directory does not exist: {}", args.path),
-                ));
-            }
-
-            if !path.is_dir() {
-                return Err(ToolError::execution_failed(
-                    "list_directory",
-                    format!("path is not a directory: {}", args.path),
-                ));
-            }
+            // Validate path using PathValidator for security
+            let validator = PathValidator::new();
+            let canonical_path = validator
+                .validate_directory(path)
+                .map_err(|e| ToolError::validation_failed("list_directory", e.to_string()))?;
 
             // Read directory entries
-            let mut read_dir = tokio::fs::read_dir(path).await.map_err(|e| {
+            let mut read_dir = tokio::fs::read_dir(&canonical_path).await.map_err(|e| {
                 ToolError::execution_failed(
                     "list_directory",
                     format!("failed to read directory: {e}"),
@@ -322,7 +315,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
+        // PathValidator returns "cannot resolve path" for non-existent directories
+        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
     }
 
     #[tokio::test]

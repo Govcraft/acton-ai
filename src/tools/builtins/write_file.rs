@@ -4,6 +4,7 @@
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
+use crate::tools::security::PathValidator;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 use acton_reactive::prelude::*;
 use serde::Deserialize;
@@ -74,7 +75,7 @@ impl ToolExecutorTrait for WriteFileTool {
 
             let path = Path::new(&args.path);
 
-            // Validate path
+            // Validate path is absolute
             if !path.is_absolute() {
                 return Err(ToolError::validation_failed(
                     "write_file",
@@ -82,8 +83,23 @@ impl ToolExecutorTrait for WriteFileTool {
                 ));
             }
 
+            // Validate path using PathValidator for security
+            // For write operations, validate the parent since the file may not exist yet
+            let validator = PathValidator::new();
+            let validated_path = if path.exists() {
+                // File exists - validate the file path directly
+                validator
+                    .validate_file(path)
+                    .map_err(|e| ToolError::validation_failed("write_file", e.to_string()))?
+            } else {
+                // File doesn't exist - validate the parent directory
+                validator
+                    .validate_parent(path)
+                    .map_err(|e| ToolError::validation_failed("write_file", e.to_string()))?
+            };
+
             // Create parent directories if they don't exist
-            if let Some(parent) = path.parent() {
+            if let Some(parent) = validated_path.parent() {
                 if !parent.exists() {
                     tokio::fs::create_dir_all(parent).await.map_err(|e| {
                         ToolError::execution_failed(
@@ -96,9 +112,11 @@ impl ToolExecutorTrait for WriteFileTool {
 
             // Write the file
             let bytes_written = args.content.len();
-            tokio::fs::write(path, &args.content).await.map_err(|e| {
-                ToolError::execution_failed("write_file", format!("failed to write file: {e}"))
-            })?;
+            tokio::fs::write(&validated_path, &args.content)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed("write_file", format!("failed to write file: {e}"))
+                })?;
 
             Ok(json!({
                 "success": true,

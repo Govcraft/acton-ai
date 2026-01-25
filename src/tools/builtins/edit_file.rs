@@ -4,6 +4,7 @@
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
+use crate::tools::security::PathValidator;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 use acton_reactive::prelude::*;
 use serde::Deserialize;
@@ -131,7 +132,7 @@ impl ToolExecutorTrait for EditFileTool {
 
             let path = Path::new(&args.path);
 
-            // Validate path
+            // Validate path is absolute
             if !path.is_absolute() {
                 return Err(ToolError::validation_failed(
                     "edit_file",
@@ -139,19 +140,11 @@ impl ToolExecutorTrait for EditFileTool {
                 ));
             }
 
-            if !path.exists() {
-                return Err(ToolError::execution_failed(
-                    "edit_file",
-                    format!("file does not exist: {}", args.path),
-                ));
-            }
-
-            if !path.is_file() {
-                return Err(ToolError::execution_failed(
-                    "edit_file",
-                    format!("path is not a file: {}", args.path),
-                ));
-            }
+            // Validate path using PathValidator for security
+            let validator = PathValidator::new();
+            let canonical_path = validator
+                .validate_file(path)
+                .map_err(|e| ToolError::validation_failed("edit_file", e.to_string()))?;
 
             // Validate that old_string != new_string
             if args.old_string == args.new_string {
@@ -162,9 +155,11 @@ impl ToolExecutorTrait for EditFileTool {
             }
 
             // Read the file
-            let content = tokio::fs::read_to_string(path).await.map_err(|e| {
-                ToolError::execution_failed("edit_file", format!("failed to read file: {e}"))
-            })?;
+            let content = tokio::fs::read_to_string(&canonical_path)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed("edit_file", format!("failed to read file: {e}"))
+                })?;
 
             // Count occurrences
             let match_count = content.matches(&args.old_string).count();
@@ -196,9 +191,11 @@ impl ToolExecutorTrait for EditFileTool {
             let diff = Self::generate_diff(&content, &new_content, &args.path);
 
             // Write the file
-            tokio::fs::write(path, &new_content).await.map_err(|e| {
-                ToolError::execution_failed("edit_file", format!("failed to write file: {e}"))
-            })?;
+            tokio::fs::write(&canonical_path, &new_content)
+                .await
+                .map_err(|e| {
+                    ToolError::execution_failed("edit_file", format!("failed to write file: {e}"))
+                })?;
 
             Ok(json!({
                 "success": true,
@@ -422,7 +419,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
+        // PathValidator returns "cannot resolve path" for non-existent files
+        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
     }
 
     #[tokio::test]

@@ -84,6 +84,7 @@ pub mod error;
 pub mod executor;
 pub mod registry;
 pub mod sandbox;
+pub mod security;
 
 // Re-exports
 pub use crate::messages::ToolDefinition;
@@ -98,6 +99,7 @@ pub use registry::{
     ToolListResponse, ToolRegistry, UnregisterTool,
 };
 pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
+pub use security::{PathValidationError, PathValidator};
 
 // Stub implementation is only available in tests (security concern in production)
 #[cfg(test)]

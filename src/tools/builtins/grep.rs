@@ -4,6 +4,7 @@
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::{ExecuteToolDirect, ToolActor, ToolActorResponse};
+use crate::tools::security::PathValidator;
 use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 use acton_reactive::prelude::*;
 use regex::Regex;
@@ -195,7 +196,8 @@ impl ToolExecutorTrait for GrepTool {
                 ToolError::validation_failed("grep", format!("invalid regex pattern: {e}"))
             })?;
 
-            // Determine search path
+            // Determine and validate search path
+            let validator = PathValidator::new();
             let search_path = match &args.path {
                 Some(p) => {
                     let path = Path::new(p);
@@ -205,13 +207,10 @@ impl ToolExecutorTrait for GrepTool {
                             "path must be absolute",
                         ));
                     }
-                    if !path.exists() {
-                        return Err(ToolError::execution_failed(
-                            "grep",
-                            format!("path does not exist: {p}"),
-                        ));
-                    }
-                    path.to_path_buf()
+                    // Validate the search path using PathValidator for security
+                    validator
+                        .validate(path)
+                        .map_err(|e| ToolError::validation_failed("grep", e.to_string()))?
                 }
                 None => std::env::current_dir().map_err(|e| {
                     ToolError::execution_failed(
@@ -553,7 +552,8 @@ mod tests {
             .await;
 
         assert!(result.is_err());
-        assert!(result.unwrap_err().to_string().contains("does not exist"));
+        // PathValidator returns "cannot resolve path" for non-existent paths
+        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
     }
 
     #[test]
