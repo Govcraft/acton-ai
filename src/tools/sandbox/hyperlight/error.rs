@@ -3,6 +3,7 @@
 //! These errors provide detailed information about sandbox failures
 //! while mapping to the standard `ToolError::SandboxError` for API compatibility.
 
+use super::guest::GuestType;
 use crate::tools::error::ToolError;
 use std::fmt;
 use std::time::Duration;
@@ -87,6 +88,14 @@ pub enum SandboxErrorKind {
         /// Reason for incompatibility
         reason: String,
     },
+
+    /// Invalid guest type requested from pool.
+    ///
+    /// The requested guest type is not supported or not configured in the pool.
+    InvalidGuestType {
+        /// The guest type that was requested
+        guest_type: GuestType,
+    },
 }
 
 impl SandboxErrorKind {
@@ -152,6 +161,13 @@ impl fmt::Display for SandboxErrorKind {
                     f,
                     "architecture '{}' not supported: {}; Hyperlight requires x86_64",
                     arch, reason
+                )
+            }
+            Self::InvalidGuestType { guest_type } => {
+                write!(
+                    f,
+                    "invalid guest type '{}' requested; guest type not available in pool",
+                    guest_type
                 )
             }
         }
@@ -269,6 +285,25 @@ mod tests {
         let err = SandboxErrorKind::ArchitectureNotSupported {
             arch: "arm".to_string(),
             reason: "test".to_string(),
+        };
+        let tool_err: ToolError = err.into();
+        assert!(tool_err.to_string().contains("sandbox error"));
+    }
+
+    #[test]
+    fn invalid_guest_type_display() {
+        let err = SandboxErrorKind::InvalidGuestType {
+            guest_type: GuestType::Shell,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("shell"));
+        assert!(msg.contains("invalid"));
+    }
+
+    #[test]
+    fn invalid_guest_type_converts_to_tool_error() {
+        let err = SandboxErrorKind::InvalidGuestType {
+            guest_type: GuestType::Http,
         };
         let tool_err: ToolError = err.into();
         assert!(tool_err.to_string().contains("sandbox error"));

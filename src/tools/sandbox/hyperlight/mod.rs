@@ -64,14 +64,16 @@ mod sandbox;
 
 // Re-export all public types
 pub use config::{
-    GuestBinarySource, SandboxConfig, DEFAULT_MEMORY_LIMIT, DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT,
+    GuestBinarySource, PoolConfig, SandboxConfig, DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE,
+    DEFAULT_MAX_PER_TYPE, DEFAULT_MEMORY_LIMIT, DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT,
+    DEFAULT_WARMUP_COUNT,
 };
 pub use error::SandboxErrorKind;
 pub use factory::HyperlightSandboxFactory;
 pub use guest::{GuestBinaries, GuestType, GUEST_BINARIES};
 pub use pool::{
-    AcquireSandbox, GetPoolMetrics, InitPool, InternalReleaseSandbox, PoolMetrics,
-    PoolMetricsResponse, PooledSandbox, ReleaseSandbox, SandboxPool, WarmPool,
+    AcquireSandbox, GetPoolMetrics, GuestPoolMetrics, InitPool, InternalReleaseSandbox,
+    PoolMetrics, PoolMetricsResponse, PooledSandbox, ReleaseSandbox, SandboxPool, WarmPool,
 };
 pub use provider::SandboxProvider;
 pub use sandbox::HyperlightSandbox;

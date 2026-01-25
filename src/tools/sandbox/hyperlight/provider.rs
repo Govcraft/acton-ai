@@ -4,7 +4,7 @@
 //! platform requirements and returns explicit errors instead of silently
 //! falling back to insecure stub implementations.
 
-use super::config::SandboxConfig;
+use super::config::{PoolConfig, SandboxConfig};
 use super::error::SandboxErrorKind;
 use super::pool::SandboxPool;
 use acton_reactive::prelude::*;
@@ -44,8 +44,10 @@ use acton_reactive::prelude::*;
 /// not available.
 #[derive(Debug, Clone)]
 pub struct SandboxProvider {
-    /// The validated configuration
+    /// The validated sandbox configuration
     config: SandboxConfig,
+    /// The pool configuration
+    pool_config: PoolConfig,
 }
 
 impl SandboxProvider {
@@ -65,9 +67,36 @@ impl SandboxProvider {
     /// * `SandboxErrorKind::HypervisorNotAvailable` - No hypervisor available
     /// * `SandboxErrorKind::InvalidConfiguration` - Invalid config values
     pub fn new(config: SandboxConfig) -> Result<Self, SandboxErrorKind> {
+        Self::with_pool_config(config, PoolConfig::default())
+    }
+
+    /// Creates a new sandbox provider with custom pool configuration.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The sandbox configuration
+    /// * `pool_config` - The pool configuration
+    ///
+    /// # Returns
+    ///
+    /// A configured `SandboxProvider` or an error if platform requirements not met.
+    ///
+    /// # Errors
+    ///
+    /// * `SandboxErrorKind::ArchitectureNotSupported` - Not running on x86_64
+    /// * `SandboxErrorKind::HypervisorNotAvailable` - No hypervisor available
+    /// * `SandboxErrorKind::InvalidConfiguration` - Invalid config values
+    pub fn with_pool_config(
+        config: SandboxConfig,
+        pool_config: PoolConfig,
+    ) -> Result<Self, SandboxErrorKind> {
         Self::validate_platform()?;
         config.validate()?;
-        Ok(Self { config })
+        pool_config.validate()?;
+        Ok(Self {
+            config,
+            pool_config,
+        })
     }
 
     /// Validates that the current platform supports Hyperlight sandboxing.
@@ -106,13 +135,19 @@ impl SandboxProvider {
     ///
     /// The actor handle for the spawned pool.
     pub async fn spawn(&self, runtime: &mut ActorRuntime) -> ActorHandle {
-        SandboxPool::spawn(runtime, self.config.clone()).await
+        SandboxPool::spawn(runtime, self.config.clone(), self.pool_config.clone()).await
     }
 
-    /// Returns a reference to the validated configuration.
+    /// Returns a reference to the validated sandbox configuration.
     #[must_use]
     pub fn config(&self) -> &SandboxConfig {
         &self.config
+    }
+
+    /// Returns a reference to the pool configuration.
+    #[must_use]
+    pub fn pool_config(&self) -> &PoolConfig {
+        &self.pool_config
     }
 }
 

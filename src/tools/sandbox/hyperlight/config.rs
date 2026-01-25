@@ -15,6 +15,15 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default sandbox pool size.
 pub const DEFAULT_POOL_SIZE: usize = 4;
 
+/// Default warmup count per guest type.
+pub const DEFAULT_WARMUP_COUNT: usize = 4;
+
+/// Default maximum sandboxes per guest type.
+pub const DEFAULT_MAX_PER_TYPE: usize = 32;
+
+/// Default maximum executions before recycling a sandbox.
+pub const DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE: usize = 1000;
+
 /// Source for the guest binary.
 ///
 /// Hyperlight requires a specially compiled guest binary that runs
@@ -317,5 +326,182 @@ mod tests {
         let config1 = SandboxConfig::new().with_memory_limit(100 * 1024 * 1024);
         let config2 = config1.clone();
         assert_eq!(config1.memory_limit, config2.memory_limit);
+    }
+}
+
+/// Configuration for the sandbox pool.
+///
+/// Controls pool behavior including warmup counts, maximum pool sizes,
+/// and recycling thresholds per guest type.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::tools::sandbox::hyperlight::PoolConfig;
+///
+/// let config = PoolConfig::default()
+///     .with_warmup_count(8)
+///     .with_max_per_type(64);
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PoolConfig {
+    /// Number of sandboxes to pre-warm per guest type.
+    ///
+    /// Default: 4
+    pub warmup_count: usize,
+
+    /// Maximum sandboxes per guest type.
+    ///
+    /// Default: 32
+    pub max_per_type: usize,
+
+    /// Maximum executions before recycling a sandbox.
+    ///
+    /// After this many executions, the sandbox is discarded and replaced
+    /// with a fresh instance to prevent resource leaks.
+    ///
+    /// Default: 1000
+    pub max_executions_before_recycle: usize,
+}
+
+impl Default for PoolConfig {
+    fn default() -> Self {
+        Self {
+            warmup_count: DEFAULT_WARMUP_COUNT,
+            max_per_type: DEFAULT_MAX_PER_TYPE,
+            max_executions_before_recycle: DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE,
+        }
+    }
+}
+
+impl PoolConfig {
+    /// Creates a new pool configuration with default values.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the warmup count per guest type.
+    #[must_use]
+    pub fn with_warmup_count(mut self, count: usize) -> Self {
+        self.warmup_count = count;
+        self
+    }
+
+    /// Sets the maximum sandboxes per guest type.
+    #[must_use]
+    pub fn with_max_per_type(mut self, max: usize) -> Self {
+        self.max_per_type = max;
+        self
+    }
+
+    /// Sets the maximum executions before recycling.
+    #[must_use]
+    pub fn with_max_executions_before_recycle(mut self, max: usize) -> Self {
+        self.max_executions_before_recycle = max;
+        self
+    }
+
+    /// Validates the pool configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SandboxErrorKind::InvalidConfiguration` if values are invalid.
+    pub fn validate(&self) -> Result<(), SandboxErrorKind> {
+        if self.max_per_type == 0 {
+            return Err(SandboxErrorKind::InvalidConfiguration {
+                field: "max_per_type".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+
+        if self.max_executions_before_recycle == 0 {
+            return Err(SandboxErrorKind::InvalidConfiguration {
+                field: "max_executions_before_recycle".to_string(),
+                reason: "must be greater than zero".to_string(),
+            });
+        }
+
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod pool_config_tests {
+    use super::*;
+
+    #[test]
+    fn pool_config_default_values() {
+        let config = PoolConfig::default();
+        assert_eq!(config.warmup_count, DEFAULT_WARMUP_COUNT);
+        assert_eq!(config.max_per_type, DEFAULT_MAX_PER_TYPE);
+        assert_eq!(
+            config.max_executions_before_recycle,
+            DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE
+        );
+    }
+
+    #[test]
+    fn pool_config_builder_warmup_count() {
+        let config = PoolConfig::new().with_warmup_count(8);
+        assert_eq!(config.warmup_count, 8);
+    }
+
+    #[test]
+    fn pool_config_builder_max_per_type() {
+        let config = PoolConfig::new().with_max_per_type(64);
+        assert_eq!(config.max_per_type, 64);
+    }
+
+    #[test]
+    fn pool_config_builder_max_executions() {
+        let config = PoolConfig::new().with_max_executions_before_recycle(500);
+        assert_eq!(config.max_executions_before_recycle, 500);
+    }
+
+    #[test]
+    fn pool_config_validate_valid() {
+        let config = PoolConfig::default();
+        assert!(config.validate().is_ok());
+    }
+
+    #[test]
+    fn pool_config_validate_zero_max_per_type() {
+        let config = PoolConfig::new().with_max_per_type(0);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, SandboxErrorKind::InvalidConfiguration { .. }));
+        assert!(err.to_string().contains("max_per_type"));
+    }
+
+    #[test]
+    fn pool_config_validate_zero_max_executions() {
+        let config = PoolConfig::new().with_max_executions_before_recycle(0);
+        let err = config.validate().unwrap_err();
+        assert!(matches!(err, SandboxErrorKind::InvalidConfiguration { .. }));
+        assert!(err.to_string().contains("max_executions"));
+    }
+
+    #[test]
+    fn pool_config_is_clone() {
+        let config1 = PoolConfig::new().with_warmup_count(10);
+        let config2 = config1.clone();
+        assert_eq!(config1, config2);
+    }
+
+    #[test]
+    fn pool_config_is_debug() {
+        let config = PoolConfig::default();
+        let debug = format!("{:?}", config);
+        assert!(debug.contains("PoolConfig"));
+        assert!(debug.contains("warmup_count"));
+    }
+
+    #[test]
+    fn pool_config_equality() {
+        let config1 = PoolConfig::new().with_warmup_count(10);
+        let config2 = PoolConfig::new().with_warmup_count(10);
+        let config3 = PoolConfig::new().with_warmup_count(20);
+        assert_eq!(config1, config2);
+        assert_ne!(config1, config3);
     }
 }

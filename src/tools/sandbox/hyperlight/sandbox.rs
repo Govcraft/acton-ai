@@ -4,7 +4,7 @@
 
 use super::config::SandboxConfig;
 use super::error::SandboxErrorKind;
-use super::guest::GUEST_BINARIES;
+use super::guest::{GuestType, GUEST_BINARIES};
 use crate::tools::error::ToolError;
 use crate::tools::sandbox::traits::{Sandbox, SandboxExecutionFuture};
 use hyperlight_host::sandbox::uninitialized::{GuestBinary, UninitializedSandbox};
@@ -150,6 +150,109 @@ impl HyperlightSandbox {
             destroyed: AtomicBool::new(false),
             config,
         })
+    }
+
+    /// Creates a new Hyperlight sandbox for the specified guest type.
+    ///
+    /// This constructor allows creating sandboxes for specific guest types
+    /// (Shell or Http), with the appropriate host functions registered.
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - The sandbox configuration
+    /// * `guest_type` - The type of guest to run
+    ///
+    /// # Returns
+    ///
+    /// A new sandbox instance, or an error if creation fails.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SandboxErrorKind::CreationFailed` if the sandbox cannot be created.
+    /// Returns `SandboxErrorKind::HypervisorNotAvailable` if no hypervisor is present.
+    pub fn new_with_guest_type(
+        config: SandboxConfig,
+        guest_type: GuestType,
+    ) -> Result<Self, SandboxErrorKind> {
+        config.validate()?;
+
+        // Check hypervisor availability
+        if !hyperlight_host::is_hypervisor_present() {
+            return Err(SandboxErrorKind::HypervisorNotAvailable);
+        }
+
+        // Create Hyperlight sandbox configuration
+        let mut hl_config = SandboxConfiguration::default();
+        hl_config.set_heap_size(config.memory_limit as u64);
+
+        // Get guest binary for the specified type
+        let guest_binary = GuestBinary::Buffer(guest_type.binary());
+
+        // Create uninitialized sandbox
+        let mut uninit = UninitializedSandbox::new(guest_binary, Some(hl_config)).map_err(|e| {
+            SandboxErrorKind::CreationFailed {
+                reason: e.to_string(),
+            }
+        })?;
+
+        // Register appropriate host functions based on guest type
+        Self::register_host_functions(&mut uninit, guest_type)?;
+
+        // Evolve to multi-use sandbox
+        let sandbox = uninit
+            .evolve()
+            .map_err(|e| SandboxErrorKind::CreationFailed {
+                reason: format!("failed to initialize VM for {}: {}", guest_type, e),
+            })?;
+
+        Ok(Self {
+            inner: Mutex::new(Some(sandbox)),
+            destroyed: AtomicBool::new(false),
+            config,
+        })
+    }
+
+    /// Registers host functions appropriate for the guest type.
+    fn register_host_functions(
+        uninit: &mut UninitializedSandbox,
+        guest_type: GuestType,
+    ) -> Result<(), SandboxErrorKind> {
+        match guest_type {
+            GuestType::Shell => {
+                uninit
+                    .register("host_run_command", |request_json: String| -> String {
+                        Self::execute_shell_command(&request_json)
+                    })
+                    .map_err(|e| SandboxErrorKind::CreationFailed {
+                        reason: format!("failed to register host_run_command: {e}"),
+                    })?;
+            }
+            GuestType::Http => {
+                // HTTP guest uses different host functions for network I/O
+                uninit
+                    .register("host_http_request", |request_json: String| -> String {
+                        Self::execute_http_request(&request_json)
+                    })
+                    .map_err(|e| SandboxErrorKind::CreationFailed {
+                        reason: format!("failed to register host_http_request: {e}"),
+                    })?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Executes an HTTP request on the host.
+    ///
+    /// This is the host function called by the HTTP guest's `host_http_request`.
+    /// Currently a placeholder for future implementation.
+    fn execute_http_request(request_json: &str) -> String {
+        // TODO: Implement HTTP request handling when http_guest is ready
+        serde_json::json!({
+            "status": 501,
+            "body": "HTTP guest not yet implemented",
+            "error": format!("request: {}", request_json)
+        })
+        .to_string()
     }
 
     /// Loads the guest binary based on configuration.

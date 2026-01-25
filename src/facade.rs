@@ -1012,11 +1012,18 @@ impl ActonAIBuilder {
                     tracing::info!("Hyperlight sandbox factory initialized");
                 }
                 SandboxMode::Pool { pool_size, config } => {
-                    // Spawn the sandbox pool actor
-                    let pool_handle = SandboxPool::spawn(&mut runtime, config).await;
+                    // Spawn the sandbox pool actor with default pool config
+                    let pool_config = crate::tools::sandbox::hyperlight::PoolConfig::default();
+                    let pool_handle =
+                        SandboxPool::spawn(&mut runtime, config, pool_config).await;
 
-                    // Warm up the pool
-                    pool_handle.send(WarmPool { count: pool_size }).await;
+                    // Warm up the pool for all guest types
+                    pool_handle
+                        .send(WarmPool {
+                            count: pool_size,
+                            guest_type: None,
+                        })
+                        .await;
 
                     tracing::info!(pool_size, "Hyperlight sandbox pool initialized and warmed");
                 }
