@@ -1,0 +1,12 @@
+[package]
+name = "shell_guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hyperlight guest binary for shell command execution"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+hyperlight-guest-bin.workspace = true

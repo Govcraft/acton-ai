@@ -53,8 +53,8 @@ pub use stub::{StubSandbox, StubSandboxFactory};
 // Re-export Hyperlight implementation when feature is enabled
 #[cfg(feature = "hyperlight")]
 pub use hyperlight::{
-    AcquireSandbox, GetPoolMetrics, GuestBinarySource, HyperlightSandbox,
+    AcquireSandbox, GetPoolMetrics, GuestBinaries, GuestBinarySource, GuestType, HyperlightSandbox,
     HyperlightSandboxFactory, InitPool, InternalReleaseSandbox, PoolMetrics, PoolMetricsResponse,
     PooledSandbox, ReleaseSandbox, SandboxConfig, SandboxErrorKind, SandboxPool, SandboxProvider,
-    WarmPool,
+    WarmPool, GUEST_BINARIES,
 };

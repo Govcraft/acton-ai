@@ -1,0 +1,22 @@
+[workspace]
+resolver = "2"
+members = [
+    "shell_guest",
+    "http_guest",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+hyperlight-guest-bin = "0.12"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = "s"
+
+[profile.dev]
+panic = "abort"

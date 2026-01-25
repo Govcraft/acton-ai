@@ -1,0 +1,12 @@
+[package]
+name = "http_guest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Hyperlight guest binary for HTTP client operations"
+
+[lib]
+crate-type = ["staticlib"]
+
+[dependencies]
+hyperlight-guest-bin.workspace = true

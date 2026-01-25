@@ -58,6 +58,7 @@
 mod config;
 mod error;
 mod factory;
+mod guest;
 mod pool;
 mod provider;
 mod sandbox;
@@ -68,6 +69,9 @@ pub use config::{
 };
 pub use error::SandboxErrorKind;
 pub use factory::HyperlightSandboxFactory;
+pub use guest::GuestType;
+#[cfg(feature = "hyperlight")]
+pub use guest::{GuestBinaries, GUEST_BINARIES};
 pub use pool::{
     AcquireSandbox, GetPoolMetrics, InitPool, InternalReleaseSandbox, PoolMetrics,
     PoolMetricsResponse, PooledSandbox, ReleaseSandbox, SandboxPool, WarmPool,
