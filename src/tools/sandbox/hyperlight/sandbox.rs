@@ -243,16 +243,122 @@ impl HyperlightSandbox {
 
     /// Executes an HTTP request on the host.
     ///
-    /// This is the host function called by the HTTP guest's `host_http_request`.
-    /// Currently a placeholder for future implementation.
+    /// This is the host function called by the HTTP guest's `host_http_fetch`.
+    /// Parses the JSON request and performs the HTTP operation.
     fn execute_http_request(request_json: &str) -> String {
-        // TODO: Implement HTTP request handling when http_guest is ready
-        serde_json::json!({
-            "status": 501,
-            "body": "HTTP guest not yet implemented",
-            "error": format!("request: {}", request_json)
-        })
-        .to_string()
+        // Parse the request
+        #[derive(serde::Deserialize)]
+        struct HttpRequest {
+            url: String,
+            #[serde(default = "default_method")]
+            method: String,
+            #[serde(default)]
+            headers: std::collections::HashMap<String, String>,
+            body: Option<String>,
+            #[serde(default = "default_timeout")]
+            timeout_secs: u64,
+        }
+
+        fn default_method() -> String {
+            "GET".to_string()
+        }
+
+        fn default_timeout() -> u64 {
+            30
+        }
+
+        let request: HttpRequest = match serde_json::from_str(request_json) {
+            Ok(req) => req,
+            Err(e) => {
+                return serde_json::json!({
+                    "status": 0,
+                    "headers": {},
+                    "body": "",
+                    "success": false,
+                    "error": format!("Failed to parse request: {}", e)
+                })
+                .to_string();
+            }
+        };
+
+        // Build and execute the HTTP request using a blocking client
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(request.timeout_secs))
+            .build()
+        {
+            Ok(c) => c,
+            Err(e) => {
+                return serde_json::json!({
+                    "status": 0,
+                    "headers": {},
+                    "body": "",
+                    "success": false,
+                    "error": format!("Failed to create HTTP client: {}", e)
+                })
+                .to_string();
+            }
+        };
+
+        let mut req_builder = match request.method.to_uppercase().as_str() {
+            "GET" => client.get(&request.url),
+            "POST" => client.post(&request.url),
+            "PUT" => client.put(&request.url),
+            "DELETE" => client.delete(&request.url),
+            "PATCH" => client.patch(&request.url),
+            "HEAD" => client.head(&request.url),
+            method => {
+                return serde_json::json!({
+                    "status": 0,
+                    "headers": {},
+                    "body": "",
+                    "success": false,
+                    "error": format!("Unsupported HTTP method: {}", method)
+                })
+                .to_string();
+            }
+        };
+
+        // Add headers
+        for (key, value) in &request.headers {
+            req_builder = req_builder.header(key, value);
+        }
+
+        // Add body if present
+        if let Some(body) = request.body {
+            req_builder = req_builder.body(body);
+        }
+
+        // Execute request
+        match req_builder.send() {
+            Ok(response) => {
+                let status = response.status().as_u16();
+                let headers: std::collections::HashMap<String, String> = response
+                    .headers()
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_str().unwrap_or("").to_string()))
+                    .collect();
+                let body = response.text().unwrap_or_default();
+
+                serde_json::json!({
+                    "status": status,
+                    "headers": headers,
+                    "body": body,
+                    "success": true,
+                    "error": null
+                })
+                .to_string()
+            }
+            Err(e) => {
+                serde_json::json!({
+                    "status": 0,
+                    "headers": {},
+                    "body": "",
+                    "success": false,
+                    "error": format!("HTTP request failed: {}", e)
+                })
+                .to_string()
+            }
+        }
     }
 
     /// Loads the guest binary based on configuration.

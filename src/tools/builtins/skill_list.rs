@@ -138,7 +138,7 @@ impl ToolActor for ListSkillsToolActor {
     }
 
     async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
-        // This is a placeholder - the actual spawn requires a registry reference
+        // Default spawn with empty registry - use spawn_with_registry for production
         // Use spawn_with_registry instead
         let mut builder = runtime.new_actor_with_name::<Self>("list_skills_tool".to_string());
 

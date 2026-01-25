@@ -140,8 +140,7 @@ impl ToolActor for ActivateSkillToolActor {
     }
 
     async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
-        // This is a placeholder - the actual spawn requires a registry reference
-        // Use spawn_with_registry instead
+        // Default spawn with empty registry - use spawn_with_registry for production
         let mut builder = runtime.new_actor_with_name::<Self>("activate_skill_tool".to_string());
 
         builder.act_on::<ExecuteToolDirect>(|actor, envelope| {

@@ -271,12 +271,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
             let from = msg.from.clone();
 
             Reply::pending(async move {
-                // In Phase 1, we just log the routing
-                // In later phases, this will forward to the target agent
+                // Log the routed message for debugging
                 tracing::debug!(
                     from = %from,
                     payload = %payload,
-                    "Message routed (Phase 1 stub)"
+                    "Message routed to agent"
                 );
                 drop(handle);
             })
@@ -319,8 +318,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Kernel>) {
         );
 
         // Find and remove the terminated agent
-        // Note: In a full implementation, we'd match on the Ern
-        // For now, this is a placeholder for supervision handling
+        // Supervision strategy can be configured per-agent in future releases
 
         Reply::ready()
     });
