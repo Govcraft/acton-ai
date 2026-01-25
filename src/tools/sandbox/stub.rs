@@ -72,6 +72,31 @@ impl Sandbox for StubSandbox {
     fn is_alive(&self) -> bool {
         !self.destroyed
     }
+
+    fn execute_sync(&self, code: &str, args: Value) -> Result<Value, ToolError> {
+        if self.destroyed {
+            return Err(ToolError::sandbox_error("sandbox has been destroyed"));
+        }
+
+        // Stub implementation just returns a placeholder response
+        let code_preview = if code.len() > 50 {
+            code[..50].to_string()
+        } else {
+            code.to_string()
+        };
+
+        tracing::warn!(
+            code_len = code.len(),
+            "StubSandbox: NOT actually sandboxing code execution (sync)"
+        );
+
+        Ok(serde_json::json!({
+            "status": "stub",
+            "message": "StubSandbox does not execute code",
+            "code_preview": code_preview,
+            "args": args
+        }))
+    }
 }
 
 /// A stub sandbox factory that creates StubSandbox instances.
@@ -163,5 +188,35 @@ mod tests {
     fn stub_sandbox_factory_is_available() {
         let factory = StubSandboxFactory::new();
         assert!(factory.is_available());
+    }
+
+    #[test]
+    fn stub_sandbox_execute_sync_returns_stub_response() {
+        let sandbox = StubSandbox::new();
+        let result = sandbox.execute_sync("some code", serde_json::json!({"arg": 1}));
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        assert_eq!(value.get("status").unwrap(), "stub");
+    }
+
+    #[test]
+    fn stub_sandbox_execute_sync_after_destroy_fails() {
+        let mut sandbox = StubSandbox::new();
+        sandbox.destroy();
+        let result = sandbox.execute_sync("code", serde_json::json!({}));
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.to_string().contains("destroyed"));
+    }
+
+    #[test]
+    fn stub_sandbox_execute_sync_truncates_long_code() {
+        let sandbox = StubSandbox::new();
+        let long_code = "x".repeat(100);
+        let result = sandbox.execute_sync(&long_code, serde_json::json!({}));
+        assert!(result.is_ok());
+        let value = result.unwrap();
+        let preview = value.get("code_preview").unwrap().as_str().unwrap();
+        assert_eq!(preview.len(), 50);
     }
 }

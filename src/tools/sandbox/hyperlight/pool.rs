@@ -10,6 +10,7 @@ use crate::tools::error::ToolError;
 use crate::tools::sandbox::traits::Sandbox;
 use acton_reactive::prelude::*;
 use serde_json::Value;
+use std::sync::Arc;
 use std::time::Instant;
 
 /// Message to initialize the pool with configuration.
@@ -85,8 +86,8 @@ pub struct ReleaseSandbox {
 /// When dropped, the sandbox is automatically returned to the pool
 /// if it's still alive.
 pub struct PooledSandbox {
-    /// The underlying sandbox
-    inner: Option<Box<dyn Sandbox>>,
+    /// The underlying sandbox (Arc allows cloning for spawn_blocking)
+    inner: Option<Arc<dyn Sandbox>>,
     /// Index in the pool
     index: usize,
     /// Handle to the pool for returning the sandbox
@@ -106,7 +107,12 @@ impl std::fmt::Debug for PooledSandbox {
 }
 
 impl PooledSandbox {
-    /// Executes code in the pooled sandbox.
+    /// Executes code in the pooled sandbox using spawn_blocking.
+    ///
+    /// This method clones the `Arc<dyn Sandbox>` and executes `execute_sync`
+    /// in a blocking context via `tokio::task::spawn_blocking`. This allows
+    /// synchronous sandbox implementations (like Hyperlight) to work correctly
+    /// within async contexts.
     ///
     /// # Arguments
     ///
@@ -119,14 +125,19 @@ impl PooledSandbox {
     ///
     /// # Errors
     ///
-    /// Returns an error if the sandbox is not available or execution fails.
+    /// Returns an error if the sandbox is not available, spawn_blocking fails,
+    /// or execution fails.
     pub async fn execute(&self, code: &str, args: Value) -> Result<Value, ToolError> {
         let sandbox = self
             .inner
-            .as_ref()
+            .clone()
             .ok_or_else(|| ToolError::sandbox_error("pooled sandbox is not available"))?;
 
-        sandbox.execute(code, args).await
+        let code = code.to_string();
+
+        tokio::task::spawn_blocking(move || sandbox.execute_sync(&code, args))
+            .await
+            .map_err(|e| ToolError::sandbox_error(format!("spawn_blocking failed: {e}")))?
     }
 
     /// Returns whether the sandbox is alive.
@@ -151,7 +162,8 @@ impl Drop for PooledSandbox {
 /// Internal sandbox entry in the pool.
 #[derive(Debug)]
 struct PoolEntry {
-    sandbox: Box<dyn Sandbox>,
+    /// The sandbox (Arc allows sharing with PooledSandbox for spawn_blocking)
+    sandbox: Arc<dyn Sandbox>,
     in_use: bool,
 }
 
@@ -231,10 +243,13 @@ impl SandboxPool {
         handle
     }
 
-    /// Attempts to create a new sandbox.
-    fn create_sandbox(&self) -> Result<Box<dyn Sandbox>, SandboxErrorKind> {
+    /// Attempts to create a new sandbox wrapped in an Arc.
+    ///
+    /// The Arc allows the sandbox to be shared with `PooledSandbox` for use
+    /// in `spawn_blocking` while still being tracked in the pool.
+    fn create_sandbox(&self) -> Result<Arc<dyn Sandbox>, SandboxErrorKind> {
         let sandbox = HyperlightSandbox::new(self.config.clone())?;
-        Ok(Box::new(sandbox))
+        Ok(Arc::new(sandbox))
     }
 }
 

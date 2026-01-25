@@ -64,6 +64,32 @@ pub trait Sandbox: Send + Sync + Debug {
     ///
     /// Returns `false` after `destroy()` has been called.
     fn is_alive(&self) -> bool;
+
+    /// Executes code synchronously (for use in blocking contexts).
+    ///
+    /// This method is intended for use with `tokio::task::spawn_blocking`
+    /// when the sandbox implementation requires synchronous execution
+    /// (e.g., Hyperlight's `MultiUseSandbox::call`).
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - The code or command to execute
+    /// * `args` - Arguments to pass to the code (as JSON)
+    ///
+    /// # Returns
+    ///
+    /// The result of execution as a JSON value, or an error.
+    ///
+    /// # Default Implementation
+    ///
+    /// Returns an error indicating synchronous execution is not supported.
+    /// Override this method for sandboxes that support synchronous execution.
+    fn execute_sync(&self, code: &str, args: Value) -> Result<Value, ToolError> {
+        let _ = (code, args); // Suppress unused parameter warnings
+        Err(ToolError::sandbox_error(
+            "synchronous execution not supported by this sandbox",
+        ))
+    }
 }
 
 /// Factory for creating sandbox instances.

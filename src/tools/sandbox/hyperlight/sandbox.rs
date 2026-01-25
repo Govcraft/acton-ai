@@ -18,7 +18,6 @@ use std::sync::Mutex;
 ///
 /// Used when calling the guest's `execute_shell` function.
 #[derive(Debug, Serialize)]
-#[allow(dead_code)] // Used in execute_sync when spawn_blocking is implemented
 struct ShellRequest {
     /// Command to execute
     command: String,
@@ -32,7 +31,6 @@ struct ShellRequest {
 ///
 /// Parsed from the JSON response from the guest's `execute_shell` function.
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)] // Used in execute_sync when spawn_blocking is implemented
 struct ShellResponse {
     /// Exit code from the command
     exit_code: i32,
@@ -169,12 +167,10 @@ impl HyperlightSandbox {
         }
     }
 
-    /// Executes a command in the sandbox synchronously.
+    /// Internal implementation of synchronous execution.
     ///
-    /// This is the internal implementation that runs within the async context.
-    /// Used by SandboxPool when executing via spawn_blocking.
-    #[allow(dead_code)] // Used when spawn_blocking is implemented
-    fn execute_sync(&self, code: &str, args: Value) -> Result<Value, ToolError> {
+    /// This is called by the `Sandbox::execute_sync` trait method.
+    fn execute_sync_internal(&self, code: &str, args: Value) -> Result<Value, ToolError> {
         if self.destroyed.load(Ordering::SeqCst) {
             return Err(SandboxErrorKind::AlreadyDestroyed.into());
         }
@@ -271,6 +267,10 @@ impl Sandbox for HyperlightSandbox {
 
     fn is_alive(&self) -> bool {
         !self.destroyed.load(Ordering::SeqCst)
+    }
+
+    fn execute_sync(&self, code: &str, args: Value) -> Result<Value, ToolError> {
+        self.execute_sync_internal(code, args)
     }
 }
 
