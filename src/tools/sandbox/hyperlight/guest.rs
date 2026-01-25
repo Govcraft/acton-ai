@@ -57,8 +57,8 @@ impl GuestType {
 
     /// Returns the embedded binary for this guest type.
     ///
-    /// Returns placeholder bytes until build.rs properly compiles
-    /// and embeds the guest binaries.
+    /// The guest binaries are compiled by build.rs from the guests/ workspace
+    /// and embedded into the final binary at compile time.
     ///
     /// # Examples
     ///
@@ -110,21 +110,14 @@ pub struct GuestBinaries {
 
 /// Embedded guest binaries, included at compile time.
 ///
-/// These are placeholder bytes until the build.rs script properly
-/// compiles and embeds the guest binaries from the guests/ workspace.
+/// These binaries are compiled by build.rs from the guests/ workspace
+/// and embedded into the final binary.
 ///
-/// # Future Implementation
-///
-/// Once cargo-hyperlight or a custom build.rs is set up:
-/// ```rust,ignore
-/// pub static GUEST_BINARIES: GuestBinaries = GuestBinaries {
-///     shell: include_bytes!("../../../guests/target/x86_64-unknown-none/release/shell_guest"),
-///     http: include_bytes!("../../../guests/target/x86_64-unknown-none/release/http_guest"),
-/// };
-/// ```
+/// If the x86_64-unknown-none target isn't installed, stub binaries
+/// are embedded that will fail at runtime with a clear error message.
 pub static GUEST_BINARIES: GuestBinaries = GuestBinaries {
-    shell: b"PLACEHOLDER:shell_guest_binary_not_yet_compiled",
-    http: b"PLACEHOLDER:http_guest_binary_not_yet_compiled",
+    shell: include_bytes!(concat!(env!("OUT_DIR"), "/guests/shell_guest")),
+    http: include_bytes!(concat!(env!("OUT_DIR"), "/guests/http_guest")),
 };
 
 #[cfg(test)]

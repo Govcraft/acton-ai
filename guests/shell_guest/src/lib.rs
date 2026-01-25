@@ -1,7 +1,8 @@
 //! Shell execution guest for Hyperlight sandboxes.
 //!
-//! This guest binary handles shell command execution requests
-//! from the host and returns structured output.
+//! This guest binary handles shell command execution requests from the host
+//! via the `execute_shell` function. The guest validates input and delegates
+//! actual command execution to host functions.
 //!
 //! # Protocol
 //!
@@ -30,30 +31,30 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::string::String;
-use hyperlight_guest_bin::guest_function;
+use hyperlight_guest_bin::{guest_function, host_function};
+
+/// Host function for executing shell commands.
+/// This is implemented on the host side and called by the guest.
+/// The host's registered function name must match: "host_run_command"
+#[host_function]
+fn host_run_command(command: String) -> String;
 
 /// Execute a shell command and return structured output.
 ///
+/// The function name `execute_shell` must match what the host calls via
+/// `sandbox.call("execute_shell", ...)`.
+///
 /// # Arguments
 ///
-/// * `input` - JSON-encoded shell request
+/// * `input` - JSON-encoded shell request with command, args, and timeout_secs
 ///
 /// # Returns
 ///
-/// JSON-encoded shell response with exit code, stdout, stderr, and success flag.
-///
-/// # Implementation Note
-///
-/// Actual shell execution requires host functions for process spawning.
-/// This placeholder returns a structured response indicating the limitation.
-#[guest_function("Execute")]
-fn execute(input: String) -> String {
-    // Parse input to validate format (in a real implementation)
-    // For now, return a placeholder response
-    format!(
-        r#"{{"exit_code":1,"stdout":"","stderr":"Shell execution requires host function support. Input length: {}","success":false,"truncated":false}}"#,
-        input.len()
-    )
+/// JSON-encoded shell response with exit_code, stdout, stderr, success, and truncated.
+#[guest_function("execute_shell")]
+fn execute_shell(input: String) -> String {
+    // Call the host function to execute the command
+    // The host is responsible for parsing the JSON and running the actual command
+    host_run_command(input)
 }

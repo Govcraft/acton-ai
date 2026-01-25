@@ -4,6 +4,7 @@
 
 use super::config::SandboxConfig;
 use super::error::SandboxErrorKind;
+use super::guest::GUEST_BINARIES;
 use crate::tools::error::ToolError;
 use crate::tools::sandbox::traits::{Sandbox, SandboxExecutionFuture};
 use hyperlight_host::sandbox::uninitialized::{GuestBinary, UninitializedSandbox};
@@ -11,13 +12,14 @@ use hyperlight_host::sandbox::SandboxConfiguration;
 use hyperlight_host::MultiUseSandbox;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
 /// Request sent to the shell executor guest.
 ///
 /// Used when calling the guest's `execute_shell` function.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct ShellRequest {
     /// Command to execute
     command: String,
@@ -120,11 +122,21 @@ impl HyperlightSandbox {
         let guest_binary = Self::load_guest_binary(&config)?;
 
         // Create uninitialized sandbox
-        let uninit = UninitializedSandbox::new(guest_binary, Some(hl_config)).map_err(|e| {
+        let mut uninit = UninitializedSandbox::new(guest_binary, Some(hl_config)).map_err(|e| {
             SandboxErrorKind::CreationFailed {
                 reason: e.to_string(),
             }
         })?;
+
+        // Register host function for shell command execution
+        // This is called by the guest's host_run_command function
+        uninit
+            .register("host_run_command", |request_json: String| -> String {
+                Self::execute_shell_command(&request_json)
+            })
+            .map_err(|e| SandboxErrorKind::CreationFailed {
+                reason: format!("failed to register host_run_command: {e}"),
+            })?;
 
         // Evolve to multi-use sandbox
         let sandbox = uninit
@@ -147,12 +159,7 @@ impl HyperlightSandbox {
         match &config.guest_binary {
             GuestBinarySource::Embedded => {
                 // Use the embedded shell executor guest
-                // Note: In a real implementation, this would use include_bytes!()
-                // to embed the pre-compiled guest binary
-                Err(SandboxErrorKind::CreationFailed {
-                    reason: "embedded guest binary not yet available; use FromPath or FromBytes"
-                        .to_string(),
-                })
+                Ok(GuestBinary::Buffer(GUEST_BINARIES.shell))
             }
             GuestBinarySource::FromPath(path) => {
                 let path_str = path.to_string_lossy().to_string();
@@ -165,6 +172,59 @@ impl HyperlightSandbox {
                 Ok(GuestBinary::Buffer(leaked))
             }
         }
+    }
+
+    /// Executes a shell command on the host.
+    ///
+    /// This is the host function called by the guest's `host_run_command`.
+    /// It parses the JSON request, executes the command, and returns a JSON response.
+    fn execute_shell_command(request_json: &str) -> String {
+        // Parse the request
+        let request: ShellRequest = match serde_json::from_str(request_json) {
+            Ok(req) => req,
+            Err(e) => {
+                return serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": format!("Failed to parse request: {}", e),
+                    "success": false,
+                    "truncated": false
+                })
+                .to_string();
+            }
+        };
+
+        // Execute the command
+        let output = match Command::new("sh")
+            .arg("-c")
+            .arg(&request.command)
+            .output()
+        {
+            Ok(output) => output,
+            Err(e) => {
+                return serde_json::json!({
+                    "exit_code": 1,
+                    "stdout": "",
+                    "stderr": format!("Failed to execute command: {}", e),
+                    "success": false,
+                    "truncated": false
+                })
+                .to_string();
+            }
+        };
+
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let exit_code = output.status.code().unwrap_or(1);
+
+        serde_json::json!({
+            "exit_code": exit_code,
+            "stdout": stdout,
+            "stderr": stderr,
+            "success": output.status.success(),
+            "truncated": false
+        })
+        .to_string()
     }
 
     /// Internal implementation of synchronous execution.
@@ -233,21 +293,16 @@ impl Sandbox for HyperlightSandbox {
             return Box::pin(async move { Err(SandboxErrorKind::AlreadyDestroyed.into()) });
         }
 
-        // Since Hyperlight's MultiUseSandbox::call is synchronous, we need to
-        // execute it in a blocking context. However, we cannot easily capture
-        // &self in an async block due to lifetime constraints.
+        // Hyperlight's MultiUseSandbox::call is synchronous, but we can't easily
+        // capture &self in an async block due to lifetime constraints.
         //
         // For production use, the SandboxPool actor pattern should be used instead,
         // which manages sandbox lifecycle properly within the actor system.
-        //
-        // Here we return a placeholder indicating the limitation.
         let code = code.to_string();
 
         Box::pin(async move {
-            // In a real implementation with tokio::task::spawn_blocking,
-            // we would execute the sync call there. For now, indicate limitation.
             Err(ToolError::sandbox_error(format!(
-                "direct HyperlightSandbox::execute() requires spawn_blocking; \
+                "direct HyperlightSandbox::execute() is not supported; \
                  use SandboxPool for managed async execution (code: {}...)",
                 if code.len() > 20 { &code[..20] } else { &code }
             )))

@@ -1,7 +1,8 @@
 //! HTTP client guest for Hyperlight sandboxes.
 //!
-//! This guest binary handles HTTP fetch requests from the host
-//! and returns structured responses.
+//! This guest binary handles HTTP fetch requests from the host via the
+//! `http_fetch` function. The guest validates input and delegates actual
+//! network I/O to host functions.
 //!
 //! # Protocol
 //!
@@ -32,28 +33,30 @@
 
 extern crate alloc;
 
-use alloc::format;
 use alloc::string::String;
-use hyperlight_guest_bin::guest_function;
+use hyperlight_guest_bin::{guest_function, host_function};
+
+/// Host function for HTTP requests.
+/// This is implemented on the host side and called by the guest.
+/// The host's registered function name must match: "host_http_fetch"
+#[host_function]
+fn host_http_fetch(request: String) -> String;
 
 /// Perform an HTTP fetch operation.
 ///
+/// The function name `http_fetch` must match what the host calls via
+/// `sandbox.call("http_fetch", ...)`.
+///
 /// # Arguments
 ///
-/// * `input` - JSON-encoded HTTP request
+/// * `input` - JSON-encoded HTTP request with url, method, headers, body, timeout_secs
 ///
 /// # Returns
 ///
-/// JSON-encoded HTTP response with status, headers, body, and success flag.
-///
-/// # Implementation Note
-///
-/// Actual HTTP requests require host functions for network I/O.
-/// This placeholder returns a structured response indicating the limitation.
-#[guest_function("Fetch")]
-fn fetch(input: String) -> String {
-    format!(
-        r#"{{"status":0,"headers":{{}},"body":"","success":false,"error":"HTTP fetch requires host function support. Input length: {}"}}"#,
-        input.len()
-    )
+/// JSON-encoded HTTP response with status, headers, body, success, and error.
+#[guest_function("http_fetch")]
+fn http_fetch(input: String) -> String {
+    // Call the host function to perform the HTTP request
+    // The host is responsible for parsing the JSON and making the actual request
+    host_http_fetch(input)
 }
