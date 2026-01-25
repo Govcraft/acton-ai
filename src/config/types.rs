@@ -1,9 +1,10 @@
 //! Configuration types for multi-provider support.
 //!
 //! This module provides types for defining multiple named LLM providers
-//! in configuration files.
+//! and sandbox settings in configuration files.
 
 use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig};
+use crate::tools::sandbox::hyperlight::{PoolConfig, SandboxConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::time::Duration;
@@ -24,6 +25,14 @@ use std::time::Duration;
 /// base_url = "http://localhost:11434/v1"
 ///
 /// default_provider = "ollama"
+///
+/// [sandbox]
+/// pool_warmup = 4
+/// pool_max_per_type = 32
+///
+/// [sandbox.limits]
+/// max_execution_ms = 30000
+/// max_memory_mb = 64
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ActonAIConfig {
@@ -40,6 +49,13 @@ pub struct ActonAIConfig {
     /// becomes the default. If multiple providers exist and no
     /// default is specified, an error occurs at launch.
     pub default_provider: Option<String>,
+
+    /// Sandbox configuration for tool execution isolation.
+    ///
+    /// When present, configures the Hyperlight sandbox pool settings
+    /// including warmup counts, pool limits, and resource constraints.
+    #[serde(default)]
+    pub sandbox: Option<SandboxFileConfig>,
 }
 
 impl ActonAIConfig {
@@ -320,6 +336,180 @@ impl NamedProviderConfig {
     }
 }
 
+/// Sandbox configuration for TOML config files.
+///
+/// This structure maps to the `[sandbox]` section in config files:
+///
+/// ```toml
+/// [sandbox]
+/// pool_warmup = 4
+/// pool_max_per_type = 32
+/// max_executions_before_recycle = 1000
+///
+/// [sandbox.limits]
+/// max_execution_ms = 30000
+/// max_memory_mb = 64
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SandboxFileConfig {
+    /// Number of sandboxes to pre-warm per guest type.
+    ///
+    /// Default: 4
+    #[serde(default)]
+    pub pool_warmup: Option<usize>,
+
+    /// Maximum sandboxes per guest type.
+    ///
+    /// Default: 32
+    #[serde(default)]
+    pub pool_max_per_type: Option<usize>,
+
+    /// Maximum executions before recycling a sandbox.
+    ///
+    /// After this many executions, the sandbox is discarded and replaced
+    /// with a fresh instance to prevent resource leaks.
+    ///
+    /// Default: 1000
+    #[serde(default)]
+    pub max_executions_before_recycle: Option<usize>,
+
+    /// Resource limits for sandbox execution.
+    #[serde(default)]
+    pub limits: Option<SandboxLimitsConfig>,
+}
+
+impl SandboxFileConfig {
+    /// Creates a new empty sandbox configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the pool warmup count.
+    #[must_use]
+    pub fn with_pool_warmup(mut self, count: usize) -> Self {
+        self.pool_warmup = Some(count);
+        self
+    }
+
+    /// Sets the maximum sandboxes per guest type.
+    #[must_use]
+    pub fn with_pool_max_per_type(mut self, max: usize) -> Self {
+        self.pool_max_per_type = Some(max);
+        self
+    }
+
+    /// Sets the maximum executions before recycling.
+    #[must_use]
+    pub fn with_max_executions_before_recycle(mut self, max: usize) -> Self {
+        self.max_executions_before_recycle = Some(max);
+        self
+    }
+
+    /// Sets the resource limits.
+    #[must_use]
+    pub fn with_limits(mut self, limits: SandboxLimitsConfig) -> Self {
+        self.limits = Some(limits);
+        self
+    }
+
+    /// Converts file config to runtime `PoolConfig`.
+    ///
+    /// Applies configured values over defaults.
+    ///
+    /// # Returns
+    ///
+    /// A `PoolConfig` with values from file config or defaults.
+    #[must_use]
+    pub fn to_pool_config(&self) -> PoolConfig {
+        let mut config = PoolConfig::default();
+
+        if let Some(warmup) = self.pool_warmup {
+            config = config.with_warmup_count(warmup);
+        }
+        if let Some(max) = self.pool_max_per_type {
+            config = config.with_max_per_type(max);
+        }
+        if let Some(max_exec) = self.max_executions_before_recycle {
+            config = config.with_max_executions_before_recycle(max_exec);
+        }
+
+        config
+    }
+
+    /// Converts file config to runtime `SandboxConfig`.
+    ///
+    /// Applies configured limits over defaults.
+    ///
+    /// # Returns
+    ///
+    /// A `SandboxConfig` with values from file config or defaults.
+    #[must_use]
+    pub fn to_sandbox_config(&self) -> SandboxConfig {
+        let mut config = SandboxConfig::default();
+
+        if let Some(ref limits) = self.limits {
+            if let Some(timeout_ms) = limits.max_execution_ms {
+                config = config.with_timeout(Duration::from_millis(timeout_ms));
+            }
+            if let Some(memory_mb) = limits.max_memory_mb {
+                config = config.with_memory_limit(memory_mb * 1024 * 1024);
+            }
+        }
+
+        // Apply pool size from warmup count if specified
+        if let Some(warmup) = self.pool_warmup {
+            config = config.with_pool_size(Some(warmup));
+        }
+
+        config
+    }
+}
+
+/// Resource limits for sandbox execution.
+///
+/// ```toml
+/// [sandbox.limits]
+/// max_execution_ms = 30000
+/// max_memory_mb = 64
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SandboxLimitsConfig {
+    /// Maximum execution time in milliseconds.
+    ///
+    /// Default: 30000 (30 seconds)
+    #[serde(default)]
+    pub max_execution_ms: Option<u64>,
+
+    /// Maximum memory in megabytes.
+    ///
+    /// Default: 64 MB
+    #[serde(default)]
+    pub max_memory_mb: Option<usize>,
+}
+
+impl SandboxLimitsConfig {
+    /// Creates a new empty limits configuration.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the maximum execution time in milliseconds.
+    #[must_use]
+    pub fn with_max_execution_ms(mut self, ms: u64) -> Self {
+        self.max_execution_ms = Some(ms);
+        self
+    }
+
+    /// Sets the maximum memory in megabytes.
+    #[must_use]
+    pub fn with_max_memory_mb(mut self, mb: usize) -> Self {
+        self.max_memory_mb = Some(mb);
+        self
+    }
+}
+
 /// Rate limiting configuration for config files.
 ///
 /// This is a simplified version of RateLimitConfig for TOML serialization.
@@ -361,6 +551,10 @@ impl Default for RateLimitFileConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tools::sandbox::hyperlight::{
+        DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE, DEFAULT_MAX_PER_TYPE, DEFAULT_MEMORY_LIMIT,
+        DEFAULT_TIMEOUT, DEFAULT_WARMUP_COUNT,
+    };
 
     #[test]
     fn acton_ai_config_default_is_empty() {
@@ -530,5 +724,256 @@ tokens_per_minute = 1000000
         let ollama = config.providers.get("ollama").unwrap();
         assert_eq!(ollama.timeout_secs, Some(300));
         assert!(ollama.rate_limit.is_some());
+    }
+
+    // Sandbox configuration tests
+
+    #[test]
+    fn sandbox_file_config_default_is_none() {
+        let config = SandboxFileConfig::default();
+        assert!(config.pool_warmup.is_none());
+        assert!(config.pool_max_per_type.is_none());
+        assert!(config.max_executions_before_recycle.is_none());
+        assert!(config.limits.is_none());
+    }
+
+    #[test]
+    fn sandbox_limits_config_default_is_none() {
+        let config = SandboxLimitsConfig::default();
+        assert!(config.max_execution_ms.is_none());
+        assert!(config.max_memory_mb.is_none());
+    }
+
+    #[test]
+    fn sandbox_file_config_builder() {
+        let config = SandboxFileConfig::new()
+            .with_pool_warmup(8)
+            .with_pool_max_per_type(64)
+            .with_max_executions_before_recycle(500);
+
+        assert_eq!(config.pool_warmup, Some(8));
+        assert_eq!(config.pool_max_per_type, Some(64));
+        assert_eq!(config.max_executions_before_recycle, Some(500));
+    }
+
+    #[test]
+    fn sandbox_limits_config_builder() {
+        let config = SandboxLimitsConfig::new()
+            .with_max_execution_ms(60000)
+            .with_max_memory_mb(128);
+
+        assert_eq!(config.max_execution_ms, Some(60000));
+        assert_eq!(config.max_memory_mb, Some(128));
+    }
+
+    #[test]
+    fn sandbox_file_config_to_pool_config_with_values() {
+        let config = SandboxFileConfig {
+            pool_warmup: Some(8),
+            pool_max_per_type: Some(64),
+            max_executions_before_recycle: Some(500),
+            limits: None,
+        };
+
+        let pool_config = config.to_pool_config();
+
+        assert_eq!(pool_config.warmup_count, 8);
+        assert_eq!(pool_config.max_per_type, 64);
+        assert_eq!(pool_config.max_executions_before_recycle, 500);
+    }
+
+    #[test]
+    fn sandbox_file_config_to_pool_config_with_defaults() {
+        let config = SandboxFileConfig::default();
+        let pool_config = config.to_pool_config();
+
+        // Should use PoolConfig defaults
+        assert_eq!(pool_config.warmup_count, DEFAULT_WARMUP_COUNT);
+        assert_eq!(pool_config.max_per_type, DEFAULT_MAX_PER_TYPE);
+        assert_eq!(
+            pool_config.max_executions_before_recycle,
+            DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE
+        );
+    }
+
+    #[test]
+    fn sandbox_file_config_to_pool_config_partial() {
+        let config = SandboxFileConfig {
+            pool_warmup: Some(16),
+            pool_max_per_type: None,
+            max_executions_before_recycle: None,
+            limits: None,
+        };
+
+        let pool_config = config.to_pool_config();
+
+        // Custom value
+        assert_eq!(pool_config.warmup_count, 16);
+        // Defaults
+        assert_eq!(pool_config.max_per_type, DEFAULT_MAX_PER_TYPE);
+        assert_eq!(
+            pool_config.max_executions_before_recycle,
+            DEFAULT_MAX_EXECUTIONS_BEFORE_RECYCLE
+        );
+    }
+
+    #[test]
+    fn sandbox_file_config_to_sandbox_config_with_limits() {
+        let config = SandboxFileConfig {
+            pool_warmup: Some(4),
+            pool_max_per_type: None,
+            max_executions_before_recycle: None,
+            limits: Some(SandboxLimitsConfig {
+                max_execution_ms: Some(60000),
+                max_memory_mb: Some(128),
+            }),
+        };
+
+        let sandbox_config = config.to_sandbox_config();
+
+        assert_eq!(sandbox_config.timeout, Duration::from_millis(60000));
+        assert_eq!(sandbox_config.memory_limit, 128 * 1024 * 1024);
+        assert_eq!(sandbox_config.pool_size, Some(4));
+    }
+
+    #[test]
+    fn sandbox_file_config_to_sandbox_config_with_defaults() {
+        let config = SandboxFileConfig::default();
+        let sandbox_config = config.to_sandbox_config();
+
+        // Should use SandboxConfig defaults
+        assert_eq!(sandbox_config.timeout, DEFAULT_TIMEOUT);
+        assert_eq!(sandbox_config.memory_limit, DEFAULT_MEMORY_LIMIT);
+    }
+
+    #[test]
+    fn config_from_toml_with_sandbox_section() {
+        let toml_str = r#"
+default_provider = "ollama"
+
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+
+[sandbox]
+pool_warmup = 8
+pool_max_per_type = 64
+max_executions_before_recycle = 500
+
+[sandbox.limits]
+max_execution_ms = 60000
+max_memory_mb = 128
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(config.sandbox.is_some());
+        let sandbox = config.sandbox.unwrap();
+        assert_eq!(sandbox.pool_warmup, Some(8));
+        assert_eq!(sandbox.pool_max_per_type, Some(64));
+        assert_eq!(sandbox.max_executions_before_recycle, Some(500));
+
+        let limits = sandbox.limits.unwrap();
+        assert_eq!(limits.max_execution_ms, Some(60000));
+        assert_eq!(limits.max_memory_mb, Some(128));
+    }
+
+    #[test]
+    fn config_from_toml_without_sandbox_section() {
+        let toml_str = r#"
+default_provider = "ollama"
+
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(config.sandbox.is_none());
+    }
+
+    #[test]
+    fn config_from_toml_with_partial_sandbox() {
+        let toml_str = r#"
+[sandbox]
+pool_warmup = 8
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(config.sandbox.is_some());
+        let sandbox = config.sandbox.unwrap();
+        assert_eq!(sandbox.pool_warmup, Some(8));
+        assert!(sandbox.pool_max_per_type.is_none());
+        assert!(sandbox.limits.is_none());
+    }
+
+    #[test]
+    fn config_from_toml_with_only_limits() {
+        let toml_str = r#"
+[sandbox.limits]
+max_execution_ms = 60000
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+
+        assert!(config.sandbox.is_some());
+        let sandbox = config.sandbox.unwrap();
+        assert!(sandbox.pool_warmup.is_none());
+
+        let limits = sandbox.limits.unwrap();
+        assert_eq!(limits.max_execution_ms, Some(60000));
+        assert!(limits.max_memory_mb.is_none());
+    }
+
+    #[test]
+    fn config_serialization_roundtrip_with_sandbox() {
+        let config = ActonAIConfig {
+            providers: HashMap::new(),
+            default_provider: None,
+            sandbox: Some(SandboxFileConfig {
+                pool_warmup: Some(8),
+                pool_max_per_type: Some(64),
+                max_executions_before_recycle: Some(500),
+                limits: Some(SandboxLimitsConfig {
+                    max_execution_ms: Some(60000),
+                    max_memory_mb: Some(128),
+                }),
+            }),
+        };
+
+        let toml_str = toml::to_string(&config).unwrap();
+        let deserialized: ActonAIConfig = toml::from_str(&toml_str).unwrap();
+
+        assert!(deserialized.sandbox.is_some());
+        let sandbox = deserialized.sandbox.unwrap();
+        assert_eq!(sandbox.pool_warmup, Some(8));
+        assert_eq!(sandbox.pool_max_per_type, Some(64));
+        assert_eq!(sandbox.max_executions_before_recycle, Some(500));
+
+        let limits = sandbox.limits.unwrap();
+        assert_eq!(limits.max_execution_ms, Some(60000));
+        assert_eq!(limits.max_memory_mb, Some(128));
+    }
+
+    #[test]
+    fn acton_ai_config_default_has_no_sandbox() {
+        let config = ActonAIConfig::default();
+        assert!(config.sandbox.is_none());
+    }
+
+    #[test]
+    fn sandbox_file_config_is_clone() {
+        let config = SandboxFileConfig::new().with_pool_warmup(8);
+        let cloned = config.clone();
+        assert_eq!(config.pool_warmup, cloned.pool_warmup);
+    }
+
+    #[test]
+    fn sandbox_limits_config_is_clone() {
+        let config = SandboxLimitsConfig::new().with_max_execution_ms(60000);
+        let cloned = config.clone();
+        assert_eq!(config.max_execution_ms, cloned.max_execution_ms);
     }
 }

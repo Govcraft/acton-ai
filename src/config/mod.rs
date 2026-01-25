@@ -1,7 +1,8 @@
 //! Configuration management for acton-ai.
 //!
 //! This module provides types and functions for loading and managing
-//! acton-ai configuration, including support for multiple named LLM providers.
+//! acton-ai configuration, including support for multiple named LLM providers
+//! and sandbox settings.
 //!
 //! # Configuration File Format
 //!
@@ -35,6 +36,16 @@
 //!
 //! # Which provider to use when none specified
 //! default_provider = "ollama"
+//!
+//! # Sandbox configuration (optional)
+//! [sandbox]
+//! pool_warmup = 4
+//! pool_max_per_type = 32
+//! max_executions_before_recycle = 1000
+//!
+//! [sandbox.limits]
+//! max_execution_ms = 30000
+//! max_memory_mb = 64
 //! ```
 //!
 //! # Usage
@@ -59,4 +70,7 @@ mod types;
 pub use file::{from_path, from_str, load, search_paths, xdg_config_dir};
 
 // Re-export types
-pub use types::{ActonAIConfig, NamedProviderConfig, RateLimitFileConfig};
+pub use types::{
+    ActonAIConfig, NamedProviderConfig, RateLimitFileConfig, SandboxFileConfig,
+    SandboxLimitsConfig,
+};

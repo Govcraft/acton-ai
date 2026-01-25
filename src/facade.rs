@@ -71,7 +71,7 @@
 //! }
 //! ```
 
-use crate::config::{self, ActonAIConfig};
+use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::kernel::{Kernel, KernelConfig};
@@ -79,6 +79,7 @@ use crate::llm::{LLMProvider, ProviderConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
+use crate::tools::sandbox::hyperlight::PoolConfig;
 use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -401,7 +402,16 @@ enum SandboxMode {
         /// Pool size (number of pre-warmed sandboxes)
         pool_size: usize,
         /// Configuration for each sandbox
-        config: SandboxConfig,
+        sandbox_config: SandboxConfig,
+        /// Configuration for the pool itself
+        pool_config: PoolConfig,
+    },
+    /// Use sandbox pool from file config
+    PoolFromConfig {
+        /// Sandbox configuration from file
+        sandbox_config: SandboxConfig,
+        /// Pool configuration from file
+        pool_config: PoolConfig,
     },
 }
 
@@ -587,7 +597,29 @@ impl ActonAIBuilder {
             self.default_provider_name = config.default_provider;
         }
 
+        // Apply sandbox configuration if present and no programmatic sandbox was set
+        if let Some(sandbox_config) = config.sandbox {
+            self = self.apply_sandbox_file_config(&sandbox_config);
+        }
+
         Ok(self)
+    }
+
+    /// Applies sandbox configuration from file to this builder.
+    ///
+    /// Only applies if no programmatic sandbox mode is already configured.
+    fn apply_sandbox_file_config(mut self, config: &SandboxFileConfig) -> Self {
+        // Only apply file config if no sandbox mode has been explicitly set
+        if matches!(self.sandbox_mode, SandboxMode::None) {
+            let sandbox_config = config.to_sandbox_config();
+            let pool_config = config.to_pool_config();
+
+            self.sandbox_mode = SandboxMode::PoolFromConfig {
+                sandbox_config,
+                pool_config,
+            };
+        }
+        self
     }
 
     // =========================================================================
@@ -914,7 +946,8 @@ impl ActonAIBuilder {
     pub fn with_sandbox_pool(mut self, pool_size: usize) -> Self {
         self.sandbox_mode = SandboxMode::Pool {
             pool_size,
-            config: SandboxConfig::default(),
+            sandbox_config: SandboxConfig::default(),
+            pool_config: PoolConfig::default(),
         };
         self
     }
@@ -937,8 +970,12 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn with_sandbox_pool_config(mut self, pool_size: usize, config: SandboxConfig) -> Self {
-        self.sandbox_mode = SandboxMode::Pool { pool_size, config };
+    pub fn with_sandbox_pool_config(mut self, pool_size: usize, sandbox_config: SandboxConfig) -> Self {
+        self.sandbox_mode = SandboxMode::Pool {
+            pool_size,
+            sandbox_config,
+            pool_config: PoolConfig::default(),
+        };
         self
     }
 
@@ -1011,11 +1048,14 @@ impl ActonAIBuilder {
                     let _factory = Arc::new(factory);
                     tracing::info!("Hyperlight sandbox factory initialized");
                 }
-                SandboxMode::Pool { pool_size, config } => {
-                    // Spawn the sandbox pool actor with default pool config
-                    let pool_config = crate::tools::sandbox::hyperlight::PoolConfig::default();
+                SandboxMode::Pool {
+                    pool_size,
+                    sandbox_config,
+                    pool_config,
+                } => {
+                    // Spawn the sandbox pool actor with provided configs
                     let pool_handle =
-                        SandboxPool::spawn(&mut runtime, config, pool_config).await;
+                        SandboxPool::spawn(&mut runtime, sandbox_config, pool_config).await;
 
                     // Warm up the pool for all guest types
                     pool_handle
@@ -1026,6 +1066,28 @@ impl ActonAIBuilder {
                         .await;
 
                     tracing::info!(pool_size, "Hyperlight sandbox pool initialized and warmed");
+                }
+                SandboxMode::PoolFromConfig {
+                    sandbox_config,
+                    pool_config,
+                } => {
+                    // Spawn the sandbox pool actor with config from file
+                    let warmup_count = pool_config.warmup_count;
+                    let pool_handle =
+                        SandboxPool::spawn(&mut runtime, sandbox_config, pool_config).await;
+
+                    // Warm up the pool for all guest types using warmup count from config
+                    pool_handle
+                        .send(WarmPool {
+                            count: warmup_count,
+                            guest_type: None,
+                        })
+                        .await;
+
+                    tracing::info!(
+                        warmup_count,
+                        "Hyperlight sandbox pool initialized from config and warmed"
+                    );
                 }
             }
         }

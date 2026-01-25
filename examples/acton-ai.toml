@@ -25,3 +25,21 @@ tokens_per_minute = 1000000
 # type = "openai"
 # model = "gpt-4o-mini"
 # api_key_env = "OPENAI_API_KEY"
+
+# Sandbox configuration (optional)
+# Uncomment to enable Hyperlight sandbox for tool execution isolation
+# Requires a hypervisor (KVM on Linux, Hyper-V on Windows)
+
+# [sandbox]
+# # Number of sandboxes to pre-warm per guest type (default: 4)
+# pool_warmup = 4
+# # Maximum sandboxes per guest type (default: 32)
+# pool_max_per_type = 32
+# # Max executions before recycling a sandbox (default: 1000)
+# max_executions_before_recycle = 1000
+#
+# [sandbox.limits]
+# # Maximum execution time in milliseconds (default: 30000)
+# max_execution_ms = 30000
+# # Maximum memory in MB (default: 64)
+# max_memory_mb = 64
