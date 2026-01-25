@@ -305,10 +305,12 @@ impl PathValidator {
         }
 
         // Get parent directory
-        let parent = path.parent().ok_or_else(|| PathValidationError::CanonicalizeError {
-            path: path.to_path_buf(),
-            reason: "path has no parent directory".to_string(),
-        })?;
+        let parent = path
+            .parent()
+            .ok_or_else(|| PathValidationError::CanonicalizeError {
+                path: path.to_path_buf(),
+                reason: "path has no parent directory".to_string(),
+            })?;
 
         // If parent exists, validate it
         if parent.exists() {
@@ -320,13 +322,12 @@ impl PathValidator {
             let mut ancestor = parent;
             while let Some(next_parent) = ancestor.parent() {
                 if next_parent.exists() {
-                    let canonical_ancestor =
-                        next_parent
-                            .canonicalize()
-                            .map_err(|e| PathValidationError::CanonicalizeError {
-                                path: next_parent.to_path_buf(),
-                                reason: e.to_string(),
-                            })?;
+                    let canonical_ancestor = next_parent.canonicalize().map_err(|e| {
+                        PathValidationError::CanonicalizeError {
+                            path: next_parent.to_path_buf(),
+                            reason: e.to_string(),
+                        }
+                    })?;
 
                     let allowed = self.allowed_roots.iter().any(|root| {
                         root.canonicalize()
@@ -396,9 +397,7 @@ mod tests {
     fn with_denied_pattern_adds_pattern() {
         let validator = PathValidator::new().with_denied_pattern("secrets");
 
-        assert!(validator
-            .denied_patterns()
-            .contains(&"secrets".to_string()));
+        assert!(validator.denied_patterns().contains(&"secrets".to_string()));
     }
 
     #[test]

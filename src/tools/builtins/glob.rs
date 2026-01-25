@@ -321,7 +321,10 @@ mod tests {
 
         assert!(result.is_err());
         // PathValidator returns "cannot resolve path" for non-existent directories
-        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot resolve path"));
     }
 
     #[test]

@@ -685,8 +685,7 @@ impl<'a> PromptBuilder<'a> {
             on_start.map(|f| Arc::new(std::sync::Mutex::new(f)));
         let on_token: Option<WrappedTokenCallback> =
             on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_end: Option<WrappedEndCallback> =
-            on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
         loop {
             rounds += 1;
@@ -864,7 +863,10 @@ async fn collect_stream_round(
     collector.mutate_on::<LLMStreamToolCall>(move |actor, envelope| {
         if envelope.message().correlation_id == expected_id {
             // State owned by actor - no external Mutex access during streaming
-            actor.model.tool_calls.push(envelope.message().tool_call.clone());
+            actor
+                .model
+                .tool_calls
+                .push(envelope.message().tool_call.clone());
         }
         Reply::ready()
     });

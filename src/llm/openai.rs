@@ -569,8 +569,10 @@ impl LLMClient for OpenAIClient {
                                                             (&acc.id, &acc.name)
                                                         {
                                                             let arguments: serde_json::Value =
-                                                                serde_json::from_str(&acc.arguments)
-                                                                    .unwrap_or(serde_json::json!({}));
+                                                                serde_json::from_str(
+                                                                    &acc.arguments,
+                                                                )
+                                                                .unwrap_or(serde_json::json!({}));
 
                                                             state.pending_events.push_back(Ok(
                                                                 LLMStreamEvent::ToolCall {

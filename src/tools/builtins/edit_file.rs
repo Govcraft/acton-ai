@@ -420,7 +420,10 @@ mod tests {
 
         assert!(result.is_err());
         // PathValidator returns "cannot resolve path" for non-existent files
-        assert!(result.unwrap_err().to_string().contains("cannot resolve path"));
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("cannot resolve path"));
     }
 
     #[tokio::test]
