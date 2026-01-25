@@ -79,6 +79,7 @@
 
 pub mod actor;
 pub mod builtins;
+pub mod compiler;
 pub mod definition;
 pub mod error;
 pub mod executor;
@@ -100,6 +101,12 @@ pub use registry::{
 };
 pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 pub use security::{PathValidationError, PathValidator};
+
+// Compiler module re-exports
+pub use compiler::{
+    CacheConfig, CacheStats, CodeHash, CodeTemplate, CompilationCache, CompilationError,
+    CompilationErrorKind, CompiledBinary, RustCompiler,
+};
 
 // Stub implementation is only available in tests (security concern in production)
 #[cfg(test)]
