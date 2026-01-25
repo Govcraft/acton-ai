@@ -373,15 +373,15 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
 /// ```rust,ignore
 /// use acton_ai::tools::builtins::spawn_skill_tool_actors;
 /// use acton_ai::skills::SkillRegistry;
-/// use std::sync::{Arc, RwLock};
+/// use std::sync::Arc;
 ///
-/// let registry = Arc::new(RwLock::new(SkillRegistry::new()));
+/// let registry = Arc::new(SkillRegistry::new());
 /// let skill_tools = spawn_skill_tool_actors(&mut runtime, registry).await;
 /// ```
 #[cfg(feature = "agent-skills")]
 pub async fn spawn_skill_tool_actors(
     runtime: &mut ActorRuntime,
-    registry: std::sync::Arc<std::sync::RwLock<crate::skills::SkillRegistry>>,
+    registry: std::sync::Arc<crate::skills::SkillRegistry>,
 ) -> Vec<(String, ActorHandle, ToolDefinition)> {
     let mut tools = Vec::new();
 

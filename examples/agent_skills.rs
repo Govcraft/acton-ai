@@ -43,7 +43,7 @@ mod skills_example {
     use colored::Colorize;
     use std::io::Write;
     use std::path::Path;
-    use std::sync::{Arc, RwLock};
+    use std::sync::Arc;
 
     /// Summarize a tool result for display.
     fn summarize_tool_result(
@@ -131,8 +131,8 @@ mod skills_example {
         let skills_path = Path::new("examples/skills");
         let registry = SkillRegistry::from_paths(&[skills_path]).await?;
 
-        // Wrap in Arc<RwLock<>> for thread-safe sharing with tool executors
-        let skill_registry = Arc::new(RwLock::new(registry));
+        // Wrap in Arc for thread-safe sharing with tool executors
+        let skill_registry = Arc::new(registry);
 
         // Get skill tool definitions (used when registering tools on the prompt)
         let list_skills_def = ListSkillsTool::config().definition;
@@ -145,28 +145,25 @@ mod skills_example {
         println!("{}", "Part 3: Available Skills".yellow().bold());
         println!();
 
-        {
-            let registry_guard = skill_registry.read().unwrap();
-            println!(
-                "{} {} skills loaded from {}",
-                "Skills:".white().bold(),
-                registry_guard.len().to_string().green().bold(),
-                skills_path.display().to_string().cyan()
-            );
+        println!(
+            "{} {} skills loaded from {}",
+            "Skills:".white().bold(),
+            skill_registry.len().to_string().green().bold(),
+            skills_path.display().to_string().cyan()
+        );
 
-            for skill_info in registry_guard.list() {
+        for skill_info in skill_registry.list() {
+            println!(
+                "  {} - {}",
+                skill_info.name.green().bold(),
+                skill_info.description.dimmed()
+            );
+            if !skill_info.tags.is_empty() {
                 println!(
-                    "  {} - {}",
-                    skill_info.name.green().bold(),
-                    skill_info.description.dimmed()
+                    "    {} {}",
+                    "Tags:".dimmed(),
+                    skill_info.tags.join(", ").cyan()
                 );
-                if !skill_info.tags.is_empty() {
-                    println!(
-                        "    {} {}",
-                        "Tags:".dimmed(),
-                        skill_info.tags.join(", ").cyan()
-                    );
-                }
             }
         }
         println!();
@@ -288,7 +285,7 @@ mod skills_example {
         );
         println!(
             "  {} - Thread-safe registry wrapper",
-            "Arc<RwLock<SkillRegistry>>".cyan()
+            "Arc<SkillRegistry>".cyan()
         );
         println!(
             "  {} - Register custom tools on prompts",

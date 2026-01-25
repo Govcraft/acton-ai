@@ -10,7 +10,7 @@ use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 
 /// List skills tool executor.
 ///
@@ -18,7 +18,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Debug)]
 pub struct ListSkillsTool {
     /// Reference to the skill registry
-    registry: Arc<RwLock<SkillRegistry>>,
+    registry: Arc<SkillRegistry>,
 }
 
 /// List skills tool actor state.
@@ -27,7 +27,7 @@ pub struct ListSkillsTool {
 #[acton_actor]
 pub struct ListSkillsToolActor {
     /// Reference to the skill registry
-    registry: Arc<RwLock<SkillRegistry>>,
+    registry: Arc<SkillRegistry>,
 }
 
 /// Arguments for the list_skills tool.
@@ -71,7 +71,7 @@ impl From<&SkillInfo> for SkillSummary {
 impl ListSkillsTool {
     /// Creates a new list skills tool with the given registry.
     #[must_use]
-    pub fn new(registry: Arc<RwLock<SkillRegistry>>) -> Self {
+    pub fn new(registry: Arc<SkillRegistry>) -> Self {
         Self { registry }
     }
 
@@ -103,14 +103,7 @@ impl ToolExecutorTrait for ListSkillsTool {
                 ToolError::validation_failed("list_skills", format!("invalid arguments: {e}"))
             })?;
 
-            let registry_guard = registry.read().map_err(|e| {
-                ToolError::execution_failed(
-                    "list_skills",
-                    format!("failed to acquire registry lock: {e}"),
-                )
-            })?;
-
-            let skills: Vec<SkillSummary> = registry_guard
+            let skills: Vec<SkillSummary> = registry
                 .list()
                 .iter()
                 .filter(|info| {
@@ -184,7 +177,7 @@ impl ListSkillsToolActor {
     /// This is the preferred way to spawn the list_skills tool actor.
     pub async fn spawn_with_registry(
         runtime: &mut ActorRuntime,
-        registry: Arc<RwLock<SkillRegistry>>,
+        registry: Arc<SkillRegistry>,
     ) -> ActorHandle {
         let mut builder = runtime.new_actor_with_name::<Self>("list_skills_tool".to_string());
 
@@ -223,7 +216,7 @@ mod tests {
     use super::*;
     use crate::skills::LoadedSkill;
 
-    fn create_test_registry() -> Arc<RwLock<SkillRegistry>> {
+    fn create_test_registry() -> Arc<SkillRegistry> {
         let mut registry = SkillRegistry::new();
 
         registry.add(LoadedSkill {
@@ -250,7 +243,7 @@ mod tests {
             enabled_by_default: false,
         });
 
-        Arc::new(RwLock::new(registry))
+        Arc::new(registry)
     }
 
     #[tokio::test]
