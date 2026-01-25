@@ -1,7 +1,7 @@
 //! Guest binary types for Hyperlight sandboxes.
 //!
 //! This module defines the types of guest binaries available for sandbox execution
-//! and provides access to the embedded binaries when the `hyperlight` feature is enabled.
+//! and provides access to the embedded binaries.
 
 use std::fmt;
 
@@ -57,9 +57,6 @@ impl GuestType {
 
     /// Returns the embedded binary for this guest type.
     ///
-    /// # Availability
-    ///
-    /// Only available when the `hyperlight` feature is enabled.
     /// Returns placeholder bytes until build.rs properly compiles
     /// and embeds the guest binaries.
     ///
@@ -71,7 +68,6 @@ impl GuestType {
     /// let binary = GuestType::Shell.binary();
     /// assert!(!binary.is_empty());
     /// ```
-    #[cfg(feature = "hyperlight")]
     #[must_use]
     pub fn binary(&self) -> &'static [u8] {
         match self {
@@ -105,7 +101,6 @@ impl fmt::Display for GuestType {
 ///
 /// Holds references to the compiled guest binaries that are
 /// included in the host binary at compile time.
-#[cfg(feature = "hyperlight")]
 pub struct GuestBinaries {
     /// Shell execution guest binary.
     pub shell: &'static [u8],
@@ -127,7 +122,6 @@ pub struct GuestBinaries {
 ///     http: include_bytes!("../../../guests/target/x86_64-unknown-none/release/http_guest"),
 /// };
 /// ```
-#[cfg(feature = "hyperlight")]
 pub static GUEST_BINARIES: GuestBinaries = GuestBinaries {
     shell: b"PLACEHOLDER:shell_guest_binary_not_yet_compiled",
     http: b"PLACEHOLDER:http_guest_binary_not_yet_compiled",
@@ -203,7 +197,6 @@ mod tests {
         assert!(format!("{:?}", GuestType::Http).contains("Http"));
     }
 
-    #[cfg(feature = "hyperlight")]
     #[test]
     fn guest_binaries_not_empty() {
         // Placeholder bytes should exist
@@ -211,7 +204,6 @@ mod tests {
         assert!(!GUEST_BINARIES.http.is_empty());
     }
 
-    #[cfg(feature = "hyperlight")]
     #[test]
     fn guest_type_binary() {
         // Placeholder bytes should be returned

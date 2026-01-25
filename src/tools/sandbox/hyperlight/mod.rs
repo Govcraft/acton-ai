@@ -14,7 +14,6 @@
 //! ## Requirements
 //!
 //! - Linux with KVM or Windows with Hyper-V
-//! - The `hyperlight` feature enabled in Cargo.toml
 //!
 //! ## Usage
 //!
@@ -69,9 +68,7 @@ pub use config::{
 };
 pub use error::SandboxErrorKind;
 pub use factory::HyperlightSandboxFactory;
-pub use guest::GuestType;
-#[cfg(feature = "hyperlight")]
-pub use guest::{GuestBinaries, GUEST_BINARIES};
+pub use guest::{GuestBinaries, GuestType, GUEST_BINARIES};
 pub use pool::{
     AcquireSandbox, GetPoolMetrics, InitPool, InternalReleaseSandbox, PoolMetrics,
     PoolMetricsResponse, PooledSandbox, ReleaseSandbox, SandboxPool, WarmPool,

@@ -185,13 +185,14 @@ mod tests {
     #[ignore = "requires hypervisor"]
     fn new_with_valid_config_and_hypervisor() {
         let config = SandboxConfig::default();
+        let expected_memory_limit = config.memory_limit;
         let result = SandboxProvider::new(config);
 
         // Only runs if hypervisor is available
         if hyperlight_host::is_hypervisor_present() {
             assert!(result.is_ok());
             let provider = result.unwrap();
-            assert_eq!(provider.config().memory_limit, config.memory_limit);
+            assert_eq!(provider.config().memory_limit, expected_memory_limit);
         }
     }
 }

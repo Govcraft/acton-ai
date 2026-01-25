@@ -1,13 +1,12 @@
 //! Example: Bash Tool with Hyperlight Sandbox
 //!
-//! This example demonstrates how to use the built-in bash tool with optional
+//! This example demonstrates how to use the built-in bash tool with
 //! Hyperlight micro-VM sandboxing for hardware-isolated command execution.
 //!
 //! # Features
 //!
-//! - **Without `hyperlight` feature**: Bash commands execute directly on the host
-//! - **With `hyperlight` feature**: Bash commands execute inside a Hyperlight
-//!   micro-VM with hardware isolation (requires KVM on Linux, Hyper-V on Windows)
+//! - Bash commands execute inside a Hyperlight micro-VM with hardware isolation
+//! - Requires KVM on Linux or Hyper-V on Windows
 //!
 //! # Configuration
 //!
@@ -25,14 +24,8 @@
 //!
 //! # Usage
 //!
-//! Run without sandbox (direct execution):
 //! ```bash
 //! cargo run --example bash_sandbox
-//! ```
-//!
-//! Run with Hyperlight sandbox (requires hypervisor):
-//! ```bash
-//! cargo run --example bash_sandbox --features hyperlight
 //! ```
 
 use acton_ai::prelude::*;
@@ -49,15 +42,9 @@ async fn main() -> anyhow::Result<()> {
         .from_config()?
         .with_builtin_tools(&["bash"]); // Enable only the bash tool
 
-    // Configure sandbox based on feature flag
-    #[cfg(feature = "hyperlight")]
-    let builder = {
-        eprintln!("Hyperlight sandbox ENABLED - commands execute in micro-VM");
-        builder.with_hyperlight_sandbox()
-    };
-
-    #[cfg(not(feature = "hyperlight"))]
-    eprintln!("Hyperlight sandbox DISABLED - commands execute directly on host");
+    // Configure Hyperlight sandbox for command execution
+    eprintln!("Hyperlight sandbox ENABLED - commands execute in micro-VM");
+    let builder = builder.with_hyperlight_sandbox();
 
     let runtime = builder.launch().await?;
 

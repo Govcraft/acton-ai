@@ -79,12 +79,10 @@ use crate::llm::{LLMProvider, ProviderConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
-#[cfg(feature = "hyperlight")]
 use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
-#[cfg(feature = "hyperlight")]
 use std::sync::Arc;
 
 /// The default provider name used when registering single providers.
@@ -391,7 +389,6 @@ enum BuiltinToolsConfig {
 }
 
 /// Configuration for sandbox execution.
-#[cfg(feature = "hyperlight")]
 #[derive(Default, Clone)]
 enum SandboxMode {
     /// No sandbox (default)
@@ -450,7 +447,6 @@ pub struct ActonAIBuilder {
     default_provider_name: Option<String>,
     builtins: BuiltinToolsConfig,
     auto_builtins: bool,
-    #[cfg(feature = "hyperlight")]
     sandbox_mode: SandboxMode,
 }
 
@@ -867,7 +863,6 @@ impl ActonAIBuilder {
     ///     .launch()
     ///     .await?;
     /// ```
-    #[cfg(feature = "hyperlight")]
     #[must_use]
     pub fn with_hyperlight_sandbox(mut self) -> Self {
         self.sandbox_mode = SandboxMode::Hyperlight(SandboxConfig::default());
@@ -893,7 +888,6 @@ impl ActonAIBuilder {
     ///     .launch()
     ///     .await?;
     /// ```
-    #[cfg(feature = "hyperlight")]
     #[must_use]
     pub fn with_hyperlight_sandbox_config(mut self, config: SandboxConfig) -> Self {
         self.sandbox_mode = SandboxMode::Hyperlight(config);
@@ -916,7 +910,6 @@ impl ActonAIBuilder {
     ///     .launch()
     ///     .await?;
     /// ```
-    #[cfg(feature = "hyperlight")]
     #[must_use]
     pub fn with_sandbox_pool(mut self, pool_size: usize) -> Self {
         self.sandbox_mode = SandboxMode::Pool {
@@ -943,7 +936,6 @@ impl ActonAIBuilder {
     ///     .launch()
     ///     .await?;
     /// ```
-    #[cfg(feature = "hyperlight")]
     #[must_use]
     pub fn with_sandbox_pool_config(mut self, pool_size: usize, config: SandboxConfig) -> Self {
         self.sandbox_mode = SandboxMode::Pool { pool_size, config };
@@ -1000,7 +992,6 @@ impl ActonAIBuilder {
         }
 
         // Initialize sandbox if configured
-        #[cfg(feature = "hyperlight")]
         {
             use crate::tools::sandbox::hyperlight::WarmPool;
 

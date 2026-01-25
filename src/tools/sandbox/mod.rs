@@ -12,7 +12,6 @@
 //! ## Implementations
 //!
 //! - **HyperlightSandbox**: Production implementation using Hyperlight micro-VMs
-//!   (requires the `hyperlight` feature)
 //! - **StubSandbox**: Test-only placeholder that does NOT sandbox code
 //!
 //! ## Usage
@@ -30,17 +29,12 @@
 //! // Warm up and use pool
 //! pool_handle.send(WarmPool { count: 4 }).await;
 //! ```
-//!
-//! ## Feature Flags
-//!
-//! - `hyperlight`: Enables the Hyperlight micro-VM sandbox implementation
 
 // Stub implementation is only available in tests (security concern in production)
 #[cfg(test)]
 mod stub;
 mod traits;
 
-#[cfg(feature = "hyperlight")]
 pub mod hyperlight;
 
 // Re-export traits
@@ -50,8 +44,7 @@ pub use traits::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactory
 #[cfg(test)]
 pub use stub::{StubSandbox, StubSandboxFactory};
 
-// Re-export Hyperlight implementation when feature is enabled
-#[cfg(feature = "hyperlight")]
+// Re-export Hyperlight implementation
 pub use hyperlight::{
     AcquireSandbox, GetPoolMetrics, GuestBinaries, GuestBinarySource, GuestType, HyperlightSandbox,
     HyperlightSandboxFactory, InitPool, InternalReleaseSandbox, PoolMetrics, PoolMetricsResponse,
