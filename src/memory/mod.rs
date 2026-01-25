@@ -108,6 +108,5 @@ pub use store::{
     SaveAgentState,
     SaveMessage,
     SearchMemories,
-    SharedConnection,
     StoreMemory,
 };

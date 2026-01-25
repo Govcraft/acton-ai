@@ -11,8 +11,6 @@ use crate::messages::Message;
 use crate::types::{AgentId, ConversationId, MemoryId, MessageId};
 use acton_reactive::prelude::*;
 use libsql::{Connection, Database};
-use std::sync::Arc;
-use tokio::sync::Mutex;
 
 // =============================================================================
 // Messages
@@ -199,6 +197,13 @@ pub struct DeleteAgentMemories {
     pub agent_id: AgentId,
 }
 
+/// Internal message to set the database connection after async initialization.
+#[acton_message]
+struct SetConnection {
+    /// The initialized database connection
+    conn: Connection,
+}
+
 /// Request optimized context window.
 #[acton_message]
 pub struct GetContextWindow {
@@ -253,48 +258,6 @@ pub struct MemoryStoreMetrics {
 }
 
 // =============================================================================
-// Shared Connection
-// =============================================================================
-
-/// Thread-safe shared connection wrapper.
-#[derive(Clone, Default)]
-pub struct SharedConnection(Arc<Mutex<Option<Connection>>>);
-
-impl std::fmt::Debug for SharedConnection {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SharedConnection")
-            .field("initialized", &"<check async>")
-            .finish()
-    }
-}
-
-impl SharedConnection {
-    /// Creates a new shared connection wrapper.
-    #[must_use]
-    pub fn new() -> Self {
-        Self(Arc::new(Mutex::new(None)))
-    }
-
-    /// Sets the connection.
-    pub async fn set(&self, conn: Connection) {
-        let mut guard = self.0.lock().await;
-        *guard = Some(conn);
-    }
-
-    /// Gets a clone of the connection if initialized.
-    pub async fn get(&self) -> Option<Connection> {
-        let guard = self.0.lock().await;
-        guard.clone()
-    }
-
-    /// Returns true if the connection has been initialized.
-    pub async fn is_initialized(&self) -> bool {
-        let guard = self.0.lock().await;
-        guard.is_some()
-    }
-}
-
-// =============================================================================
 // Actor
 // =============================================================================
 
@@ -305,8 +268,8 @@ pub struct MemoryStore {
     pub config: Option<PersistenceConfig>,
     /// Database handle (initialized after start)
     pub database: Option<Database>,
-    /// Shared connection for async operations
-    pub shared_connection: SharedConnection,
+    /// Database connection (initialized after start)
+    pub connection: Option<Connection>,
     /// Whether the store is shutting down
     pub shutting_down: bool,
     /// Metrics
@@ -363,9 +326,16 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
 
 /// Configures the initialization handler.
 fn configure_init_handler(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    // Handle SetConnection (internal message for async init completion)
+    builder.mutate_on::<SetConnection>(|actor, envelope| {
+        actor.model.connection = Some(envelope.message().conn.clone());
+        tracing::info!("Memory Store connection established");
+        Reply::ready()
+    });
+
     builder.mutate_on::<InitMemoryStore>(|actor, envelope| {
         let config = envelope.message().config.clone();
-        let shared_conn = actor.model.shared_connection.clone();
+        let actor_handle = actor.handle().clone();
         actor.model.config = Some(config.clone());
 
         // Spawn a tokio task to do the async database work
@@ -373,7 +343,8 @@ fn configure_init_handler(builder: &mut ManagedActor<Idle, MemoryStore>) {
         let handle = tokio::spawn(async move {
             match initialize_database(&config).await {
                 Ok((_db, conn)) => {
-                    shared_conn.set(conn).await;
+                    // Send connection back to actor via message
+                    actor_handle.send(SetConnection { conn }).await;
                     tracing::info!(db_path = %config.db_path, "Memory Store initialized with database");
                 }
                 Err(e) => {
@@ -409,13 +380,13 @@ fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let agent_id = envelope.message().agent_id.clone();
         let reply = envelope.reply_envelope();
         actor.model.metrics.conversations_created += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -442,13 +413,13 @@ fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let conversation_id = envelope.message().conversation_id.clone();
         let reply = envelope.reply_envelope();
         actor.model.metrics.conversations_loaded += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -480,12 +451,12 @@ fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let agent_id = envelope.message().agent_id.clone();
         let reply = envelope.reply_envelope();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -514,11 +485,11 @@ fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let conversation_id = envelope.message().conversation_id.clone();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -540,12 +511,12 @@ fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let agent_id = envelope.message().agent_id.clone();
         let reply = envelope.reply_envelope();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -574,7 +545,7 @@ fn configure_message_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let msg = envelope.message();
         let conversation_id = msg.conversation_id.clone();
         let message = msg.message.clone();
@@ -582,7 +553,7 @@ fn configure_message_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
         actor.model.metrics.messages_saved += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -612,12 +583,12 @@ fn configure_state_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let snapshot = envelope.message().snapshot.clone();
         actor.model.metrics.state_saves += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -639,13 +610,13 @@ fn configure_state_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let agent_id = envelope.message().agent_id.clone();
         let reply = envelope.reply_envelope();
         actor.model.metrics.state_loads += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -675,7 +646,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let content = msg.content.clone();
@@ -684,7 +655,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
         actor.model.metrics.memories_stored += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -716,7 +687,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let query_embedding = msg.query_embedding.clone();
@@ -726,7 +697,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
         actor.model.metrics.memory_searches += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -761,14 +732,14 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let limit = msg.limit;
         let reply = envelope.reply_envelope();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -795,11 +766,11 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let memory_id = envelope.message().memory_id.clone();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -821,11 +792,11 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let agent_id = envelope.message().agent_id.clone();
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -847,7 +818,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             return Reply::ready();
         }
 
-        let shared_conn = actor.model.shared_connection.clone();
+        let conn = actor.model.connection.clone();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let system_prompt = msg.system_prompt.clone();
@@ -859,7 +830,7 @@ fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
         actor.model.metrics.context_windows_built += 1;
 
         let handle = tokio::spawn(async move {
-            let Some(conn) = shared_conn.get().await else {
+            let Some(conn) = conn else {
                 tracing::error!("Memory Store not initialized");
                 return;
             };
@@ -922,11 +893,5 @@ mod tests {
         assert_eq!(metrics.conversations_loaded, 0);
         assert_eq!(metrics.state_saves, 0);
         assert_eq!(metrics.state_loads, 0);
-    }
-
-    #[tokio::test]
-    async fn shared_connection_initialization() {
-        let shared = SharedConnection::new();
-        assert!(!shared.is_initialized().await);
     }
 }
