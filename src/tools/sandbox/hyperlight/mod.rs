@@ -59,6 +59,7 @@ mod config;
 mod error;
 mod factory;
 mod pool;
+mod provider;
 mod sandbox;
 
 // Re-export all public types
@@ -66,9 +67,14 @@ pub use config::{
     GuestBinarySource, SandboxConfig, DEFAULT_MEMORY_LIMIT, DEFAULT_POOL_SIZE, DEFAULT_TIMEOUT,
 };
 pub use error::SandboxErrorKind;
-pub use factory::{AutoSandboxFactory, HyperlightSandboxFactory};
+pub use factory::HyperlightSandboxFactory;
 pub use pool::{
     AcquireSandbox, GetPoolMetrics, InitPool, InternalReleaseSandbox, PoolMetrics,
     PoolMetricsResponse, PooledSandbox, ReleaseSandbox, SandboxPool, WarmPool,
 };
+pub use provider::SandboxProvider;
 pub use sandbox::HyperlightSandbox;
+
+// AutoSandboxFactory is only available in tests (it silently falls back to stub)
+#[cfg(test)]
+pub use factory::AutoSandboxFactory;

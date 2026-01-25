@@ -1,7 +1,7 @@
 //! Sandbox trait and implementations.
 //!
 //! Defines the interface for sandboxed code execution and provides
-//! implementations for both development (stub) and production (Hyperlight).
+//! implementations for production (Hyperlight).
 //!
 //! ## Overview
 //!
@@ -11,29 +11,32 @@
 //!
 //! ## Implementations
 //!
-//! - **StubSandbox**: Development placeholder that does NOT sandbox code
 //! - **HyperlightSandbox**: Production implementation using Hyperlight micro-VMs
 //!   (requires the `hyperlight` feature)
+//! - **StubSandbox**: Test-only placeholder that does NOT sandbox code
 //!
 //! ## Usage
 //!
 //! ```rust,ignore
-//! use acton_ai::tools::sandbox::{SandboxFactory, StubSandboxFactory};
+//! use acton_ai::tools::sandbox::hyperlight::{SandboxProvider, SandboxConfig, WarmPool};
+//! use acton_reactive::prelude::*;
 //!
-//! // Create a factory (use HyperlightSandboxFactory in production)
-//! let factory = StubSandboxFactory::new();
+//! // Create provider - fails explicitly if platform unsupported
+//! let provider = SandboxProvider::new(SandboxConfig::default())?;
 //!
-//! // Create a sandbox instance
-//! let sandbox = factory.create().await?;
+//! // Spawn the pool actor
+//! let pool_handle = provider.spawn(&mut runtime).await;
 //!
-//! // Execute code in the sandbox
-//! let result = sandbox.execute("echo hello", serde_json::json!({})).await?;
+//! // Warm up and use pool
+//! pool_handle.send(WarmPool { count: 4 }).await;
 //! ```
 //!
 //! ## Feature Flags
 //!
 //! - `hyperlight`: Enables the Hyperlight micro-VM sandbox implementation
 
+// Stub implementation is only available in tests (security concern in production)
+#[cfg(test)]
 mod stub;
 mod traits;
 
@@ -43,13 +46,15 @@ pub mod hyperlight;
 // Re-export traits
 pub use traits::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 
-// Re-export stub implementation
+// Stub implementation is only available in tests
+#[cfg(test)]
 pub use stub::{StubSandbox, StubSandboxFactory};
 
 // Re-export Hyperlight implementation when feature is enabled
 #[cfg(feature = "hyperlight")]
 pub use hyperlight::{
-    AcquireSandbox, AutoSandboxFactory, GetPoolMetrics, GuestBinarySource, HyperlightSandbox,
+    AcquireSandbox, GetPoolMetrics, GuestBinarySource, HyperlightSandbox,
     HyperlightSandboxFactory, InitPool, InternalReleaseSandbox, PoolMetrics, PoolMetricsResponse,
-    PooledSandbox, ReleaseSandbox, SandboxConfig, SandboxErrorKind, SandboxPool, WarmPool,
+    PooledSandbox, ReleaseSandbox, SandboxConfig, SandboxErrorKind, SandboxPool, SandboxProvider,
+    WarmPool,
 };

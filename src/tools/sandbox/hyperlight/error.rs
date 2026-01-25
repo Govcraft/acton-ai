@@ -77,6 +77,16 @@ pub enum SandboxErrorKind {
         /// Why it's invalid
         reason: String,
     },
+
+    /// Architecture not supported by Hyperlight.
+    ///
+    /// Hyperlight requires x86_64 architecture with hardware virtualization support.
+    ArchitectureNotSupported {
+        /// The current architecture (e.g., "aarch64", "arm")
+        arch: String,
+        /// Reason for incompatibility
+        reason: String,
+    },
 }
 
 impl SandboxErrorKind {
@@ -135,6 +145,13 @@ impl fmt::Display for SandboxErrorKind {
                     f,
                     "invalid sandbox configuration for '{}': {}",
                     field, reason
+                )
+            }
+            Self::ArchitectureNotSupported { arch, reason } => {
+                write!(
+                    f,
+                    "architecture '{}' not supported: {}; Hyperlight requires x86_64",
+                    arch, reason
                 )
             }
         }
@@ -231,6 +248,28 @@ mod tests {
     #[test]
     fn converts_to_tool_error() {
         let err = SandboxErrorKind::HypervisorNotAvailable;
+        let tool_err: ToolError = err.into();
+        assert!(tool_err.to_string().contains("sandbox error"));
+    }
+
+    #[test]
+    fn architecture_not_supported_display() {
+        let err = SandboxErrorKind::ArchitectureNotSupported {
+            arch: "aarch64".to_string(),
+            reason: "Hyperlight requires x86_64 with hardware virtualization".to_string(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("aarch64"));
+        assert!(msg.contains("x86_64"));
+        assert!(msg.contains("not supported"));
+    }
+
+    #[test]
+    fn architecture_not_supported_converts_to_tool_error() {
+        let err = SandboxErrorKind::ArchitectureNotSupported {
+            arch: "arm".to_string(),
+            reason: "test".to_string(),
+        };
         let tool_err: ToolError = err.into();
         assert!(tool_err.to_string().contains("sandbox error"));
     }

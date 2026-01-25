@@ -97,7 +97,8 @@ pub use registry::{
     ConfigureSandbox, InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics,
     ToolListResponse, ToolRegistry, UnregisterTool,
 };
-pub use sandbox::{
-    Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture, StubSandbox,
-    StubSandboxFactory,
-};
+pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
+
+// Stub implementation is only available in tests (security concern in production)
+#[cfg(test)]
+pub use sandbox::{StubSandbox, StubSandboxFactory};

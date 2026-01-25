@@ -5,7 +5,6 @@
 use super::config::SandboxConfig;
 use super::error::SandboxErrorKind;
 use super::sandbox::HyperlightSandbox;
-use crate::tools::sandbox::stub::StubSandboxFactory;
 use crate::tools::sandbox::traits::{Sandbox, SandboxFactory, SandboxFactoryFuture};
 
 /// Factory for creating Hyperlight sandbox instances.
@@ -131,108 +130,124 @@ impl SandboxFactory for HyperlightSandboxFactory {
     }
 }
 
-/// Wrapper that automatically uses Hyperlight when available, stub otherwise.
-///
-/// This is useful for applications that want to use sandboxing when possible
-/// but still function on systems without hypervisor support.
-///
-/// # Example
-///
-/// ```rust,ignore
-/// use acton_ai::tools::sandbox::AutoSandboxFactory;
-///
-/// let factory = AutoSandboxFactory::new();
-///
-/// // Will use Hyperlight if available, stub otherwise
-/// let sandbox = factory.create().await?;
-/// ```
-#[derive(Debug, Clone)]
-pub struct AutoSandboxFactory {
-    /// Inner factory (either Hyperlight or Stub)
-    inner: AutoSandboxInner,
-}
+// AutoSandboxFactory is gated to test builds only because it silently falls back
+// to StubSandbox, which is a security concern in production. Use SandboxProvider
+// for production code, which returns explicit errors when platform requirements
+// are not met.
+#[cfg(test)]
+mod auto_factory {
+    use super::*;
+    use crate::tools::sandbox::stub::StubSandboxFactory;
 
-#[derive(Debug, Clone)]
-enum AutoSandboxInner {
-    Hyperlight(HyperlightSandboxFactory),
-    Stub(StubSandboxFactory),
-}
-
-impl Default for AutoSandboxFactory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl AutoSandboxFactory {
-    /// Creates a new auto-selecting factory.
+    /// Wrapper that automatically uses Hyperlight when available, stub otherwise.
     ///
-    /// Uses Hyperlight if a hypervisor is available and sandboxes can be
-    /// created successfully, otherwise uses the stub implementation.
-    #[must_use]
-    pub fn new() -> Self {
-        Self::with_config(SandboxConfig::default())
+    /// # Warning
+    ///
+    /// This type is only available in test builds. It silently falls back to
+    /// `StubSandbox` when Hyperlight is not available, which is a security
+    /// concern for production code. Use `SandboxProvider` instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::tools::sandbox::AutoSandboxFactory;
+    ///
+    /// let factory = AutoSandboxFactory::new();
+    ///
+    /// // Will use Hyperlight if available, stub otherwise
+    /// let sandbox = factory.create().await?;
+    /// ```
+    #[derive(Debug, Clone)]
+    pub struct AutoSandboxFactory {
+        /// Inner factory (either Hyperlight or Stub)
+        inner: AutoSandboxInner,
     }
 
-    /// Creates a new auto-selecting factory with custom configuration.
-    ///
-    /// Uses Hyperlight if a hypervisor is available, config is valid, and
-    /// sandboxes can be successfully created, otherwise falls back to the
-    /// stub implementation.
-    #[must_use]
-    pub fn with_config(config: SandboxConfig) -> Self {
-        // Try creating a Hyperlight factory
-        let hyperlight_factory = HyperlightSandboxFactory::with_config(config.clone()).ok();
+    #[derive(Debug, Clone)]
+    enum AutoSandboxInner {
+        Hyperlight(HyperlightSandboxFactory),
+        Stub(StubSandboxFactory),
+    }
 
-        // If we got a factory, verify we can actually create sandboxes
-        let inner = if let Some(factory) = hyperlight_factory {
-            // Try to create a sandbox to verify the full stack works
-            match HyperlightSandbox::new(config) {
-                Ok(_sandbox) => {
-                    // Success! Use Hyperlight
-                    tracing::info!("AutoSandboxFactory: Using Hyperlight sandboxing");
-                    AutoSandboxInner::Hyperlight(factory)
+    impl Default for AutoSandboxFactory {
+        fn default() -> Self {
+            Self::new()
+        }
+    }
+
+    impl AutoSandboxFactory {
+        /// Creates a new auto-selecting factory.
+        ///
+        /// Uses Hyperlight if a hypervisor is available and sandboxes can be
+        /// created successfully, otherwise uses the stub implementation.
+        #[must_use]
+        pub fn new() -> Self {
+            Self::with_config(SandboxConfig::default())
+        }
+
+        /// Creates a new auto-selecting factory with custom configuration.
+        ///
+        /// Uses Hyperlight if a hypervisor is available, config is valid, and
+        /// sandboxes can be successfully created, otherwise falls back to the
+        /// stub implementation.
+        #[must_use]
+        pub fn with_config(config: SandboxConfig) -> Self {
+            // Try creating a Hyperlight factory
+            let hyperlight_factory = HyperlightSandboxFactory::with_config(config.clone()).ok();
+
+            // If we got a factory, verify we can actually create sandboxes
+            let inner = if let Some(factory) = hyperlight_factory {
+                // Try to create a sandbox to verify the full stack works
+                match HyperlightSandbox::new(config) {
+                    Ok(_sandbox) => {
+                        // Success! Use Hyperlight
+                        tracing::info!("AutoSandboxFactory: Using Hyperlight sandboxing");
+                        AutoSandboxInner::Hyperlight(factory)
+                    }
+                    Err(e) => {
+                        // Sandbox creation failed (e.g., missing guest binary)
+                        tracing::warn!(
+                            error = %e,
+                            "AutoSandboxFactory: Hyperlight sandbox creation failed, falling back to stub"
+                        );
+                        AutoSandboxInner::Stub(StubSandboxFactory::new())
+                    }
                 }
-                Err(e) => {
-                    // Sandbox creation failed (e.g., missing guest binary)
-                    tracing::warn!(
-                        error = %e,
-                        "AutoSandboxFactory: Hyperlight sandbox creation failed, falling back to stub"
-                    );
-                    AutoSandboxInner::Stub(StubSandboxFactory::new())
-                }
+            } else {
+                // No hypervisor or invalid config
+                tracing::info!("AutoSandboxFactory: No hypervisor available, using stub");
+                AutoSandboxInner::Stub(StubSandboxFactory::new())
+            };
+
+            Self { inner }
+        }
+
+        /// Returns whether Hyperlight sandboxing is being used.
+        #[must_use]
+        pub fn is_using_hyperlight(&self) -> bool {
+            matches!(self.inner, AutoSandboxInner::Hyperlight(_))
+        }
+    }
+
+    impl SandboxFactory for AutoSandboxFactory {
+        fn create(&self) -> SandboxFactoryFuture {
+            match &self.inner {
+                AutoSandboxInner::Hyperlight(factory) => factory.create(),
+                AutoSandboxInner::Stub(factory) => factory.create(),
             }
-        } else {
-            // No hypervisor or invalid config
-            tracing::info!("AutoSandboxFactory: No hypervisor available, using stub");
-            AutoSandboxInner::Stub(StubSandboxFactory::new())
-        };
-
-        Self { inner }
-    }
-
-    /// Returns whether Hyperlight sandboxing is being used.
-    #[must_use]
-    pub fn is_using_hyperlight(&self) -> bool {
-        matches!(self.inner, AutoSandboxInner::Hyperlight(_))
-    }
-}
-
-impl SandboxFactory for AutoSandboxFactory {
-    fn create(&self) -> SandboxFactoryFuture {
-        match &self.inner {
-            AutoSandboxInner::Hyperlight(factory) => factory.create(),
-            AutoSandboxInner::Stub(factory) => factory.create(),
         }
-    }
 
-    fn is_available(&self) -> bool {
-        match &self.inner {
-            AutoSandboxInner::Hyperlight(factory) => factory.is_available(),
-            AutoSandboxInner::Stub(factory) => factory.is_available(),
+        fn is_available(&self) -> bool {
+            match &self.inner {
+                AutoSandboxInner::Hyperlight(factory) => factory.is_available(),
+                AutoSandboxInner::Stub(factory) => factory.is_available(),
+            }
         }
     }
 }
+
+#[cfg(test)]
+pub use auto_factory::AutoSandboxFactory;
 
 #[cfg(test)]
 mod tests {
