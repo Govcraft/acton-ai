@@ -465,6 +465,8 @@ impl LLMClient for OpenAIClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
     ) -> Result<LLMEventStream, LLMError> {
+        use std::collections::{HashMap, VecDeque};
+
         let api_messages = self.convert_messages(messages);
 
         let request_body = ChatCompletionRequest {
@@ -488,115 +490,137 @@ impl LLMClient for OpenAIClient {
 
         let stream = response.bytes_stream();
 
-        // State for accumulating tool calls across chunks
-        // Using std::sync::Mutex because flat_map closure is synchronous
-        let tool_call_accumulators: std::sync::Arc<
-            std::sync::Mutex<std::collections::HashMap<usize, ToolCallAccumulator>>,
-        > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        // State carried through the unfold iteration.
+        // This eliminates the need for Arc<Mutex<>> by owning state directly.
+        struct StreamState<S> {
+            stream: S,
+            tool_accumulators: HashMap<usize, ToolCallAccumulator>,
+            pending_events: VecDeque<Result<LLMStreamEvent, LLMError>>,
+        }
 
-        let event_stream = stream.flat_map(move |result| {
-            let tool_call_accumulators = tool_call_accumulators.clone();
+        let event_stream = futures::stream::unfold(
+            StreamState {
+                stream,
+                tool_accumulators: HashMap::new(),
+                pending_events: VecDeque::new(),
+            },
+            |mut state| async move {
+                loop {
+                    // Return any pending events first
+                    if let Some(event) = state.pending_events.pop_front() {
+                        return Some((event, state));
+                    }
 
-            let events: Vec<Result<LLMStreamEvent, LLMError>> = match result {
-                Ok(bytes) => {
-                    let text = String::from_utf8_lossy(&bytes);
-                    let mut events = Vec::new();
-                    let mut first_id = None;
+                    // Get next chunk from stream
+                    let result = state.stream.next().await?;
 
-                    for line in text.lines() {
-                        if let Some(chunk_result) = Self::parse_sse_line(line) {
-                            match chunk_result {
-                                Ok(chunk) => {
-                                    // Capture first ID for Start event
-                                    if first_id.is_none() && !chunk.id.is_empty() {
-                                        first_id = Some(chunk.id.clone());
-                                    }
+                    match result {
+                        Ok(bytes) => {
+                            let text = String::from_utf8_lossy(&bytes);
+                            let mut first_id = None;
 
-                                    for choice in chunk.choices {
-                                        // Handle content delta
-                                        if let Some(content) = choice.delta.content {
-                                            if !content.is_empty() {
-                                                events.push(Ok(LLMStreamEvent::Token {
-                                                    text: content,
-                                                }));
+                            for line in text.lines() {
+                                if let Some(chunk_result) = OpenAIClient::parse_sse_line(line) {
+                                    match chunk_result {
+                                        Ok(chunk) => {
+                                            // Capture first ID for Start event
+                                            if first_id.is_none() && !chunk.id.is_empty() {
+                                                first_id = Some(chunk.id.clone());
                                             }
-                                        }
 
-                                        // Handle tool call deltas
-                                        if let Some(tool_deltas) = choice.delta.tool_calls {
-                                            for delta in tool_deltas {
-                                                let mut accumulators =
-                                                    tool_call_accumulators.lock().unwrap();
-                                                let acc =
-                                                    accumulators.entry(delta.index).or_default();
-
-                                                if let Some(id) = delta.id {
-                                                    acc.id = Some(id);
-                                                }
-
-                                                if let Some(ref func) = delta.function {
-                                                    if let Some(ref name) = func.name {
-                                                        acc.name = Some(name.clone());
-                                                    }
-                                                    if let Some(ref args) = func.arguments {
-                                                        acc.arguments.push_str(args);
+                                            for choice in chunk.choices {
+                                                // Handle content delta
+                                                if let Some(content) = choice.delta.content {
+                                                    if !content.is_empty() {
+                                                        state.pending_events.push_back(Ok(
+                                                            LLMStreamEvent::Token { text: content },
+                                                        ));
                                                     }
                                                 }
-                                            }
-                                        }
 
-                                        // Handle finish reason
-                                        if let Some(ref reason) = choice.finish_reason {
-                                            // Emit any accumulated tool calls
-                                            let accumulators =
-                                                tool_call_accumulators.lock().unwrap();
-                                            for acc in accumulators.values() {
-                                                if let (Some(id), Some(name)) = (&acc.id, &acc.name)
-                                                {
-                                                    let arguments: serde_json::Value =
-                                                        serde_json::from_str(&acc.arguments)
-                                                            .unwrap_or(serde_json::json!({}));
+                                                // Handle tool call deltas
+                                                if let Some(tool_deltas) = choice.delta.tool_calls {
+                                                    for delta in tool_deltas {
+                                                        let acc = state
+                                                            .tool_accumulators
+                                                            .entry(delta.index)
+                                                            .or_default();
 
-                                                    events.push(Ok(LLMStreamEvent::ToolCall {
-                                                        tool_call: ToolCall {
-                                                            id: id.clone(),
-                                                            name: name.clone(),
-                                                            arguments,
+                                                        if let Some(id) = delta.id {
+                                                            acc.id = Some(id);
+                                                        }
+
+                                                        if let Some(ref func) = delta.function {
+                                                            if let Some(ref name) = func.name {
+                                                                acc.name = Some(name.clone());
+                                                            }
+                                                            if let Some(ref args) = func.arguments {
+                                                                acc.arguments.push_str(args);
+                                                            }
+                                                        }
+                                                    }
+                                                }
+
+                                                // Handle finish reason
+                                                if let Some(ref reason) = choice.finish_reason {
+                                                    // Emit any accumulated tool calls
+                                                    for acc in state.tool_accumulators.values() {
+                                                        if let (Some(id), Some(name)) =
+                                                            (&acc.id, &acc.name)
+                                                        {
+                                                            let arguments: serde_json::Value =
+                                                                serde_json::from_str(&acc.arguments)
+                                                                    .unwrap_or(serde_json::json!({}));
+
+                                                            state.pending_events.push_back(Ok(
+                                                                LLMStreamEvent::ToolCall {
+                                                                    tool_call: ToolCall {
+                                                                        id: id.clone(),
+                                                                        name: name.clone(),
+                                                                        arguments,
+                                                                    },
+                                                                },
+                                                            ));
+                                                        }
+                                                    }
+
+                                                    state.pending_events.push_back(Ok(
+                                                        LLMStreamEvent::End {
+                                                            stop_reason:
+                                                                OpenAIClient::parse_stop_reason(
+                                                                    Some(reason),
+                                                                ),
                                                         },
-                                                    }));
+                                                    ));
                                                 }
                                             }
-
-                                            events.push(Ok(LLMStreamEvent::End {
-                                                stop_reason: Self::parse_stop_reason(Some(reason)),
-                                            }));
+                                        }
+                                        Err(e) => {
+                                            state.pending_events.push_back(Err(e));
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    events.push(Err(e));
                                 }
                             }
+
+                            // Add Start event at the front if we have an ID
+                            if let Some(id) = first_id {
+                                state
+                                    .pending_events
+                                    .push_front(Ok(LLMStreamEvent::Start { id }));
+                            }
+
+                            // Loop continues to return first pending event (or get next chunk if none)
+                        }
+                        Err(e) => {
+                            return Some((
+                                Err(LLMError::stream_error(format!("stream read error: {}", e))),
+                                state,
+                            ));
                         }
                     }
-
-                    // Add Start event if we have an ID and haven't emitted one yet
-                    if let Some(id) = first_id {
-                        events.insert(0, Ok(LLMStreamEvent::Start { id }));
-                    }
-
-                    events
                 }
-                Err(e) => {
-                    vec![Err(LLMError::stream_error(format!(
-                        "stream read error: {}",
-                        e
-                    )))]
-                }
-            };
-
-            futures::stream::iter(events)
-        });
+            },
+        );
 
         Ok(Box::pin(event_stream))
     }
