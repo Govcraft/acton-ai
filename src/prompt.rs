@@ -51,7 +51,7 @@ use acton_reactive::prelude::*;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
-use tokio::sync::{Mutex, Notify};
+use tokio::sync::Notify;
 
 /// Type alias for start callbacks.
 type StartCallback = Box<dyn FnMut() + Send + 'static>;
@@ -135,14 +135,14 @@ impl Clone for ToolSpec {
     }
 }
 
-/// Shared state for collecting stream data.
-#[derive(Default)]
-struct SharedCollectorState {
-    buffer: String,
-    token_count: usize,
-    stop_reason: Option<StopReason>,
-    tool_calls: Vec<ToolCall>,
-}
+/// Type alias for wrapped start callback (shared across rounds).
+type WrappedStartCallback = Arc<std::sync::Mutex<StartCallback>>;
+
+/// Type alias for wrapped token callback (shared across rounds).
+type WrappedTokenCallback = Arc<std::sync::Mutex<TokenCallback>>;
+
+/// Type alias for wrapped end callback (shared across rounds).
+type WrappedEndCallback = Arc<std::sync::Mutex<EndCallback>>;
 
 /// A fluent builder for constructing and sending LLM prompts.
 ///
@@ -680,10 +680,13 @@ impl<'a> PromptBuilder<'a> {
         let mut final_text;
         let mut rounds = 0;
 
-        // Wrap callbacks for sharing across iterations
-        let on_start = on_start.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_token = on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_end = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        // Wrap callbacks in Arc<Mutex> for sharing across multiple rounds
+        let on_start: Option<WrappedStartCallback> =
+            on_start.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let on_token: Option<WrappedTokenCallback> =
+            on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        let on_end: Option<WrappedEndCallback> =
+            on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
         loop {
             rounds += 1;
@@ -784,19 +787,33 @@ impl<'a> PromptBuilder<'a> {
 }
 
 /// Collects a single stream round.
+///
+/// This function creates a `StreamCollector` actor that owns all collection state
+/// internally. All mutable state (buffer, token_count, stop_reason, tool_calls)
+/// is owned by the actor and accessed directly in handlers via `actor.model`,
+/// eliminating the need for external Mutex-protected shared state during streaming.
+///
+/// The only synchronization is a single-use Mutex for the final result, which is
+/// filled once when streaming ends and read once to retrieve results. This is
+/// a minimal, single-write single-read pattern with no contention during streaming.
 async fn collect_stream_round(
     runtime: &ActonAI,
     provider_handle: &ActorHandle,
     request: &LLMRequest,
     correlation_id: CorrelationId,
-    on_start: Option<Arc<std::sync::Mutex<StartCallback>>>,
-    on_token: Option<Arc<std::sync::Mutex<TokenCallback>>>,
-    on_end: Option<Arc<std::sync::Mutex<EndCallback>>>,
+    on_start: Option<WrappedStartCallback>,
+    on_token: Option<WrappedTokenCallback>,
+    on_end: Option<WrappedEndCallback>,
 ) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
-    // Set up completion signal and shared state
+    // Set up completion signal
     let stream_done = Arc::new(Notify::new());
     let stream_done_signal = stream_done.clone();
-    let shared_state = Arc::new(Mutex::new(SharedCollectorState::default()));
+
+    // Result container - filled once when stream ends, read once to retrieve
+    // This replaces the original per-token Mutex with a single-use pattern
+    let result_container: Arc<std::sync::Mutex<Option<CollectorResultData>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let result_container_clone = result_container.clone();
 
     // Create the collector actor
     let mut actor_runtime = runtime.runtime().clone();
@@ -806,7 +823,7 @@ async fn collect_stream_round(
     let on_start_clone = on_start.clone();
     let expected_id = correlation_id.clone();
 
-    // Handle stream start
+    // Handle stream start - callback captured in closure
     collector.mutate_on::<LLMStreamStart>(move |_actor, envelope| {
         if envelope.message().correlation_id == expected_id {
             if let Some(ref callback) = on_start_clone {
@@ -820,18 +837,16 @@ async fn collect_stream_round(
 
     // Clone for the token handler
     let on_token_clone = on_token.clone();
-    let shared_state_clone = shared_state.clone();
     let expected_id = correlation_id.clone();
 
-    // Handle tokens
-    collector.mutate_on::<LLMStreamToken>(move |_actor, envelope| {
+    // Handle tokens - accumulates to actor-owned buffer (no Mutex during streaming)
+    collector.mutate_on::<LLMStreamToken>(move |actor, envelope| {
         if envelope.message().correlation_id == expected_id {
             let token = &envelope.message().token;
 
-            if let Ok(mut state) = shared_state_clone.try_lock() {
-                state.buffer.push_str(token);
-                state.token_count += 1;
-            }
+            // State owned by actor - no external Mutex access during streaming
+            actor.model.buffer.push_str(token);
+            actor.model.token_count += 1;
 
             if let Some(ref callback) = on_token_clone {
                 if let Ok(mut f) = callback.lock() {
@@ -843,37 +858,46 @@ async fn collect_stream_round(
     });
 
     // Clone for the tool call handler
-    let shared_state_clone = shared_state.clone();
     let expected_id = correlation_id.clone();
 
-    // Handle tool calls
-    collector.mutate_on::<LLMStreamToolCall>(move |_actor, envelope| {
+    // Handle tool calls - accumulates to actor-owned vec (no Mutex during streaming)
+    collector.mutate_on::<LLMStreamToolCall>(move |actor, envelope| {
         if envelope.message().correlation_id == expected_id {
-            if let Ok(mut state) = shared_state_clone.try_lock() {
-                state.tool_calls.push(envelope.message().tool_call.clone());
-            }
+            // State owned by actor - no external Mutex access during streaming
+            actor.model.tool_calls.push(envelope.message().tool_call.clone());
         }
         Reply::ready()
     });
 
     // Clone for the end handler
     let on_end_clone = on_end.clone();
-    let shared_state_clone = shared_state.clone();
     let expected_id = correlation_id.clone();
 
-    // Handle stream end
-    collector.mutate_on::<LLMStreamEnd>(move |_actor, envelope| {
+    // Handle stream end - collects results, signals completion
+    collector.mutate_on::<LLMStreamEnd>(move |actor, envelope| {
         if envelope.message().correlation_id == expected_id {
-            if let Ok(mut state) = shared_state_clone.try_lock() {
-                state.stop_reason = Some(envelope.message().stop_reason);
-            }
+            // Set stop reason in actor state
+            actor.model.stop_reason = Some(envelope.message().stop_reason);
 
+            // Invoke end callback
             if let Some(ref callback) = on_end_clone {
                 if let Ok(mut f) = callback.lock() {
                     f(envelope.message().stop_reason);
                 }
             }
 
+            // Collect all results from actor state into the result container
+            // This is a single write - no contention during streaming
+            if let Ok(mut container) = result_container_clone.lock() {
+                *container = Some(CollectorResultData {
+                    buffer: std::mem::take(&mut actor.model.buffer),
+                    stop_reason: actor.model.stop_reason,
+                    token_count: actor.model.token_count,
+                    tool_calls: std::mem::take(&mut actor.model.tool_calls),
+                });
+            }
+
+            // Signal completion
             stream_done_signal.notify_one();
         }
         Reply::ready()
@@ -897,13 +921,20 @@ async fn collect_stream_round(
     // Stop the collector
     let _ = collector_handle.stop().await;
 
-    // Extract the collected data
-    let state = shared_state.lock().await;
+    // Extract the collected data - single read, no contention
+    let result = result_container
+        .lock()
+        .ok()
+        .and_then(|mut guard| guard.take())
+        .ok_or_else(|| {
+            ActonAIError::prompt_failed("failed to retrieve collected stream data".to_string())
+        })?;
+
     Ok((
-        state.buffer.clone(),
-        state.stop_reason.unwrap_or(StopReason::EndTurn),
-        state.token_count,
-        state.tool_calls.clone(),
+        result.buffer,
+        result.stop_reason.unwrap_or(StopReason::EndTurn),
+        result.token_count,
+        result.tool_calls,
     ))
 }
 
@@ -936,8 +967,35 @@ async fn execute_tool_with_callback(
 }
 
 /// Internal actor for collecting stream tokens.
+///
+/// This actor owns all state for collecting streaming responses, eliminating
+/// the need for external Mutex-protected shared state. All mutable state
+/// (buffer, token_count, stop_reason, tool_calls) is owned by the actor
+/// and accessed directly in handlers via `actor.model`.
 #[acton_actor]
-struct StreamCollector;
+struct StreamCollector {
+    /// Accumulated response buffer
+    buffer: String,
+    /// Count of tokens received
+    token_count: usize,
+    /// Stop reason when stream ends
+    stop_reason: Option<StopReason>,
+    /// Accumulated tool calls
+    tool_calls: Vec<ToolCall>,
+}
+
+/// Collected stream data returned from the actor.
+#[derive(Debug, Clone, Default)]
+struct CollectorResultData {
+    /// Accumulated text from tokens
+    buffer: String,
+    /// Reason the stream stopped
+    stop_reason: Option<StopReason>,
+    /// Number of tokens received
+    token_count: usize,
+    /// Tool calls received during streaming
+    tool_calls: Vec<ToolCall>,
+}
 
 #[cfg(test)]
 mod tests {
