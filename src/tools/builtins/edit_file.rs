@@ -74,6 +74,7 @@ impl EditFileTool {
                 "required": ["path", "old_string", "new_string"]
             }),
         })
+        .with_sandbox(true) // File edits require sandbox for security
     }
 
     /// Generates a simple diff-style output.
@@ -228,6 +229,10 @@ impl ToolExecutorTrait for EditFileTool {
         }
 
         Ok(())
+    }
+
+    fn requires_sandbox(&self) -> bool {
+        true
     }
 }
 
@@ -467,5 +472,17 @@ mod tests {
         assert!(schema["properties"]["old_string"].is_object());
         assert!(schema["properties"]["new_string"].is_object());
         assert!(schema["properties"]["replace_all"].is_object());
+    }
+
+    #[test]
+    fn edit_file_requires_sandbox() {
+        let tool = EditFileTool::new();
+        assert!(tool.requires_sandbox());
+    }
+
+    #[test]
+    fn edit_file_config_is_sandboxed() {
+        let config = EditFileTool::config();
+        assert!(config.sandboxed, "edit_file tool should require sandbox");
     }
 }
