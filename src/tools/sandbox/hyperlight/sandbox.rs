@@ -348,16 +348,14 @@ impl HyperlightSandbox {
                 })
                 .to_string()
             }
-            Err(e) => {
-                serde_json::json!({
-                    "status": 0,
-                    "headers": {},
-                    "body": "",
-                    "success": false,
-                    "error": format!("HTTP request failed: {}", e)
-                })
-                .to_string()
-            }
+            Err(e) => serde_json::json!({
+                "status": 0,
+                "headers": {},
+                "body": "",
+                "success": false,
+                "error": format!("HTTP request failed: {}", e)
+            })
+            .to_string(),
         }
     }
 
@@ -404,11 +402,7 @@ impl HyperlightSandbox {
         };
 
         // Execute the command
-        let output = match Command::new("sh")
-            .arg("-c")
-            .arg(&request.command)
-            .output()
-        {
+        let output = match Command::new("sh").arg("-c").arg(&request.command).output() {
             Ok(output) => output,
             Err(e) => {
                 return serde_json::json!({

@@ -64,11 +64,7 @@ static COMPILER: OnceLock<Result<Arc<RustCompiler>, String>> = OnceLock::new();
 /// Gets or initializes the global compiler instance.
 fn get_compiler() -> Result<Arc<RustCompiler>, String> {
     COMPILER
-        .get_or_init(|| {
-            RustCompiler::new()
-                .map(Arc::new)
-                .map_err(|e| e.to_string())
-        })
+        .get_or_init(|| RustCompiler::new().map(Arc::new).map_err(|e| e.to_string()))
         .clone()
 }
 
@@ -163,8 +159,8 @@ impl RustCodeTool {
             .with_guest_binary(GuestBinarySource::FromBytes(compiled.into_bytes()))
             .with_timeout(Duration::from_secs(timeout_secs));
 
-        let sandbox = HyperlightSandbox::new(config)
-            .map_err(|e| ToolError::sandbox_error(e.to_string()))?;
+        let sandbox =
+            HyperlightSandbox::new(config).map_err(|e| ToolError::sandbox_error(e.to_string()))?;
 
         // 3. Execute in sandbox (synchronous, via spawn_blocking)
         let result = tokio::task::spawn_blocking(move || {
@@ -185,15 +181,16 @@ impl RustCodeTool {
     /// Converts a `CompilationError` to a `ToolError` with helpful messages.
     fn compilation_error_to_tool_error(error: &CompilationError) -> ToolError {
         match error.kind() {
-            CompilationErrorKind::ClippyFailed { errors, error_count } => {
-                ToolError::validation_failed(
-                    "rust_code",
-                    format!(
-                        "Code has {} clippy error(s). Fix the issues and retry:\n\n{}",
-                        error_count, errors
-                    ),
-                )
-            }
+            CompilationErrorKind::ClippyFailed {
+                errors,
+                error_count,
+            } => ToolError::validation_failed(
+                "rust_code",
+                format!(
+                    "Code has {} clippy error(s). Fix the issues and retry:\n\n{}",
+                    error_count, errors
+                ),
+            ),
             CompilationErrorKind::CompilationFailed { errors, .. } => ToolError::validation_failed(
                 "rust_code",
                 format!(
@@ -204,15 +201,16 @@ impl RustCodeTool {
             CompilationErrorKind::TemplateFailed { reason } => {
                 ToolError::validation_failed("rust_code", reason.clone())
             }
-            CompilationErrorKind::ToolchainError { missing, install_hint } => {
-                ToolError::execution_failed(
-                    "rust_code",
-                    format!(
-                        "Required tooling '{}' not available. Install with: {}",
-                        missing, install_hint
-                    ),
-                )
-            }
+            CompilationErrorKind::ToolchainError {
+                missing,
+                install_hint,
+            } => ToolError::execution_failed(
+                "rust_code",
+                format!(
+                    "Required tooling '{}' not available. Install with: {}",
+                    missing, install_hint
+                ),
+            ),
             _ => ToolError::execution_failed("rust_code", error.to_string()),
         }
     }
@@ -292,9 +290,11 @@ impl ToolActor for RustCodeToolActor {
                                     .unwrap_or_else(|e| format!("{{\"error\": \"{}\"}}", e));
                                 ToolActorResponse::success(correlation_id, tool_call_id, result_str)
                             }
-                            Err(e) => {
-                                ToolActorResponse::error(correlation_id, tool_call_id, e.to_string())
-                            }
+                            Err(e) => ToolActorResponse::error(
+                                correlation_id,
+                                tool_call_id,
+                                e.to_string(),
+                            ),
                         }
                     }
                     Err(e) => ToolActorResponse::error(
@@ -367,7 +367,10 @@ mod tests {
         assert!(schema["properties"]["code"].is_object());
         assert!(schema["properties"]["input"].is_object());
         assert!(schema["properties"]["timeout_secs"].is_object());
-        assert!(schema["required"].as_array().unwrap().contains(&json!("code")));
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("code")));
     }
 
     // --- ToolConfig tests ---

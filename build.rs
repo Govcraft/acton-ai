@@ -67,7 +67,8 @@ fn can_compile_guests() -> bool {
 
 /// Compile guest binaries to x86_64-unknown-none.
 fn compile_guests(output_dir: &Path) {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let guests_workspace = manifest_dir.join("guests");
 
     // Build shell_guest
@@ -83,12 +84,7 @@ fn compile_guest(workspace: &Path, guest_name: &str, output_dir: &Path) {
 
     let status = Command::new("cargo")
         .current_dir(workspace.join(guest_name))
-        .args([
-            "build",
-            "--release",
-            "--target",
-            "x86_64-unknown-none",
-        ])
+        .args(["build", "--release", "--target", "x86_64-unknown-none"])
         .env("CARGO_TARGET_DIR", workspace.join("target"))
         .status();
 
@@ -104,9 +100,8 @@ fn compile_guest(workspace: &Path, guest_name: &str, output_dir: &Path) {
             let dest_path = output_dir.join(guest_name);
 
             if binary_path.exists() {
-                fs::copy(&binary_path, &dest_path).unwrap_or_else(|e| {
-                    panic!("Failed to copy {} binary: {}", guest_name, e)
-                });
+                fs::copy(&binary_path, &dest_path)
+                    .unwrap_or_else(|e| panic!("Failed to copy {} binary: {}", guest_name, e));
                 println!("cargo:warning={} guest compiled successfully", guest_name);
             } else {
                 // Try alternative path (might be named differently)
@@ -117,9 +112,8 @@ fn compile_guest(workspace: &Path, guest_name: &str, output_dir: &Path) {
                     .join(guest_name);
 
                 if alt_path.exists() {
-                    fs::copy(&alt_path, &dest_path).unwrap_or_else(|e| {
-                        panic!("Failed to copy {} binary: {}", guest_name, e)
-                    });
+                    fs::copy(&alt_path, &dest_path)
+                        .unwrap_or_else(|e| panic!("Failed to copy {} binary: {}", guest_name, e));
                     println!("cargo:warning={} guest compiled successfully", guest_name);
                 } else {
                     panic!(
@@ -130,7 +124,11 @@ fn compile_guest(workspace: &Path, guest_name: &str, output_dir: &Path) {
             }
         }
         Ok(status) => {
-            panic!("Failed to compile {} guest: exit code {:?}", guest_name, status.code());
+            panic!(
+                "Failed to compile {} guest: exit code {:?}",
+                guest_name,
+                status.code()
+            );
         }
         Err(e) => {
             panic!("Failed to run cargo for {} guest: {}", guest_name, e);

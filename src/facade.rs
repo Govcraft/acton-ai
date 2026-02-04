@@ -970,7 +970,11 @@ impl ActonAIBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn with_sandbox_pool_config(mut self, pool_size: usize, sandbox_config: SandboxConfig) -> Self {
+    pub fn with_sandbox_pool_config(
+        mut self,
+        pool_size: usize,
+        sandbox_config: SandboxConfig,
+    ) -> Self {
         self.sandbox_mode = SandboxMode::Pool {
             pool_size,
             sandbox_config,

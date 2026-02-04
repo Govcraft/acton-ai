@@ -432,7 +432,10 @@ mod tests {
         assert_eq!(tools.len(), 9);
 
         // rust_code is not in all() because it requires toolchain
-        for name in BuiltinTools::available().iter().filter(|n| **n != "rust_code") {
+        for name in BuiltinTools::available()
+            .iter()
+            .filter(|n| **n != "rust_code")
+        {
             assert!(
                 tools.get_config(name).is_some(),
                 "missing config for {name}"

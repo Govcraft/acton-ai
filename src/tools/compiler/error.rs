@@ -156,7 +156,10 @@ impl CompilationError {
 impl fmt::Display for CompilationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.kind.as_ref() {
-            CompilationErrorKind::ClippyFailed { errors, error_count } => {
+            CompilationErrorKind::ClippyFailed {
+                errors,
+                error_count,
+            } => {
                 write!(
                     f,
                     "clippy found {} error(s); fix the issues and retry:\n{}",
@@ -183,7 +186,10 @@ impl fmt::Display for CompilationError {
             CompilationErrorKind::CacheError { reason } => {
                 write!(f, "compilation cache error: {}", reason)
             }
-            CompilationErrorKind::ToolchainError { missing, install_hint } => {
+            CompilationErrorKind::ToolchainError {
+                missing,
+                install_hint,
+            } => {
                 write!(
                     f,
                     "required tooling not available: {}; install with: {}",

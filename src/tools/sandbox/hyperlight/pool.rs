@@ -376,10 +376,8 @@ impl SandboxPool {
 
     /// Creates a sandbox for the specified guest type.
     fn create_sandbox(&self, guest_type: GuestType) -> Result<Arc<dyn Sandbox>, SandboxErrorKind> {
-        let sandbox = HyperlightSandbox::new_with_guest_type(
-            self.sandbox_config.clone(),
-            guest_type,
-        )?;
+        let sandbox =
+            HyperlightSandbox::new_with_guest_type(self.sandbox_config.clone(), guest_type)?;
         Ok(Arc::new(sandbox))
     }
 

@@ -30,7 +30,9 @@ pub struct CodeTemplate {
 
 impl Default for CodeTemplate {
     fn default() -> Self {
-        Self { forbid_unsafe: true }
+        Self {
+            forbid_unsafe: true,
+        }
     }
 }
 
