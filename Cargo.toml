@@ -7,6 +7,16 @@ license = "MIT"
 repository = "https://github.com/rodzilla/acton-ai"
 keywords = ["ai", "agents", "actors", "llm", "async"]
 categories = ["asynchronous", "concurrency"]
+include = [
+    "src/**/*",
+    "build.rs",
+    "guests/Cargo.toml",
+    "guests/Cargo.lock",
+    "guests/shell_guest/**/*",
+    "guests/http_guest/**/*",
+    "README.md",
+    "LICENSE",
+]
 
 [features]
 default = []
