@@ -10,12 +10,9 @@ categories = ["asynchronous", "concurrency"]
 include = [
     "src/**/*",
     "build.rs",
-    "guests/Cargo.toml",
-    "guests/Cargo.lock",
-    "guests/shell_guest/**/*",
-    "guests/http_guest/**/*",
     "README.md",
     "LICENSE",
+    "!docs/**/*",
 ]
 
 [features]

@@ -32,6 +32,7 @@ fn main() {
 /// Requirements:
 /// - Running on x86_64 architecture
 /// - The x86_64-unknown-none target is available
+/// - The guests source directory exists (not in crates.io package)
 fn can_compile_guests() -> bool {
     // Check architecture
     if env::consts::ARCH != "x86_64" {
@@ -39,6 +40,15 @@ fn can_compile_guests() -> bool {
             "cargo:warning=Guest compilation skipped: requires x86_64, got {}",
             env::consts::ARCH
         );
+        return false;
+    }
+
+    // Check if guests source directory exists (won't exist in crates.io package)
+    let manifest_dir =
+        PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
+    let guests_dir = manifest_dir.join("guests").join("shell_guest").join("src");
+    if !guests_dir.exists() {
+        println!("cargo:warning=Guest compilation skipped: guests source not found (crates.io build)");
         return false;
     }
 
