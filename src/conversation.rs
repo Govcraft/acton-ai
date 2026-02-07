@@ -211,9 +211,9 @@ fn exit_tool_definition() -> ToolDefinition {
 ///     println!("{}", response.text);
 /// }
 /// ```
-pub struct Conversation<'a> {
-    /// Reference to the ActonAI runtime
-    runtime: &'a ActonAI,
+pub struct Conversation {
+    /// The ActonAI runtime (cheaply cloned via Arc)
+    runtime: ActonAI,
     /// Accumulated conversation history
     history: Vec<Message>,
     /// Optional system prompt
@@ -224,10 +224,10 @@ pub struct Conversation<'a> {
     exit_tool_enabled: bool,
 }
 
-impl<'a> Conversation<'a> {
+impl Conversation {
     /// Creates a new conversation.
     fn new(
-        runtime: &'a ActonAI,
+        runtime: ActonAI,
         system_prompt: Option<String>,
         history: Vec<Message>,
         exit_tool_enabled: bool,
@@ -297,7 +297,7 @@ impl<'a> Conversation<'a> {
         configure: F,
     ) -> Result<CollectedResponse, ActonAIError>
     where
-        F: FnOnce(PromptBuilder<'a>) -> PromptBuilder<'a>,
+        F: FnOnce(PromptBuilder) -> PromptBuilder,
     {
         let user_content = content.into();
 
@@ -637,7 +637,7 @@ impl<'a> Conversation<'a> {
     }
 }
 
-impl std::fmt::Debug for Conversation<'_> {
+impl std::fmt::Debug for Conversation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Conversation")
             .field("history_len", &self.history.len())
@@ -663,17 +663,17 @@ impl std::fmt::Debug for Conversation<'_> {
 ///     .restore(saved_history)
 ///     .build();
 /// ```
-pub struct ConversationBuilder<'a> {
-    runtime: &'a ActonAI,
+pub struct ConversationBuilder {
+    runtime: ActonAI,
     system_prompt: Option<String>,
     history: Vec<Message>,
     /// Whether to enable the built-in exit tool
     exit_tool_enabled: bool,
 }
 
-impl<'a> ConversationBuilder<'a> {
+impl ConversationBuilder {
     /// Creates a new conversation builder.
-    pub(crate) fn new(runtime: &'a ActonAI) -> Self {
+    pub(crate) fn new(runtime: ActonAI) -> Self {
         Self {
             runtime,
             system_prompt: None,
@@ -790,7 +790,7 @@ impl<'a> ConversationBuilder<'a> {
     /// After calling this, you can use [`Conversation::send`] to interact
     /// with the LLM.
     #[must_use]
-    pub fn build(self) -> Conversation<'a> {
+    pub fn build(self) -> Conversation {
         Conversation::new(
             self.runtime,
             self.system_prompt,
@@ -861,7 +861,7 @@ impl<'a> ConversationBuilder<'a> {
     }
 }
 
-impl std::fmt::Debug for ConversationBuilder<'_> {
+impl std::fmt::Debug for ConversationBuilder {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ConversationBuilder")
             .field("has_system_prompt", &self.system_prompt.is_some())

@@ -170,9 +170,9 @@ type WrappedEndCallback = Arc<std::sync::Mutex<EndCallback>>;
 ///     .collect()
 ///     .await?;
 /// ```
-pub struct PromptBuilder<'a> {
-    /// Reference to the ActonAI runtime
-    runtime: &'a ActonAI,
+pub struct PromptBuilder {
+    /// The ActonAI runtime (cheaply cloned via Arc)
+    runtime: ActonAI,
     /// The user's prompt content
     user_content: String,
     /// Optional system prompt
@@ -193,12 +193,12 @@ pub struct PromptBuilder<'a> {
     provider_name: Option<String>,
 }
 
-impl<'a> PromptBuilder<'a> {
+impl PromptBuilder {
     /// Creates a new prompt builder with the given content.
     ///
     /// This is called internally by `ActonAI::prompt()`.
     #[must_use]
-    pub(crate) fn new(runtime: &'a ActonAI, user_content: String) -> Self {
+    pub(crate) fn new(runtime: ActonAI, user_content: String) -> Self {
         Self {
             runtime,
             user_content,
@@ -713,7 +713,7 @@ impl<'a> PromptBuilder<'a> {
 
             // Collect stream response
             let (text, stop_reason, token_count, tool_calls) = collect_stream_round(
-                runtime,
+                &runtime,
                 &provider_handle,
                 &request,
                 correlation_id,

@@ -84,6 +84,7 @@ use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFact
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 /// The default provider name used when registering single providers.
@@ -125,29 +126,45 @@ pub const DEFAULT_PROVIDER_NAME: &str = "default";
 /// // Use specific provider
 /// runtime.prompt("Complex task").provider("claude").collect().await?;
 /// ```
-pub struct ActonAI {
+/// Internal state shared via `Arc`.
+pub(crate) struct ActonAIInner {
     /// The underlying actor runtime
-    runtime: ActorRuntime,
+    pub(crate) runtime: ActorRuntime,
     /// Named LLM provider handles
-    providers: HashMap<String, ActorHandle>,
+    pub(crate) providers: HashMap<String, ActorHandle>,
     /// The name of the default provider
-    default_provider: String,
+    pub(crate) default_provider: String,
     /// Built-in tools (if enabled)
-    builtins: Option<BuiltinTools>,
+    pub(crate) builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
-    auto_builtins: bool,
+    pub(crate) auto_builtins: bool,
     /// Whether the runtime has been shut down
-    is_shutdown: bool,
+    pub(crate) is_shutdown: AtomicBool,
+}
+
+pub struct ActonAI {
+    pub(crate) inner: Arc<ActonAIInner>,
+}
+
+impl Clone for ActonAI {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl std::fmt::Debug for ActonAI {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ActonAI")
-            .field("is_shutdown", &self.is_shutdown)
-            .field("has_builtins", &self.builtins.is_some())
-            .field("auto_builtins", &self.auto_builtins)
-            .field("provider_count", &self.providers.len())
-            .field("default_provider", &self.default_provider)
+            .field(
+                "is_shutdown",
+                &self.inner.is_shutdown.load(Ordering::SeqCst),
+            )
+            .field("has_builtins", &self.inner.builtins.is_some())
+            .field("auto_builtins", &self.inner.auto_builtins)
+            .field("provider_count", &self.inner.providers.len())
+            .field("default_provider", &self.inner.default_provider)
             .finish_non_exhaustive()
     }
 }
@@ -187,9 +204,9 @@ impl ActonAI {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn prompt(&self, content: impl Into<String>) -> PromptBuilder<'_> {
-        let mut builder = PromptBuilder::new(self, content.into());
-        if self.auto_builtins && self.builtins.is_some() {
+    pub fn prompt(&self, content: impl Into<String>) -> PromptBuilder {
+        let mut builder = PromptBuilder::new(self.clone(), content.into());
+        if self.inner.auto_builtins && self.inner.builtins.is_some() {
             builder = builder.use_builtins();
         }
         builder
@@ -201,15 +218,23 @@ impl ActonAI {
     /// direct access to the actor system.
     #[must_use]
     pub fn runtime(&self) -> &ActorRuntime {
-        &self.runtime
+        &self.inner.runtime
     }
 
     /// Returns a mutable reference to the underlying actor runtime.
     ///
     /// This provides an escape hatch for advanced use cases that need
     /// direct access to the actor system.
+    ///
+    /// # Panics
+    ///
+    /// Panics if there are other clones of this `ActonAI` handle. This
+    /// matches the previous `&mut self` semantics — you can only call it
+    /// if you have exclusive access.
     pub fn runtime_mut(&mut self) -> &mut ActorRuntime {
-        &mut self.runtime
+        &mut Arc::get_mut(&mut self.inner)
+            .expect("cannot get mutable runtime: ActonAI is shared")
+            .runtime
     }
 
     /// Returns a clone of the default LLM provider handle.
@@ -218,8 +243,9 @@ impl ActonAI {
     /// for advanced use cases.
     #[must_use]
     pub fn provider_handle(&self) -> ActorHandle {
-        self.providers
-            .get(&self.default_provider)
+        self.inner
+            .providers
+            .get(&self.inner.default_provider)
             .cloned()
             .expect("default provider must exist")
     }
@@ -237,36 +263,36 @@ impl ActonAI {
     /// ```
     #[must_use]
     pub fn provider_handle_named(&self, name: &str) -> Option<ActorHandle> {
-        self.providers.get(name).cloned()
+        self.inner.providers.get(name).cloned()
     }
 
     /// Returns the name of the default provider.
     #[must_use]
     pub fn default_provider_name(&self) -> &str {
-        &self.default_provider
+        &self.inner.default_provider
     }
 
     /// Returns an iterator over the names of all registered providers.
     pub fn provider_names(&self) -> impl Iterator<Item = &str> {
-        self.providers.keys().map(String::as_str)
+        self.inner.providers.keys().map(String::as_str)
     }
 
     /// Returns the number of registered providers.
     #[must_use]
     pub fn provider_count(&self) -> usize {
-        self.providers.len()
+        self.inner.providers.len()
     }
 
     /// Returns true if a provider with the given name exists.
     #[must_use]
     pub fn has_provider(&self, name: &str) -> bool {
-        self.providers.contains_key(name)
+        self.inner.providers.contains_key(name)
     }
 
     /// Returns whether the runtime has been shut down.
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
-        self.is_shutdown
+        self.inner.is_shutdown.load(Ordering::SeqCst)
     }
 
     /// Returns a reference to the built-in tools, if enabled.
@@ -276,13 +302,13 @@ impl ActonAI {
     /// [`with_builtin_tools`](ActonAIBuilder::with_builtin_tools).
     #[must_use]
     pub fn builtins(&self) -> Option<&BuiltinTools> {
-        self.builtins.as_ref()
+        self.inner.builtins.as_ref()
     }
 
     /// Returns whether built-in tools are enabled.
     #[must_use]
     pub fn has_builtins(&self) -> bool {
-        self.builtins.is_some()
+        self.inner.builtins.is_some()
     }
 
     /// Returns whether builtins are automatically enabled on each prompt.
@@ -292,7 +318,7 @@ impl ActonAI {
     /// requiring [`use_builtins()`](crate::prompt::PromptBuilder::use_builtins).
     #[must_use]
     pub fn is_auto_builtins(&self) -> bool {
-        self.auto_builtins
+        self.inner.auto_builtins
     }
 
     /// Continues a conversation from existing messages.
@@ -322,10 +348,10 @@ impl ActonAI {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn continue_with(&self, messages: impl IntoIterator<Item = Message>) -> PromptBuilder<'_> {
-        let mut builder = PromptBuilder::new(self, String::new());
+    pub fn continue_with(&self, messages: impl IntoIterator<Item = Message>) -> PromptBuilder {
+        let mut builder = PromptBuilder::new(self.clone(), String::new());
         builder = builder.messages(messages);
-        if self.auto_builtins && self.builtins.is_some() {
+        if self.inner.auto_builtins && self.inner.builtins.is_some() {
             builder = builder.use_builtins();
         }
         builder
@@ -357,8 +383,8 @@ impl ActonAI {
     /// println!("Assistant: {}", response.text);
     /// ```
     #[must_use]
-    pub fn conversation(&self) -> ConversationBuilder<'_> {
-        ConversationBuilder::new(self)
+    pub fn conversation(&self) -> ConversationBuilder {
+        ConversationBuilder::new(self.clone())
     }
 
     /// Shuts down the runtime gracefully.
@@ -368,9 +394,12 @@ impl ActonAI {
     /// # Errors
     ///
     /// Returns an error if the shutdown fails.
-    pub async fn shutdown(mut self) -> Result<(), ActonAIError> {
-        self.is_shutdown = true;
-        self.runtime
+    pub async fn shutdown(self) -> Result<(), ActonAIError> {
+        self.inner.is_shutdown.store(true, Ordering::SeqCst);
+        // Get the runtime clone for shutdown. The Arc may still be shared,
+        // so we clone the ActorRuntime (which is itself cheap to clone).
+        let mut runtime = self.inner.runtime.clone();
+        runtime
             .shutdown_all()
             .await
             .map_err(|e| ActonAIError::launch_failed(e.to_string()))
@@ -1112,12 +1141,14 @@ impl ActonAIBuilder {
         };
 
         Ok(ActonAI {
-            runtime,
-            providers,
-            default_provider: default_provider_name,
-            builtins,
-            auto_builtins: self.auto_builtins,
-            is_shutdown: false,
+            inner: Arc::new(ActonAIInner {
+                runtime,
+                providers,
+                default_provider: default_provider_name,
+                builtins,
+                auto_builtins: self.auto_builtins,
+                is_shutdown: AtomicBool::new(false),
+            }),
         })
     }
 
