@@ -38,6 +38,7 @@
 //!     .await?;
 //! ```
 
+use crate::conversation::StreamToken;
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::messages::{
@@ -191,6 +192,8 @@ pub struct PromptBuilder {
     max_tool_rounds: usize,
     /// Name of the provider to use (None = default provider)
     provider_name: Option<String>,
+    /// Optional actor handle to receive [`StreamToken`] messages
+    token_target: Option<ActorHandle>,
 }
 
 impl PromptBuilder {
@@ -210,6 +213,7 @@ impl PromptBuilder {
             tools: Vec::new(),
             max_tool_rounds: 10,
             provider_name: None,
+            token_target: None,
         }
     }
 
@@ -548,6 +552,19 @@ impl PromptBuilder {
         self
     }
 
+    /// Sets a target actor to receive [`StreamToken`] messages during streaming.
+    ///
+    /// When set, each token received from the LLM is forwarded as a [`StreamToken`]
+    /// message to the target actor. The target actor must have a handler registered
+    /// for `StreamToken`.
+    ///
+    /// This is used internally by [`Conversation::send_streaming`](crate::conversation::Conversation::send_streaming).
+    #[must_use]
+    pub fn token_target(mut self, handle: ActorHandle) -> Self {
+        self.token_target = Some(handle);
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -638,6 +655,7 @@ impl PromptBuilder {
             mut tools,
             max_tool_rounds,
             provider_name,
+            token_target,
         } = self;
 
         // Resolve the provider handle
@@ -717,9 +735,12 @@ impl PromptBuilder {
                 &provider_handle,
                 &request,
                 correlation_id,
-                on_start.clone(),
-                on_token.clone(),
-                on_end.clone(),
+                StreamRoundCallbacks {
+                    on_start: on_start.clone(),
+                    on_token: on_token.clone(),
+                    on_end: on_end.clone(),
+                    token_target: token_target.clone(),
+                },
             )
             .await?;
 
@@ -785,6 +806,14 @@ impl PromptBuilder {
     }
 }
 
+/// Callbacks and token target for a single stream round.
+struct StreamRoundCallbacks {
+    on_start: Option<WrappedStartCallback>,
+    on_token: Option<WrappedTokenCallback>,
+    on_end: Option<WrappedEndCallback>,
+    token_target: Option<ActorHandle>,
+}
+
 /// Collects a single stream round.
 ///
 /// This function creates a `StreamCollector` actor that owns all collection state
@@ -800,10 +829,14 @@ async fn collect_stream_round(
     provider_handle: &ActorHandle,
     request: &LLMRequest,
     correlation_id: CorrelationId,
-    on_start: Option<WrappedStartCallback>,
-    on_token: Option<WrappedTokenCallback>,
-    on_end: Option<WrappedEndCallback>,
+    callbacks: StreamRoundCallbacks,
 ) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
+    let StreamRoundCallbacks {
+        on_start,
+        on_token,
+        on_end,
+        token_target,
+    } = callbacks;
     // Set up completion signal
     let stream_done = Arc::new(Notify::new());
     let stream_done_signal = stream_done.clone();
@@ -836,6 +869,7 @@ async fn collect_stream_round(
 
     // Clone for the token handler
     let on_token_clone = on_token.clone();
+    let token_target_clone = token_target.clone();
     let expected_id = correlation_id.clone();
 
     // Handle tokens - accumulates to actor-owned buffer (no Mutex during streaming)
@@ -851,6 +885,15 @@ async fn collect_stream_round(
                 if let Ok(mut f) = callback.lock() {
                     f(token);
                 }
+            }
+
+            // Forward token to target actor if set
+            if let Some(ref target) = token_target_clone {
+                let target = target.clone();
+                let text = token.to_string();
+                return Reply::pending(async move {
+                    target.send(StreamToken { text }).await;
+                });
             }
         }
         Reply::ready()

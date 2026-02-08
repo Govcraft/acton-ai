@@ -370,9 +370,10 @@ impl ActonAI {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let mut conv = runtime.conversation()
+    /// let conv = runtime.conversation()
     ///     .system("You are a helpful assistant.")
-    ///     .build();
+    ///     .build()
+    ///     .await;
     ///
     /// // Each send() automatically manages history
     /// let response = conv.send("What is Rust?").await?;

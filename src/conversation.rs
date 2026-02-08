@@ -3,6 +3,10 @@
 //! This module provides the [`Conversation`] type which handles automatic history
 //! management, reducing boilerplate in multi-turn conversation scenarios.
 //!
+//! `Conversation` is an actor-based wrapper: a [`ConversationActor`] owns the history,
+//! the mailbox serializes sends, and the public [`Conversation`] handle is
+//! `Clone + Send + 'static` with all methods taking `&self`.
+//!
 //! # Example
 //!
 //! ```rust,ignore
@@ -15,9 +19,10 @@
 //!     .launch()
 //!     .await?;
 //!
-//! let mut conv = runtime.conversation()
+//! let conv = runtime.conversation()
 //!     .system("You are a helpful assistant.")
-//!     .build();
+//!     .build()
+//!     .await;
 //!
 //! // History is automatically managed
 //! let response = conv.send("What is Rust?").await?;
@@ -30,10 +35,11 @@
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::messages::{Message, ToolDefinition};
-use crate::prompt::PromptBuilder;
 use crate::stream::CollectedResponse;
-use std::sync::atomic::{AtomicBool, Ordering};
+use acton_reactive::prelude::*;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
+use tokio::sync::{mpsc, watch};
 
 /// Type alias for input mapper functions used in [`ChatConfig`].
 type InputMapperFn = Box<dyn FnMut(&str) -> String + Send>;
@@ -47,6 +53,10 @@ You are a helpful assistant with access to various tools. \
 Use tools when appropriate to help the user. \
 When the user wants to end the conversation (says goodbye, bye, quit, exit, etc.), \
 use the exit_conversation tool.";
+
+// =========================================================================
+// ChatConfig (unchanged from original)
+// =========================================================================
 
 /// Configuration for the chat loop.
 ///
@@ -166,6 +176,10 @@ impl std::fmt::Debug for ChatConfig {
     }
 }
 
+// =========================================================================
+// Exit tool definition (unchanged)
+// =========================================================================
+
 /// Creates the exit tool definition for conversation termination.
 fn exit_tool_definition() -> ToolDefinition {
     ToolDefinition {
@@ -187,23 +201,265 @@ fn exit_tool_definition() -> ToolDefinition {
     }
 }
 
+// =========================================================================
+// Actor messages
+// =========================================================================
+
+/// Wrapper → ConversationActor: initiate a send.
+#[derive(Clone, Debug)]
+struct ConvSend {
+    content: String,
+    token_target: Option<ActorHandle>,
+    result_tx: mpsc::Sender<Result<CollectedResponse, ActonAIError>>,
+}
+
+/// Async block → ConversationActor: LLM completed, add assistant message.
+#[derive(Clone, Debug)]
+struct ConvAddAssistant {
+    text: String,
+}
+
+/// A streamed token message sent from the conversation to a user-provided actor.
+///
+/// Register a handler for this message type on your actor to receive
+/// individual tokens as they are streamed from the LLM.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use acton_ai::prelude::*;
+///
+/// actor.mutate_on::<StreamToken>(|_actor, ctx| {
+///     print!("{}", ctx.message().text);
+///     std::io::stdout().flush().ok();
+///     Reply::ready()
+/// });
+/// ```
+#[derive(Clone, Debug)]
+pub struct StreamToken {
+    /// The token text.
+    pub text: String,
+}
+
+/// Wrapper → ConversationActor: clear history (fire-and-forget).
+#[derive(Clone, Debug)]
+struct ConvClear;
+
+/// Wrapper → ConversationActor: update system prompt (fire-and-forget).
+#[derive(Clone, Debug)]
+struct ConvSetSystemPrompt {
+    prompt: Option<String>,
+}
+
+// =========================================================================
+// ConversationActor
+// =========================================================================
+
+/// Actor that owns the conversation history.
+///
+/// All mutations are serialized through the mailbox. The `Reply::pending`
+/// future blocks the mailbox during the LLM call, guaranteeing that
+/// `ConvAddAssistant` is processed before the next `ConvSend`.
+#[acton_actor]
+struct ConversationActor {
+    history: Vec<Message>,
+}
+
+/// Actor used internally by [`Conversation::run_chat_with`] to print tokens to stdout.
+#[derive(Default, Debug)]
+struct StdoutTokenPrinter;
+
+// =========================================================================
+// Handler configuration
+// =========================================================================
+
+/// Shared state captured by handler closures at build time.
+///
+/// Groups the shared state that `configure_handlers` needs, keeping the
+/// function signature clean.
+struct HandlerState {
+    runtime: ActonAI,
+    self_handle: ActorHandle,
+    history_tx: Arc<watch::Sender<Vec<Message>>>,
+    history_len: Arc<AtomicUsize>,
+    exit_requested: Arc<AtomicBool>,
+    exit_tool_enabled: Arc<AtomicBool>,
+    system_prompt_rx: watch::Receiver<Option<String>>,
+    system_prompt_tx: watch::Sender<Option<String>>,
+}
+
+/// Registers all message handlers on the `ConversationActor` builder.
+fn configure_handlers(
+    builder: &mut ManagedActor<Idle, ConversationActor>,
+    state: HandlerState,
+) {
+    let HandlerState {
+        runtime,
+        self_handle,
+        history_tx,
+        history_len,
+        exit_requested,
+        exit_tool_enabled,
+        system_prompt_rx,
+        system_prompt_tx,
+    } = state;
+    // ----- ConvSend: push user msg, run LLM call, await it -----
+    {
+        let runtime = runtime.clone();
+        let self_handle = self_handle.clone();
+        let history_tx = history_tx.clone();
+        let history_len = history_len.clone();
+        let exit_requested = exit_requested.clone();
+        let exit_tool_enabled = exit_tool_enabled.clone();
+        let system_prompt_rx = system_prompt_rx.clone();
+
+        builder.mutate_on::<ConvSend>(move |actor, ctx| {
+            let msg = ctx.message().clone();
+
+            // Sync: push user message to history
+            actor.model.history.push(Message::user(&msg.content));
+
+            // Update watch channel and atomic
+            let _ = history_tx.send(actor.model.history.clone());
+            history_len.store(actor.model.history.len(), Ordering::SeqCst);
+
+            // Clone everything for the async block
+            let history = actor.model.history.clone();
+            let system_prompt = system_prompt_rx.borrow().clone();
+            let runtime = runtime.clone();
+            let exit_requested = exit_requested.clone();
+            let exit_tool_enabled_val = exit_tool_enabled.load(Ordering::SeqCst);
+            let result_tx = msg.result_tx;
+            let token_target = msg.token_target;
+            let self_handle = self_handle.clone();
+
+            // The LLM call runs in a spawned task because PromptBuilder
+            // contains non-Sync callbacks (FnMut). The spawned task only
+            // requires Send. JoinHandle is Send+Sync, satisfying the
+            // FutureBox = Pin<Box<dyn Future + Send + Sync>> requirement.
+            Reply::pending(async move {
+                let llm_result = tokio::spawn(async move {
+                    // Build prompt with full history
+                    let mut builder = runtime.continue_with(history);
+
+                    if let Some(ref system) = system_prompt {
+                        builder = builder.system(system);
+                    }
+
+                    // Inject exit tool if enabled
+                    if exit_tool_enabled_val {
+                        let exit_flag = exit_requested.clone();
+                        builder = builder.with_tool_callback(
+                            exit_tool_definition(),
+                            move |_args| {
+                                let flag = exit_flag.clone();
+                                async move {
+                                    flag.store(true, Ordering::SeqCst);
+                                    Ok(serde_json::json!({"status": "goodbye"}))
+                                }
+                            },
+                            |_result| {},
+                        );
+                    }
+
+                    // Add token target if provided
+                    if let Some(target) = token_target {
+                        builder = builder.token_target(target);
+                    }
+
+                    // Collect response
+                    builder.collect().await
+                })
+                .await;
+
+                // Unwrap the JoinHandle result
+                let result = match llm_result {
+                    Ok(r) => r,
+                    Err(join_err) => Err(ActonAIError::prompt_failed(join_err.to_string())),
+                };
+
+                // On success, send assistant message back to actor
+                // (queued BEFORE result is sent to caller → FIFO guarantees ordering)
+                if let Ok(ref response) = result {
+                    self_handle
+                        .send(ConvAddAssistant {
+                            text: response.text.clone(),
+                        })
+                        .await;
+                }
+
+                // Send result to caller
+                let _ = result_tx.send(result).await;
+            })
+        });
+    }
+
+    // ----- ConvAddAssistant: push assistant msg (sync only) -----
+    {
+        let history_tx = history_tx.clone();
+        let history_len = history_len.clone();
+
+        builder.mutate_on::<ConvAddAssistant>(move |actor, ctx| {
+            let text = &ctx.message().text;
+            actor.model.history.push(Message::assistant(text));
+
+            let _ = history_tx.send(actor.model.history.clone());
+            history_len.store(actor.model.history.len(), Ordering::SeqCst);
+
+            Reply::ready()
+        });
+    }
+
+    // ----- ConvClear: clear history (sync only) -----
+    {
+        let history_tx = history_tx.clone();
+        let history_len = history_len.clone();
+
+        builder.mutate_on::<ConvClear>(move |actor, _ctx| {
+            actor.model.history.clear();
+
+            let _ = history_tx.send(actor.model.history.clone());
+            history_len.store(0, Ordering::SeqCst);
+
+            Reply::ready()
+        });
+    }
+
+    // ----- ConvSetSystemPrompt: update watch channel (sync only) -----
+    builder.mutate_on::<ConvSetSystemPrompt>(move |_actor, ctx| {
+        let prompt = ctx.message().prompt.clone();
+        let _ = system_prompt_tx.send(prompt);
+
+        Reply::ready()
+    });
+}
+
+// =========================================================================
+// Conversation — thin, Clone + Send + 'static wrapper
+// =========================================================================
+
 /// A managed conversation with automatic history tracking.
 ///
-/// `Conversation` eliminates the boilerplate of manually managing conversation
-/// history. Each call to [`send`](Self::send) automatically:
+/// `Conversation` is backed by an actor that serializes all operations through
+/// its mailbox. This makes `Conversation` `Clone + Send + 'static` with all
+/// methods taking `&self`, enabling safe sharing across tasks.
+///
+/// Each call to [`send`](Self::send) automatically:
 /// 1. Adds the user message to history
 /// 2. Sends the request to the LLM
 /// 3. Adds the assistant response to history
 /// 4. Returns the response
 ///
-/// Create a `Conversation` using [`ActonAI::conversation()`](ActonAI::conversation).
+/// Create a `Conversation` using [`ActonAI::conversation()`](ActonAI::conversation)
+/// and [`ConversationBuilder::build().await`](ConversationBuilder::build).
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// let mut conv = runtime.conversation()
+/// let conv = runtime.conversation()
 ///     .system("You are a helpful assistant.")
-///     .build();
+///     .build()
+///     .await;
 ///
 /// loop {
 ///     let input = read_user_input();
@@ -212,35 +468,47 @@ fn exit_tool_definition() -> ToolDefinition {
 /// }
 /// ```
 pub struct Conversation {
-    /// The ActonAI runtime (cheaply cloned via Arc)
+    /// Handle to the ConversationActor.
+    handle: ActorHandle,
+    /// The ActonAI runtime (cheaply cloned via Arc).
     runtime: ActonAI,
-    /// Accumulated conversation history
-    history: Vec<Message>,
-    /// Optional system prompt
-    system_prompt: Option<String>,
-    /// Exit flag - set when the exit tool is called
+    /// Exit flag — set when the exit tool is called.
     exit_requested: Arc<AtomicBool>,
-    /// Whether the exit tool is enabled
-    exit_tool_enabled: bool,
+    /// Whether the exit tool is enabled.
+    exit_tool_enabled: Arc<AtomicBool>,
+    /// Broadcast receiver for history changes.
+    history_rx: watch::Receiver<Vec<Message>>,
+    /// Lock-free history length.
+    history_len: Arc<AtomicUsize>,
+    /// Broadcast receiver for system prompt changes.
+    system_prompt_rx: watch::Receiver<Option<String>>,
+}
+
+// Compile-time assertion: Conversation is Clone + Send + 'static.
+const _: () = {
+    #[allow(dead_code)]
+    fn assert_clone_send_static<T: Clone + Send + 'static>() {}
+    #[allow(dead_code)]
+    fn assert_conversation() {
+        assert_clone_send_static::<Conversation>();
+    }
+};
+
+impl Clone for Conversation {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            runtime: self.runtime.clone(),
+            exit_requested: self.exit_requested.clone(),
+            exit_tool_enabled: self.exit_tool_enabled.clone(),
+            history_rx: self.history_rx.clone(),
+            history_len: self.history_len.clone(),
+            system_prompt_rx: self.system_prompt_rx.clone(),
+        }
+    }
 }
 
 impl Conversation {
-    /// Creates a new conversation.
-    fn new(
-        runtime: ActonAI,
-        system_prompt: Option<String>,
-        history: Vec<Message>,
-        exit_tool_enabled: bool,
-    ) -> Self {
-        Self {
-            runtime,
-            history,
-            system_prompt,
-            exit_requested: Arc::new(AtomicBool::new(false)),
-            exit_tool_enabled,
-        }
-    }
-
     /// Sends a message and receives a response, automatically managing history.
     ///
     /// This is the primary method for interacting with a conversation. It:
@@ -267,105 +535,65 @@ impl Conversation {
     /// println!("{}", response.text);  // "Berlin"
     /// ```
     pub async fn send(
-        &mut self,
+        &self,
         content: impl Into<String>,
     ) -> Result<CollectedResponse, ActonAIError> {
-        self.send_with(content, |b| b).await
+        let (tx, mut rx) = mpsc::channel(1);
+        self.handle
+            .send(ConvSend {
+                content: content.into(),
+                token_target: None,
+                result_tx: tx,
+            })
+            .await;
+
+        rx.recv().await.unwrap_or_else(|| {
+            Err(ActonAIError::prompt_failed(
+                "conversation actor dropped".to_string(),
+            ))
+        })
     }
 
-    /// Sends a message with additional prompt configuration.
+    /// Sends a message with streaming tokens delivered to a user-provided actor.
     ///
-    /// This allows per-message customization like adding tools, setting callbacks,
-    /// or modifying other prompt options while still getting automatic history management.
+    /// The `token_handle` actor must have a handler registered for [`StreamToken`]
+    /// messages. Tokens are delivered in order as they arrive from the LLM.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let response = conv.send_with("Process this data", |b| {
-    ///     b.tool(
-    ///         "process",
-    ///         "Process data",
-    ///         schema,
-    ///         |args| async move { Ok(json!({})) },
-    ///     )
-    ///     .on_token(|t| print!("{t}"))
-    /// }).await?;
+    /// // Create a token-handling actor
+    /// let mut printer = runtime.runtime().clone().new_actor::<MyPrinter>();
+    /// printer.mutate_on::<StreamToken>(|_actor, ctx| {
+    ///     print!("{}", ctx.message().text);
+    ///     Reply::ready()
+    /// });
+    /// let printer_handle = printer.start().await;
+    ///
+    /// let response = conv.send_streaming("Tell me a story", &printer_handle).await?;
     /// ```
-    pub async fn send_with<F>(
-        &mut self,
+    pub async fn send_streaming(
+        &self,
         content: impl Into<String>,
-        configure: F,
-    ) -> Result<CollectedResponse, ActonAIError>
-    where
-        F: FnOnce(PromptBuilder) -> PromptBuilder,
-    {
-        let user_content = content.into();
+        token_handle: &ActorHandle,
+    ) -> Result<CollectedResponse, ActonAIError> {
+        let (tx, mut rx) = mpsc::channel(1);
+        self.handle
+            .send(ConvSend {
+                content: content.into(),
+                token_target: Some(token_handle.clone()),
+                result_tx: tx,
+            })
+            .await;
 
-        // Add user message to history
-        self.history.push(Message::user(&user_content));
-
-        // Build the prompt with history
-        let mut builder = self.runtime.continue_with(self.history.clone());
-
-        // Apply system prompt if set
-        if let Some(ref system) = self.system_prompt {
-            builder = builder.system(system);
-        }
-
-        // Inject exit tool if enabled
-        if self.exit_tool_enabled {
-            let exit_flag = Arc::clone(&self.exit_requested);
-            builder = builder.with_tool_callback(
-                exit_tool_definition(),
-                move |_args| {
-                    let flag = Arc::clone(&exit_flag);
-                    async move {
-                        flag.store(true, Ordering::SeqCst);
-                        Ok(serde_json::json!({"status": "goodbye"}))
-                    }
-                },
-                |_result| {},
-            );
-        }
-
-        // Apply user customization
-        builder = configure(builder);
-
-        // Send and collect response
-        let response = builder.collect().await?;
-
-        // Add assistant response to history
-        self.history.push(Message::assistant(&response.text));
-
-        Ok(response)
+        rx.recv().await.unwrap_or_else(|| {
+            Err(ActonAIError::prompt_failed(
+                "conversation actor dropped".to_string(),
+            ))
+        })
     }
 
-    /// Sends a message with a streaming token callback.
-    ///
-    /// This is a convenience method for the common case of wanting to stream
-    /// tokens while still getting automatic history management.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let response = conv.send_streaming("Tell me a story", |token| {
-    ///     print!("{token}");
-    ///     std::io::stdout().flush().ok();
-    /// }).await?;
-    /// println!();
-    /// ```
-    pub async fn send_streaming<F>(
-        &mut self,
-        content: impl Into<String>,
-        on_token: F,
-    ) -> Result<CollectedResponse, ActonAIError>
-    where
-        F: FnMut(&str) + Send + 'static,
-    {
-        self.send_with(content, |b| b.on_token(on_token)).await
-    }
-
-    /// Returns a reference to the conversation history.
+    /// Returns a snapshot of the conversation history.
     ///
     /// This is useful for:
     /// - Serializing the conversation for persistence
@@ -380,25 +608,17 @@ impl Conversation {
     /// }
     /// ```
     #[must_use]
-    pub fn history(&self) -> &[Message] {
-        &self.history
-    }
-
-    /// Returns a mutable reference to the conversation history.
-    ///
-    /// This allows manual manipulation of history when needed, such as:
-    /// - Removing messages to shorten context
-    /// - Editing messages to correct errors
-    /// - Inserting messages for context injection
-    #[must_use]
-    pub fn history_mut(&mut self) -> &mut Vec<Message> {
-        &mut self.history
+    pub fn history(&self) -> Vec<Message> {
+        self.history_rx.borrow().clone()
     }
 
     /// Clears the conversation history.
     ///
     /// This resets the conversation to a fresh state while keeping the system
     /// prompt. Use this to start a new topic without creating a new `Conversation`.
+    ///
+    /// The clear is sent as a fire-and-forget message to the actor and will be
+    /// processed after any in-flight sends complete.
     ///
     /// # Example
     ///
@@ -407,38 +627,54 @@ impl Conversation {
     /// conv.clear();  // Start fresh
     /// conv.send("Topic B discussion...").await?;
     /// ```
-    pub fn clear(&mut self) {
-        self.history.clear();
+    pub fn clear(&self) {
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            handle.send(ConvClear).await;
+        });
     }
 
     /// Returns the number of messages in the conversation history.
     #[must_use]
     pub fn len(&self) -> usize {
-        self.history.len()
+        self.history_len.load(Ordering::SeqCst)
     }
 
     /// Returns true if the conversation history is empty.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.history.is_empty()
+        self.history_len.load(Ordering::SeqCst) == 0
     }
 
     /// Returns the system prompt, if set.
     #[must_use]
-    pub fn system_prompt(&self) -> Option<&str> {
-        self.system_prompt.as_deref()
+    pub fn system_prompt(&self) -> Option<String> {
+        self.system_prompt_rx.borrow().clone()
     }
 
     /// Sets or updates the system prompt.
     ///
     /// This can be used to change the assistant's behavior mid-conversation.
-    pub fn set_system_prompt(&mut self, prompt: impl Into<String>) {
-        self.system_prompt = Some(prompt.into());
+    /// The change is sent as a fire-and-forget message and will take effect
+    /// on the next [`send`](Self::send) call.
+    pub fn set_system_prompt(&self, prompt: impl Into<String>) {
+        let handle = self.handle.clone();
+        let prompt = prompt.into();
+        tokio::spawn(async move {
+            handle
+                .send(ConvSetSystemPrompt {
+                    prompt: Some(prompt),
+                })
+                .await;
+        });
     }
 
     /// Clears the system prompt.
-    pub fn clear_system_prompt(&mut self) {
-        self.system_prompt = None;
+    pub fn clear_system_prompt(&self) {
+        let handle = self.handle.clone();
+        tokio::spawn(async move {
+            handle.send(ConvSetSystemPrompt { prompt: None }).await;
+        });
     }
 
     /// Returns `true` if the exit tool has been called.
@@ -485,7 +721,7 @@ impl Conversation {
     ///     }
     /// }
     /// ```
-    pub fn clear_exit(&mut self) {
+    pub fn clear_exit(&self) {
         self.exit_requested.store(false, Ordering::SeqCst);
     }
 
@@ -512,7 +748,7 @@ impl Conversation {
     /// Returns whether the exit tool is enabled for this conversation.
     #[must_use]
     pub fn is_exit_tool_enabled(&self) -> bool {
-        self.exit_tool_enabled
+        self.exit_tool_enabled.load(Ordering::SeqCst)
     }
 
     /// Runs a complete terminal chat loop.
@@ -547,7 +783,7 @@ impl Conversation {
     ///     .run_chat()
     ///     .await?;
     /// ```
-    pub async fn run_chat(&mut self) -> Result<(), ActonAIError> {
+    pub async fn run_chat(&self) -> Result<(), ActonAIError> {
         self.run_chat_with(ChatConfig::default()).await
     }
 
@@ -572,28 +808,36 @@ impl Conversation {
     ///         .user_prompt(">>> ")
     ///         .assistant_prompt("AI: ")
     ///         .map_input(|s| format!("[context] {}", s))
-    ///         .on_token(|t| {
-    ///             print!("{t}");
-    ///             std::io::stdout().flush().ok();
-    ///         })
     /// ).await?;
     /// ```
-    pub async fn run_chat_with(&mut self, mut config: ChatConfig) -> Result<(), ActonAIError> {
+    pub async fn run_chat_with(&self, mut config: ChatConfig) -> Result<(), ActonAIError> {
         use std::io::{BufRead, Write};
 
         // Auto-enable exit tool since chat loop depends on it
-        if !self.exit_tool_enabled {
-            self.exit_tool_enabled = true;
-        }
+        self.exit_tool_enabled.store(true, Ordering::SeqCst);
 
         // Use default system prompt if none is set
-        if self.system_prompt.is_none() {
-            self.system_prompt = Some(DEFAULT_SYSTEM_PROMPT.to_string());
+        if self.system_prompt_rx.borrow().is_none() {
+            self.handle
+                .send(ConvSetSystemPrompt {
+                    prompt: Some(DEFAULT_SYSTEM_PROMPT.to_string()),
+                })
+                .await;
         }
+
+        // Create a temporary token actor for stdout printing
+        let mut actor_runtime = self.runtime.runtime().clone();
+        let mut token_actor = actor_runtime.new_actor::<StdoutTokenPrinter>();
+        token_actor.mutate_on::<StreamToken>(|_actor, ctx| {
+            print!("{}", ctx.message().text);
+            std::io::stdout().flush().ok();
+            Reply::ready()
+        });
+        let token_handle = token_actor.start().await;
 
         let stdin = std::io::stdin();
 
-        loop {
+        let result = loop {
             // Print user prompt and flush
             print!("{}", config.user_prompt);
             std::io::stdout().flush().ok();
@@ -601,7 +845,7 @@ impl Conversation {
             // Read input line
             let mut input = String::new();
             if stdin.lock().read_line(&mut input).unwrap_or(0) == 0 {
-                break; // EOF
+                break Ok(()); // EOF
             }
 
             let input = input.trim();
@@ -619,30 +863,41 @@ impl Conversation {
             print!("{}", config.assistant_prompt);
             std::io::stdout().flush().ok();
 
-            // Stream response to stdout
-            self.send_streaming(&content, |token| {
-                print!("{token}");
-                std::io::stdout().flush().ok();
-            })
-            .await?;
-            println!();
+            // Stream response to stdout via the token actor
+            match self.send_streaming(&content, &token_handle).await {
+                Ok(_) => {
+                    println!();
+                }
+                Err(e) => {
+                    break Err(e);
+                }
+            }
 
             // Check for exit
             if self.should_exit() {
-                break;
+                break Ok(());
             }
-        }
+        };
 
-        Ok(())
+        // Stop the temporary token actor
+        let _ = token_handle.stop().await;
+
+        result
     }
 }
 
 impl std::fmt::Debug for Conversation {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Conversation")
-            .field("history_len", &self.history.len())
-            .field("has_system_prompt", &self.system_prompt.is_some())
-            .field("exit_tool_enabled", &self.exit_tool_enabled)
+            .field("history_len", &self.history_len.load(Ordering::SeqCst))
+            .field(
+                "has_system_prompt",
+                &self.system_prompt_rx.borrow().is_some(),
+            )
+            .field(
+                "exit_tool_enabled",
+                &self.exit_tool_enabled.load(Ordering::SeqCst),
+            )
             .field(
                 "exit_requested",
                 &self.exit_requested.load(Ordering::SeqCst),
@@ -650,6 +905,10 @@ impl std::fmt::Debug for Conversation {
             .finish_non_exhaustive()
     }
 }
+
+// =========================================================================
+// ConversationBuilder
+// =========================================================================
 
 /// Builder for creating a [`Conversation`].
 ///
@@ -661,7 +920,8 @@ impl std::fmt::Debug for Conversation {
 /// let conv = runtime.conversation()
 ///     .system("You are a helpful assistant.")
 ///     .restore(saved_history)
-///     .build();
+///     .build()
+///     .await;
 /// ```
 pub struct ConversationBuilder {
     runtime: ActonAI,
@@ -692,7 +952,8 @@ impl ConversationBuilder {
     /// ```rust,ignore
     /// let conv = runtime.conversation()
     ///     .system("You are a concise assistant. Answer in one sentence.")
-    ///     .build();
+    ///     .build()
+    ///     .await;
     /// ```
     #[must_use]
     pub fn system(mut self, prompt: impl Into<String>) -> Self {
@@ -714,7 +975,8 @@ impl ConversationBuilder {
     /// let conv = runtime.conversation()
     ///     .system("Be helpful.")
     ///     .restore(saved)
-    ///     .build();
+    ///     .build()
+    ///     .await;
     /// ```
     #[must_use]
     pub fn restore(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
@@ -733,14 +995,15 @@ impl ConversationBuilder {
     /// # Example
     ///
     /// ```rust,ignore
-    /// let mut conv = runtime.conversation()
+    /// let conv = runtime.conversation()
     ///     .system("Be helpful. Use exit_conversation when the user says goodbye.")
     ///     .with_exit_tool()
-    ///     .build();
+    ///     .build()
+    ///     .await;
     ///
     /// loop {
     ///     let input = read_input();
-    ///     conv.send_streaming(&input, |t| print!("{t}")).await?;
+    ///     let response = conv.send(&input).await?;
     ///
     ///     if conv.should_exit() {
     ///         break;
@@ -768,8 +1031,9 @@ impl ConversationBuilder {
     /// ```rust,ignore
     /// let conv = runtime.conversation()
     ///     .system("You are helpful.")
-    ///     .without_exit_tool()  // Don't enable exit tool by default
-    ///     .build();
+    ///     .without_exit_tool()
+    ///     .build()
+    ///     .await;
     ///
     /// // Manual control over conversation
     /// loop {
@@ -785,18 +1049,57 @@ impl ConversationBuilder {
         self
     }
 
-    /// Builds the conversation.
+    /// Builds the conversation by spawning a [`ConversationActor`].
     ///
     /// After calling this, you can use [`Conversation::send`] to interact
-    /// with the LLM.
-    #[must_use]
-    pub fn build(self) -> Conversation {
-        Conversation::new(
-            self.runtime,
-            self.system_prompt,
-            self.history,
-            self.exit_tool_enabled,
-        )
+    /// with the LLM. The returned `Conversation` is `Clone + Send + 'static`.
+    pub async fn build(self) -> Conversation {
+        let initial_history = self.history;
+
+        // Create watch channels with initial values
+        let (history_tx, history_rx) = watch::channel(initial_history.clone());
+        let (system_prompt_tx, system_prompt_rx) = watch::channel(self.system_prompt);
+
+        let history_len = Arc::new(AtomicUsize::new(initial_history.len()));
+        let exit_requested = Arc::new(AtomicBool::new(false));
+        let exit_tool_enabled = Arc::new(AtomicBool::new(self.exit_tool_enabled));
+
+        // Create the actor
+        let mut actor_runtime = self.runtime.runtime().clone();
+        let mut actor_builder = actor_runtime.new_actor::<ConversationActor>();
+
+        // Set initial history in the actor model
+        actor_builder.model.history = initial_history;
+
+        let actor_handle = actor_builder.handle().clone();
+
+        // Configure all message handlers
+        configure_handlers(
+            &mut actor_builder,
+            HandlerState {
+                runtime: self.runtime.clone(),
+                self_handle: actor_handle.clone(),
+                history_tx: Arc::new(history_tx),
+                history_len: history_len.clone(),
+                exit_requested: exit_requested.clone(),
+                exit_tool_enabled: exit_tool_enabled.clone(),
+                system_prompt_rx: system_prompt_rx.clone(),
+                system_prompt_tx,
+            },
+        );
+
+        // Start the actor
+        let _started = actor_builder.start().await;
+
+        Conversation {
+            handle: actor_handle,
+            runtime: self.runtime,
+            exit_requested,
+            exit_tool_enabled,
+            history_rx,
+            history_len,
+            system_prompt_rx,
+        }
     }
 
     /// Builds the conversation and immediately runs the chat loop.
@@ -832,7 +1135,7 @@ impl ConversationBuilder {
     ///     .await?;
     /// ```
     pub async fn run_chat(self) -> Result<(), ActonAIError> {
-        self.build().run_chat().await
+        self.build().await.run_chat().await
     }
 
     /// Builds the conversation and immediately runs the chat loop with custom config.
@@ -857,7 +1160,7 @@ impl ConversationBuilder {
     ///     .await?;
     /// ```
     pub async fn run_chat_with(self, config: ChatConfig) -> Result<(), ActonAIError> {
-        self.build().run_chat_with(config).await
+        self.build().await.run_chat_with(config).await
     }
 }
 
