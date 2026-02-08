@@ -1,14 +1,16 @@
-# Hidden files and directories (except .gitignore and .env.example)
+# Hidden files and directories (except .gitignore, .env.example, .github)
 .*
 !.gitignore
 !.env.example
 !**/.env.example
+!.github
 
-# Text and markdown files (except README.md and example skills)
+# Text and markdown files (except README.md, example skills, and docs)
 *.txt
 *.md
 !README.md
 !examples/skills/*.md
+!docs/**/*.md
 
 # Rust
 /target/

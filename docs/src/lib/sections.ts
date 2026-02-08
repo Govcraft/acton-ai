@@ -39,11 +39,11 @@ function isH3Node(node: Node): node is H3Node {
   return isHeadingNode(node) && node.attributes.level === 3
 }
 
-function getNodeText(node: Node) {
+function getNodeText(node: Node): string {
   let text = ''
   for (let child of node.children ?? []) {
     if (child.type === 'text') {
-      text += child.attributes.content
+      text += child.attributes.content ?? ''
     }
     text += getNodeText(child)
   }

@@ -30,8 +30,19 @@ const nodes = {
       let slugify = documentSlugifyMap.get(config)
       let attributes = node.transformAttributes(config)
       let children = node.transformChildren(config)
-      let text = children.filter((child) => typeof child === 'string').join(' ')
-      let id = attributes.id ?? slugify(text)
+
+      function extractText(nodes) {
+        return nodes
+          .map((child) => {
+            if (typeof child === 'string') return child
+            if (child && child.children) return extractText(child.children)
+            return ''
+          })
+          .join('')
+      }
+
+      let text = extractText(children).trim() || 'section'
+      let id = attributes.id ?? (text ? slugify(text) : 'section')
 
       return new Tag(
         `h${node.attributes.level}`,
