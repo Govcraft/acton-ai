@@ -451,7 +451,13 @@ impl LLMClient for OpenAIClient {
             })
             .unwrap_or_default();
 
-        let stop_reason = Self::parse_stop_reason(choice.finish_reason.as_deref());
+        // If tool calls are present, force ToolUse stop reason even if the
+        // provider (e.g. Ollama) sent "stop" instead of "tool_calls".
+        let stop_reason = if !tool_calls.is_empty() {
+            StopReason::ToolUse
+        } else {
+            Self::parse_stop_reason(choice.finish_reason.as_deref())
+        };
 
         Ok(LLMClientResponse {
             content,
@@ -564,6 +570,7 @@ impl LLMClient for OpenAIClient {
                                                 // Handle finish reason
                                                 if let Some(ref reason) = choice.finish_reason {
                                                     // Emit any accumulated tool calls
+                                                    let mut emitted_tool_calls = false;
                                                     for acc in state.tool_accumulators.values() {
                                                         if let (Some(id), Some(name)) =
                                                             (&acc.id, &acc.name)
@@ -583,15 +590,24 @@ impl LLMClient for OpenAIClient {
                                                                     },
                                                                 },
                                                             ));
+                                                            emitted_tool_calls = true;
                                                         }
                                                     }
 
+                                                    // If tool calls were emitted, force ToolUse
+                                                    // stop reason even if the provider (e.g. Ollama)
+                                                    // sent "stop" instead of "tool_calls".
+                                                    let stop_reason = if emitted_tool_calls {
+                                                        StopReason::ToolUse
+                                                    } else {
+                                                        OpenAIClient::parse_stop_reason(
+                                                            Some(reason),
+                                                        )
+                                                    };
+
                                                     state.pending_events.push_back(Ok(
                                                         LLMStreamEvent::End {
-                                                            stop_reason:
-                                                                OpenAIClient::parse_stop_reason(
-                                                                    Some(reason),
-                                                                ),
+                                                            stop_reason,
                                                         },
                                                     ));
                                                 }
