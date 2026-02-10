@@ -5,7 +5,7 @@
 
 use crate::llm::anthropic::AnthropicClient;
 use crate::llm::client::{LLMClient, LLMStreamEvent};
-use crate::llm::config::{ProviderConfig, ProviderType};
+use crate::llm::config::{ProviderConfig, ProviderType, SamplingParams};
 use crate::llm::openai::OpenAIClient;
 use crate::llm::streaming::StreamAccumulator;
 use crate::messages::{
@@ -314,6 +314,16 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 .map(|c| c.rate_limit.queue_when_limited) // Streaming is enabled by default
                 .unwrap_or(true);
 
+            // Merge provider-level sampling defaults with per-request overrides
+            let merged_sampling = {
+                let base = &config.sampling;
+                match &request.sampling {
+                    Some(overrides) => Some(base.merge_with(overrides)),
+                    None if !base.is_empty() => Some(base.clone()),
+                    _ => None,
+                }
+            };
+
             // Record the request
             actor
                 .model
@@ -325,9 +335,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             if let Some(client) = client {
                 tokio::spawn(async move {
                     if streaming {
-                        process_streaming_request(&client, &request, &broker).await;
+                        process_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
                     } else {
-                        process_non_streaming_request(&client, &request, &broker).await;
+                        process_non_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
                     }
                 });
             }
@@ -381,6 +391,16 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 let broker = actor.broker().clone();
                 let request = pending.request;
 
+                // Merge provider-level sampling defaults with per-request overrides
+                let merged_sampling = {
+                    let base = &config.sampling;
+                    match &request.sampling {
+                        Some(overrides) => Some(base.merge_with(overrides)),
+                        None if !base.is_empty() => Some(base.clone()),
+                        _ => None,
+                    }
+                };
+
                 actor
                     .model
                     .rate_limiter
@@ -390,7 +410,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 // Spawn the request processing
                 tokio::spawn(async move {
                     if let Some(client) = client {
-                        process_streaming_request(&client, &request, &broker).await;
+                        process_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
                     }
                 });
             } else {
@@ -438,6 +458,7 @@ async fn process_streaming_request(
     client: &Arc<dyn LLMClient>,
     request: &LLMRequest,
     broker: &ActorHandle,
+    sampling: Option<&SamplingParams>,
 ) {
     let correlation_id = &request.correlation_id;
     let provider_name = client.provider_name();
@@ -454,7 +475,7 @@ async fn process_streaming_request(
 
     // Start streaming request
     match client
-        .send_streaming_request(&request.messages, tools)
+        .send_streaming_request(&request.messages, tools, sampling)
         .await
     {
         Ok(mut stream) => {
@@ -577,6 +598,7 @@ async fn process_non_streaming_request(
     client: &Arc<dyn LLMClient>,
     request: &LLMRequest,
     broker: &ActorHandle,
+    sampling: Option<&SamplingParams>,
 ) {
     let correlation_id = &request.correlation_id;
     let provider_name = client.provider_name();
@@ -584,7 +606,7 @@ async fn process_non_streaming_request(
     // Convert tools if present
     let tools = request.tools.as_deref();
 
-    match client.send_request(&request.messages, tools).await {
+    match client.send_request(&request.messages, tools, sampling).await {
         Ok(response) => {
             broker
                 .broadcast(LLMResponse {
@@ -682,6 +704,7 @@ mod tests {
             agent_id: AgentId::new(),
             messages: vec![Message::user("Hello world")], // 11 chars
             tools: None,
+            sampling: None,
         };
 
         let tokens = estimate_tokens(&request);

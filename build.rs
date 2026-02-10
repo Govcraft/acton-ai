@@ -48,7 +48,9 @@ fn can_compile_guests() -> bool {
         PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR not set"));
     let guests_dir = manifest_dir.join("guests").join("shell_guest").join("src");
     if !guests_dir.exists() {
-        println!("cargo:warning=Guest compilation skipped: guests source not found (crates.io build)");
+        println!(
+            "cargo:warning=Guest compilation skipped: guests source not found (crates.io build)"
+        );
         return false;
     }
 

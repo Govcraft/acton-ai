@@ -41,6 +41,7 @@
 use crate::conversation::StreamToken;
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
+use crate::llm::SamplingParams;
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
     StopReason, ToolCall, ToolDefinition,
@@ -194,6 +195,8 @@ pub struct PromptBuilder {
     provider_name: Option<String>,
     /// Optional actor handle to receive [`StreamToken`] messages
     token_target: Option<ActorHandle>,
+    /// Optional sampling parameters for this prompt
+    sampling: Option<SamplingParams>,
 }
 
 impl PromptBuilder {
@@ -214,6 +217,7 @@ impl PromptBuilder {
             max_tool_rounds: 10,
             provider_name: None,
             token_target: None,
+            sampling: None,
         }
     }
 
@@ -552,6 +556,80 @@ impl PromptBuilder {
         self
     }
 
+    /// Sets the sampling parameters for this prompt.
+    ///
+    /// These override any provider-level defaults.
+    #[must_use]
+    pub fn sampling(mut self, params: SamplingParams) -> Self {
+        self.sampling = Some(params);
+        self
+    }
+
+    /// Sets the temperature for this prompt.
+    ///
+    /// Overrides any provider-level default temperature.
+    #[must_use]
+    pub fn temperature(mut self, temperature: f64) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .temperature = Some(temperature);
+        self
+    }
+
+    /// Sets top_p (nucleus) sampling for this prompt.
+    #[must_use]
+    pub fn top_p(mut self, top_p: f64) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .top_p = Some(top_p);
+        self
+    }
+
+    /// Sets top_k sampling for this prompt.
+    #[must_use]
+    pub fn top_k(mut self, top_k: u32) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .top_k = Some(top_k);
+        self
+    }
+
+    /// Sets stop sequences for this prompt.
+    #[must_use]
+    pub fn stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .stop_sequences = Some(sequences);
+        self
+    }
+
+    /// Sets the frequency penalty for this prompt.
+    #[must_use]
+    pub fn frequency_penalty(mut self, penalty: f64) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .frequency_penalty = Some(penalty);
+        self
+    }
+
+    /// Sets the presence penalty for this prompt.
+    #[must_use]
+    pub fn presence_penalty(mut self, penalty: f64) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .presence_penalty = Some(penalty);
+        self
+    }
+
+    /// Sets the seed for deterministic generation.
+    #[must_use]
+    pub fn seed(mut self, seed: u64) -> Self {
+        self.sampling
+            .get_or_insert_with(SamplingParams::default)
+            .seed = Some(seed);
+        self
+    }
+
     /// Sets a target actor to receive [`StreamToken`] messages during streaming.
     ///
     /// When set, each token received from the LLM is forwarded as a [`StreamToken`]
@@ -656,6 +734,7 @@ impl PromptBuilder {
             max_tool_rounds,
             provider_name,
             token_target,
+            sampling,
         } = self;
 
         // Resolve the provider handle
@@ -727,6 +806,7 @@ impl PromptBuilder {
                 } else {
                     None
                 },
+                sampling: sampling.clone(),
             };
 
             // Collect stream response

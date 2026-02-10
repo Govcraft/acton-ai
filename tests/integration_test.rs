@@ -282,6 +282,7 @@ fn test_llm_request_creation() {
         agent_id: agent_id.clone(),
         messages: vec![Message::system("You are helpful"), Message::user("Hello")],
         tools: None,
+        sampling: None,
     };
 
     assert_eq!(request.correlation_id, corr_id);

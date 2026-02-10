@@ -231,6 +231,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
             } else {
                 Some(actor.model.tool_definitions.clone())
             },
+            sampling: None,
         };
 
         // Broadcast LLM request via broker for LLM Provider to pick up
@@ -766,6 +767,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
                         } else {
                             Some(actor.model.tool_definitions.clone())
                         },
+                        sampling: None,
                     };
 
                     // Re-add to pending

@@ -14,7 +14,7 @@ mod streaming;
 
 pub use anthropic::AnthropicClient;
 pub use client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
-pub use config::{ProviderConfig, ProviderType, RateLimitConfig};
+pub use config::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
 pub use error::{LLMError, LLMErrorKind};
 pub use openai::OpenAIClient;
 pub use provider::{InitLLMProvider, LLMProvider};

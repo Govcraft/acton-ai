@@ -145,6 +145,75 @@ Available builder methods:
 | `.with_base_url(url)` | Override the API base URL | Provider-dependent |
 | `.with_rate_limit(config)` | Rate limiting settings | 50 req/min, 40k tokens/min |
 | `.with_retry(config)` | Retry settings | 3 retries, exponential backoff |
+| `.with_sampling(params)` | Set all sampling parameters at once | None |
+| `.with_temperature(f64)` | Set sampling temperature | Provider default |
+| `.with_top_p(f64)` | Set nucleus sampling (top-p) | Provider default |
+| `.with_top_k(u32)` | Set top-k sampling (Anthropic/Ollama) | Provider default |
+| `.with_stop_sequences(vec)` | Set custom stop sequences | None |
+
+## Sampling parameters
+
+Sampling parameters control the randomness and diversity of LLM output. You can set defaults at the provider level, and optionally override them per-prompt via the [PromptBuilder](/docs/api-prompt-builder).
+
+Provider-level defaults apply to every request sent through that provider. Per-prompt overrides (set on `PromptBuilder`) take precedence and are merged on top -- only the fields you set are overridden, the rest fall back to the provider default.
+
+### Programmatic configuration
+
+```rust
+use acton_ai::prelude::*;
+
+// Set defaults on the provider
+let config = ProviderConfig::anthropic("sk-ant-...")
+    .with_temperature(0.7)
+    .with_top_p(0.9);
+
+// Or set all parameters at once
+let config = ProviderConfig::openai("sk-...")
+    .with_sampling(SamplingParams {
+        temperature: Some(0.8),
+        top_p: Some(0.95),
+        frequency_penalty: Some(0.5),
+        ..Default::default()
+    });
+```
+
+### TOML configuration
+
+Sampling fields are set directly on the provider section:
+
+```toml
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key_env = "ANTHROPIC_API_KEY"
+temperature = 0.7
+top_p = 0.9
+top_k = 40
+
+[providers.openai]
+type = "openai"
+model = "gpt-4o"
+api_key_env = "OPENAI_API_KEY"
+temperature = 0.8
+frequency_penalty = 0.5
+presence_penalty = 0.3
+```
+
+### Available parameters
+
+| Parameter | Type | Supported by | Description |
+|---|---|---|---|
+| `temperature` | `f64` | All providers | Controls randomness (0.0 = deterministic, higher = more random) |
+| `top_p` | `f64` | All providers | Nucleus sampling -- consider tokens within this cumulative probability |
+| `top_k` | `u32` | Anthropic, Ollama | Only consider the top-k most likely tokens |
+| `frequency_penalty` | `f64` | OpenAI | Penalize tokens based on their frequency in the text so far |
+| `presence_penalty` | `f64` | OpenAI | Penalize tokens that have appeared at all in the text so far |
+| `seed` | `u64` | OpenAI | Seed for deterministic sampling (best-effort) |
+| `stop_sequences` | `Vec<String>` | All providers | Custom sequences that cause the model to stop generating |
+
+{% callout type="note" title="Provider-specific parameters" %}
+Parameters not supported by a provider are silently ignored. For example, setting `top_k` on an OpenAI provider has no effect. This lets you share a `SamplingParams` across providers without errors.
+{% /callout %}
 
 ## Rate limiting configuration
 

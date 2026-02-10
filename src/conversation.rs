@@ -289,10 +289,7 @@ struct HandlerState {
 }
 
 /// Registers all message handlers on the `ConversationActor` builder.
-fn configure_handlers(
-    builder: &mut ManagedActor<Idle, ConversationActor>,
-    state: HandlerState,
-) {
+fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state: HandlerState) {
     let HandlerState {
         runtime,
         self_handle,

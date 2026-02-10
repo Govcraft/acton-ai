@@ -3,7 +3,7 @@
 //! This module provides types for defining multiple named LLM providers
 //! and sandbox settings in configuration files.
 
-use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig};
+use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
 use crate::tools::sandbox::hyperlight::{PoolConfig, SandboxConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -155,6 +155,34 @@ pub struct NamedProviderConfig {
     /// Rate limiting configuration.
     #[serde(default)]
     pub rate_limit: Option<RateLimitFileConfig>,
+
+    /// Controls randomness in generation (0.0 to 1.0 for Anthropic, 0.0 to 2.0 for OpenAI).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    /// Limits sampling to the top K most likely tokens (Anthropic only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+
+    /// Nucleus sampling threshold.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    /// Penalizes tokens based on frequency (OpenAI only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+
+    /// Penalizes tokens based on presence (OpenAI only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+
+    /// Seed for deterministic generation (OpenAI only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+
+    /// Sequences that will cause the model to stop generating.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
 }
 
 impl NamedProviderConfig {
@@ -170,6 +198,13 @@ impl NamedProviderConfig {
             timeout_secs: None,
             max_tokens: None,
             rate_limit: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop_sequences: None,
         }
     }
 
@@ -185,6 +220,13 @@ impl NamedProviderConfig {
             timeout_secs: None,
             max_tokens: None,
             rate_limit: None,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop_sequences: None,
         }
     }
 
@@ -203,6 +245,13 @@ impl NamedProviderConfig {
                 requests_per_minute: 1000,
                 tokens_per_minute: 1_000_000,
             }),
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop_sequences: None,
         }
     }
 
@@ -245,6 +294,34 @@ impl NamedProviderConfig {
     #[must_use]
     pub fn with_rate_limit(mut self, rate_limit: RateLimitFileConfig) -> Self {
         self.rate_limit = Some(rate_limit);
+        self
+    }
+
+    /// Sets the temperature.
+    #[must_use]
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets top_k sampling.
+    #[must_use]
+    pub fn with_top_k(mut self, top_k: u32) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Sets top_p (nucleus) sampling.
+    #[must_use]
+    pub fn with_top_p(mut self, top_p: f64) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    /// Sets the stop sequences.
+    #[must_use]
+    pub fn with_stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.stop_sequences = Some(sequences);
         self
     }
 
@@ -330,6 +407,33 @@ impl NamedProviderConfig {
 
         if let Some(ref rate_limit) = self.rate_limit {
             config = config.with_rate_limit(rate_limit.to_rate_limit_config());
+        }
+
+        // Build sampling params from individual fields
+        let mut sampling = SamplingParams::default();
+        if let Some(temp) = self.temperature {
+            sampling.temperature = Some(temp);
+        }
+        if let Some(k) = self.top_k {
+            sampling.top_k = Some(k);
+        }
+        if let Some(p) = self.top_p {
+            sampling.top_p = Some(p);
+        }
+        if let Some(fp) = self.frequency_penalty {
+            sampling.frequency_penalty = Some(fp);
+        }
+        if let Some(pp) = self.presence_penalty {
+            sampling.presence_penalty = Some(pp);
+        }
+        if let Some(s) = self.seed {
+            sampling.seed = Some(s);
+        }
+        if let Some(ref seqs) = self.stop_sequences {
+            sampling.stop_sequences = Some(seqs.clone());
+        }
+        if !sampling.is_empty() {
+            config = config.with_sampling(sampling);
         }
 
         config
@@ -907,6 +1011,53 @@ pool_warmup = 8
         assert_eq!(sandbox.pool_warmup, Some(8));
         assert!(sandbox.pool_max_per_type.is_none());
         assert!(sandbox.limits.is_none());
+    }
+
+    #[test]
+    fn named_provider_config_sampling_fields_default_to_none() {
+        let config = NamedProviderConfig::anthropic("claude-sonnet-4-20250514");
+        assert!(config.temperature.is_none());
+        assert!(config.top_k.is_none());
+        assert!(config.top_p.is_none());
+        assert!(config.frequency_penalty.is_none());
+        assert!(config.presence_penalty.is_none());
+        assert!(config.seed.is_none());
+        assert!(config.stop_sequences.is_none());
+    }
+
+    #[test]
+    fn named_provider_config_to_provider_config_with_sampling() {
+        let config = NamedProviderConfig::anthropic("claude-sonnet-4-20250514")
+            .with_temperature(0.7)
+            .with_top_p(0.9);
+
+        let provider = config.to_provider_config();
+        assert_eq!(provider.sampling.temperature, Some(0.7));
+        assert_eq!(provider.sampling.top_p, Some(0.9));
+    }
+
+    #[test]
+    fn config_from_toml_with_sampling_params() {
+        let toml_str = r#"
+default_provider = "claude"
+
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+api_key_env = "ANTHROPIC_API_KEY"
+temperature = 0.7
+top_p = 0.9
+stop_sequences = ["END", "STOP"]
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let claude = config.providers.get("claude").unwrap();
+        assert_eq!(claude.temperature, Some(0.7));
+        assert_eq!(claude.top_p, Some(0.9));
+        assert_eq!(
+            claude.stop_sequences,
+            Some(vec!["END".to_string(), "STOP".to_string()])
+        );
     }
 
     #[test]

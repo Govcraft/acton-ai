@@ -4,7 +4,7 @@
 //! including streaming SSE response handling.
 
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
-use crate::llm::config::ProviderConfig;
+use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
 use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolDefinition};
 use async_trait::async_trait;
@@ -33,6 +33,14 @@ struct MessagesRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiTool>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_k: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop_sequences: Option<Vec<String>>,
 }
 
 /// A message in the API format.
@@ -240,6 +248,7 @@ impl AnthropicClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<MessagesResponse, LLMError> {
         let (system, api_messages) = self.convert_messages(messages);
 
@@ -250,6 +259,10 @@ impl AnthropicClient {
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
             stream: false,
+            temperature: sampling.and_then(|s| s.temperature),
+            top_k: sampling.and_then(|s| s.top_k),
+            top_p: sampling.and_then(|s| s.top_p),
+            stop_sequences: sampling.and_then(|s| s.stop_sequences.clone()),
         };
 
         let response = self
@@ -284,6 +297,7 @@ impl AnthropicClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<impl futures::Stream<Item = Result<StreamEvent, LLMError>>, LLMError> {
         let (system, api_messages) = self.convert_messages(messages);
 
@@ -294,6 +308,10 @@ impl AnthropicClient {
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
             stream: true,
+            temperature: sampling.and_then(|s| s.temperature),
+            top_k: sampling.and_then(|s| s.top_k),
+            top_p: sampling.and_then(|s| s.top_p),
+            stop_sequences: sampling.and_then(|s| s.stop_sequences.clone()),
         };
 
         let response = self
@@ -603,8 +621,9 @@ impl LLMClient for AnthropicClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMClientResponse, LLMError> {
-        let response = self.send_messages(messages, tools).await?;
+        let response = self.send_messages(messages, tools, sampling).await?;
         Ok(LLMClientResponse {
             content: extract_text_content(&response),
             tool_calls: extract_tool_calls(&response),
@@ -620,8 +639,9 @@ impl LLMClient for AnthropicClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMEventStream, LLMError> {
-        let stream = self.send_messages_streaming(messages, tools).await?;
+        let stream = self.send_messages_streaming(messages, tools, sampling).await?;
         Ok(Box::pin(convert_anthropic_stream(stream)))
     }
 

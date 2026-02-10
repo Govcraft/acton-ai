@@ -99,7 +99,7 @@ pub mod prelude {
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,
         LLMEventStream, LLMProvider, LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderType,
-        RateLimitConfig,
+        RateLimitConfig, SamplingParams,
     };
     pub use crate::memory::{
         AgentStateSnapshot, ContextStats, ContextWindow, ContextWindowConfig,

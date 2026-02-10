@@ -50,8 +50,152 @@ impl ProviderType {
     }
 }
 
+/// Sampling parameters for LLM text generation.
+///
+/// These parameters control the randomness and creativity of the model's output.
+/// All fields are optional — only set values are sent to the API.
+///
+/// The merge order is: per-prompt overrides > per-provider defaults > API defaults.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SamplingParams {
+    /// Controls randomness in generation.
+    ///
+    /// - Anthropic: 0.0 to 1.0 (default 1.0)
+    /// - OpenAI: 0.0 to 2.0 (default 1.0)
+    ///
+    /// Lower values produce more deterministic output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub temperature: Option<f64>,
+
+    /// Limits sampling to the top K most likely tokens.
+    ///
+    /// Supported by Anthropic. Not supported by OpenAI (ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_k: Option<u32>,
+
+    /// Nucleus sampling: limits to tokens whose cumulative probability
+    /// exceeds this threshold.
+    ///
+    /// Supported by both Anthropic and OpenAI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub top_p: Option<f64>,
+
+    /// Penalizes tokens based on their frequency in the generated text so far.
+    ///
+    /// Supported by OpenAI (-2.0 to 2.0). Not supported by Anthropic (ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub frequency_penalty: Option<f64>,
+
+    /// Penalizes tokens based on whether they appear in the generated text so far.
+    ///
+    /// Supported by OpenAI (-2.0 to 2.0). Not supported by Anthropic (ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub presence_penalty: Option<f64>,
+
+    /// Seed for deterministic generation.
+    ///
+    /// Supported by OpenAI. Not supported by Anthropic (ignored).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seed: Option<u64>,
+
+    /// Sequences that will cause the model to stop generating.
+    ///
+    /// - Anthropic: `stop_sequences` field
+    /// - OpenAI: `stop` field
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_sequences: Option<Vec<String>>,
+}
+
+impl SamplingParams {
+    /// Creates new empty sampling parameters.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the temperature.
+    #[must_use]
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets top_k sampling.
+    #[must_use]
+    pub fn with_top_k(mut self, top_k: u32) -> Self {
+        self.top_k = Some(top_k);
+        self
+    }
+
+    /// Sets top_p (nucleus) sampling.
+    #[must_use]
+    pub fn with_top_p(mut self, top_p: f64) -> Self {
+        self.top_p = Some(top_p);
+        self
+    }
+
+    /// Sets the frequency penalty.
+    #[must_use]
+    pub fn with_frequency_penalty(mut self, penalty: f64) -> Self {
+        self.frequency_penalty = Some(penalty);
+        self
+    }
+
+    /// Sets the presence penalty.
+    #[must_use]
+    pub fn with_presence_penalty(mut self, penalty: f64) -> Self {
+        self.presence_penalty = Some(penalty);
+        self
+    }
+
+    /// Sets the seed for deterministic generation.
+    #[must_use]
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    /// Sets the stop sequences.
+    #[must_use]
+    pub fn with_stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.stop_sequences = Some(sequences);
+        self
+    }
+
+    /// Returns true if no parameters are set.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.temperature.is_none()
+            && self.top_k.is_none()
+            && self.top_p.is_none()
+            && self.frequency_penalty.is_none()
+            && self.presence_penalty.is_none()
+            && self.seed.is_none()
+            && self.stop_sequences.is_none()
+    }
+
+    /// Merges two `SamplingParams`, with `overrides` taking precedence.
+    ///
+    /// Fields set in `overrides` replace fields in `self`.
+    #[must_use]
+    pub fn merge_with(&self, overrides: &SamplingParams) -> SamplingParams {
+        SamplingParams {
+            temperature: overrides.temperature.or(self.temperature),
+            top_k: overrides.top_k.or(self.top_k),
+            top_p: overrides.top_p.or(self.top_p),
+            frequency_penalty: overrides.frequency_penalty.or(self.frequency_penalty),
+            presence_penalty: overrides.presence_penalty.or(self.presence_penalty),
+            seed: overrides.seed.or(self.seed),
+            stop_sequences: overrides
+                .stop_sequences
+                .clone()
+                .or_else(|| self.stop_sequences.clone()),
+        }
+    }
+}
+
 /// Configuration for the LLM Provider actor.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ProviderConfig {
     /// The type of LLM provider
     pub provider_type: ProviderType,
@@ -71,6 +215,9 @@ pub struct ProviderConfig {
     pub rate_limit: RateLimitConfig,
     /// Retry configuration
     pub retry: RetryConfig,
+    /// Default sampling parameters for this provider
+    #[serde(default, skip_serializing_if = "SamplingParams::is_empty")]
+    pub sampling: SamplingParams,
 }
 
 impl ProviderConfig {
@@ -122,6 +269,7 @@ impl ProviderConfig {
             timeout: Duration::from_secs(120),
             rate_limit: RateLimitConfig::default(),
             retry: RetryConfig::default(),
+            sampling: SamplingParams::default(),
         }
     }
 
@@ -153,6 +301,7 @@ impl ProviderConfig {
             timeout: Duration::from_secs(300), // Longer timeout for local inference
             rate_limit: RateLimitConfig::new(1000, 1_000_000), // High limits for local
             retry: RetryConfig::default(),
+            sampling: SamplingParams::default(),
         }
     }
 
@@ -182,6 +331,7 @@ impl ProviderConfig {
             timeout: Duration::from_secs(120),
             rate_limit: RateLimitConfig::default(),
             retry: RetryConfig::default(),
+            sampling: SamplingParams::default(),
         }
     }
 
@@ -213,6 +363,7 @@ impl ProviderConfig {
             timeout: Duration::from_secs(300),
             rate_limit: RateLimitConfig::new(1000, 1_000_000),
             retry: RetryConfig::default(),
+            sampling: SamplingParams::default(),
         }
     }
 
@@ -276,6 +427,41 @@ impl ProviderConfig {
     #[must_use]
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Sets the default sampling parameters for this provider.
+    #[must_use]
+    pub fn with_sampling(mut self, sampling: SamplingParams) -> Self {
+        self.sampling = sampling;
+        self
+    }
+
+    /// Sets the default temperature for this provider.
+    #[must_use]
+    pub fn with_temperature(mut self, temperature: f64) -> Self {
+        self.sampling.temperature = Some(temperature);
+        self
+    }
+
+    /// Sets the default top_p for this provider.
+    #[must_use]
+    pub fn with_top_p(mut self, top_p: f64) -> Self {
+        self.sampling.top_p = Some(top_p);
+        self
+    }
+
+    /// Sets the default top_k for this provider.
+    #[must_use]
+    pub fn with_top_k(mut self, top_k: u32) -> Self {
+        self.sampling.top_k = Some(top_k);
+        self
+    }
+
+    /// Sets the default stop sequences for this provider.
+    #[must_use]
+    pub fn with_stop_sequences(mut self, sequences: Vec<String>) -> Self {
+        self.sampling.stop_sequences = Some(sequences);
         self
     }
 
@@ -628,6 +814,129 @@ mod tests {
     #[test]
     fn provider_config_serialization_roundtrip() {
         let config = ProviderConfig::new("test-key").with_model("claude-3-haiku-20240307");
+
+        let json = serde_json::to_string(&config).unwrap();
+        let deserialized: ProviderConfig = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(config, deserialized);
+    }
+
+    // SamplingParams tests
+
+    #[test]
+    fn sampling_params_default_is_all_none() {
+        let params = SamplingParams::default();
+        assert!(params.temperature.is_none());
+        assert!(params.top_k.is_none());
+        assert!(params.top_p.is_none());
+        assert!(params.frequency_penalty.is_none());
+        assert!(params.presence_penalty.is_none());
+        assert!(params.seed.is_none());
+        assert!(params.stop_sequences.is_none());
+    }
+
+    #[test]
+    fn sampling_params_is_empty_when_default() {
+        assert!(SamplingParams::default().is_empty());
+    }
+
+    #[test]
+    fn sampling_params_is_not_empty_with_temperature() {
+        let params = SamplingParams::new().with_temperature(0.7);
+        assert!(!params.is_empty());
+    }
+
+    #[test]
+    fn sampling_params_builder_pattern() {
+        let params = SamplingParams::new()
+            .with_temperature(0.7)
+            .with_top_k(40)
+            .with_top_p(0.9)
+            .with_frequency_penalty(0.5)
+            .with_presence_penalty(0.3)
+            .with_seed(42)
+            .with_stop_sequences(vec!["END".to_string()]);
+
+        assert_eq!(params.temperature, Some(0.7));
+        assert_eq!(params.top_k, Some(40));
+        assert_eq!(params.top_p, Some(0.9));
+        assert_eq!(params.frequency_penalty, Some(0.5));
+        assert_eq!(params.presence_penalty, Some(0.3));
+        assert_eq!(params.seed, Some(42));
+        assert_eq!(
+            params.stop_sequences,
+            Some(vec!["END".to_string()])
+        );
+    }
+
+    #[test]
+    fn sampling_params_merge_override_takes_precedence() {
+        let base = SamplingParams::new().with_temperature(0.5);
+        let overrides = SamplingParams::new().with_temperature(0.9);
+
+        let merged = base.merge_with(&overrides);
+        assert_eq!(merged.temperature, Some(0.9));
+    }
+
+    #[test]
+    fn sampling_params_merge_preserves_base_when_override_is_none() {
+        let base = SamplingParams::new().with_top_p(0.8).with_temperature(0.5);
+        let overrides = SamplingParams::new().with_temperature(0.9);
+
+        let merged = base.merge_with(&overrides);
+        assert_eq!(merged.temperature, Some(0.9));
+        assert_eq!(merged.top_p, Some(0.8));
+    }
+
+    #[test]
+    fn sampling_params_merge_both_empty() {
+        let base = SamplingParams::default();
+        let overrides = SamplingParams::default();
+        let merged = base.merge_with(&overrides);
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn sampling_params_serialization_roundtrip() {
+        let params = SamplingParams::new()
+            .with_temperature(0.7)
+            .with_top_k(40);
+
+        let json = serde_json::to_string(&params).unwrap();
+        let deserialized: SamplingParams = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(params, deserialized);
+    }
+
+    #[test]
+    fn sampling_params_serialization_skips_none() {
+        let params = SamplingParams::new().with_temperature(0.7);
+        let json = serde_json::to_string(&params).unwrap();
+
+        assert!(json.contains("temperature"));
+        assert!(!json.contains("top_k"));
+        assert!(!json.contains("top_p"));
+    }
+
+    #[test]
+    fn provider_config_with_sampling() {
+        let config = ProviderConfig::new("test-key")
+            .with_sampling(SamplingParams::new().with_temperature(0.7));
+
+        assert_eq!(config.sampling.temperature, Some(0.7));
+    }
+
+    #[test]
+    fn provider_config_with_temperature() {
+        let config = ProviderConfig::new("test-key").with_temperature(0.5);
+        assert_eq!(config.sampling.temperature, Some(0.5));
+    }
+
+    #[test]
+    fn provider_config_serialization_roundtrip_with_sampling() {
+        let config = ProviderConfig::new("test-key")
+            .with_model("claude-3-haiku-20240307")
+            .with_temperature(0.7);
 
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ProviderConfig = serde_json::from_str(&json).unwrap();

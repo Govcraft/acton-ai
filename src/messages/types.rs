@@ -3,6 +3,7 @@
 //! All messages implement Send + Sync + Debug + Clone + 'static as required by acton-reactive.
 
 use crate::agent::AgentConfig;
+use crate::llm::SamplingParams;
 use crate::types::{AgentId, CorrelationId, TaskId};
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,8 @@ pub struct LLMRequest {
     pub messages: Vec<Message>,
     /// Optional tool definitions available to the LLM
     pub tools: Option<Vec<ToolDefinition>>,
+    /// Optional sampling parameters for this request
+    pub sampling: Option<SamplingParams>,
 }
 
 impl LLMRequest {
@@ -243,6 +246,7 @@ impl LLMRequest {
             agent_id: AgentId::new(),
             messages: vec![Message::user(content)],
             tools: None,
+            sampling: None,
         }
     }
 
@@ -268,6 +272,7 @@ impl LLMRequest {
             agent_id: AgentId::new(),
             messages: vec![Message::system(system), Message::user(content)],
             tools: None,
+            sampling: None,
         }
     }
 
@@ -316,6 +321,7 @@ pub struct LLMRequestBuilder {
     agent_id: Option<AgentId>,
     messages: Vec<Message>,
     tools: Option<Vec<ToolDefinition>>,
+    sampling: Option<SamplingParams>,
 }
 
 impl LLMRequestBuilder {
@@ -388,6 +394,13 @@ impl LLMRequestBuilder {
         self
     }
 
+    /// Sets the sampling parameters for this request.
+    #[must_use]
+    pub fn sampling(mut self, params: SamplingParams) -> Self {
+        self.sampling = Some(params);
+        self
+    }
+
     /// Builds the LLM request.
     ///
     /// IDs are auto-generated if not explicitly set.
@@ -398,6 +411,7 @@ impl LLMRequestBuilder {
             agent_id: self.agent_id.unwrap_or_default(),
             messages: self.messages,
             tools: self.tools,
+            sampling: self.sampling,
         }
     }
 }

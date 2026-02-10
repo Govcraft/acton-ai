@@ -4,7 +4,7 @@
 //! OpenAI, Ollama, vLLM, LocalAI, and other compatible endpoints.
 
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
-use crate::llm::config::ProviderConfig;
+use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
 use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolDefinition};
 use async_trait::async_trait;
@@ -38,6 +38,18 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    top_p: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    frequency_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    presence_penalty: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stop: Option<Vec<String>>,
 }
 
 /// A message in OpenAI format.
@@ -398,6 +410,7 @@ impl LLMClient for OpenAIClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMClientResponse, LLMError> {
         let api_messages = self.convert_messages(messages);
 
@@ -407,6 +420,12 @@ impl LLMClient for OpenAIClient {
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
             stream: false,
+            temperature: sampling.and_then(|s| s.temperature),
+            top_p: sampling.and_then(|s| s.top_p),
+            frequency_penalty: sampling.and_then(|s| s.frequency_penalty),
+            presence_penalty: sampling.and_then(|s| s.presence_penalty),
+            seed: sampling.and_then(|s| s.seed),
+            stop: sampling.and_then(|s| s.stop_sequences.clone()),
         };
 
         let request = self.build_request(&request_body)?;
@@ -470,6 +489,7 @@ impl LLMClient for OpenAIClient {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMEventStream, LLMError> {
         use std::collections::{HashMap, VecDeque};
 
@@ -481,6 +501,12 @@ impl LLMClient for OpenAIClient {
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
             stream: true,
+            temperature: sampling.and_then(|s| s.temperature),
+            top_p: sampling.and_then(|s| s.top_p),
+            frequency_penalty: sampling.and_then(|s| s.frequency_penalty),
+            presence_penalty: sampling.and_then(|s| s.presence_penalty),
+            seed: sampling.and_then(|s| s.seed),
+            stop: sampling.and_then(|s| s.stop_sequences.clone()),
         };
 
         let request = self.build_request(&request_body)?;
@@ -600,15 +626,13 @@ impl LLMClient for OpenAIClient {
                                                     let stop_reason = if emitted_tool_calls {
                                                         StopReason::ToolUse
                                                     } else {
-                                                        OpenAIClient::parse_stop_reason(
-                                                            Some(reason),
-                                                        )
+                                                        OpenAIClient::parse_stop_reason(Some(
+                                                            reason,
+                                                        ))
                                                     };
 
                                                     state.pending_events.push_back(Ok(
-                                                        LLMStreamEvent::End {
-                                                            stop_reason,
-                                                        },
+                                                        LLMStreamEvent::End { stop_reason },
                                                     ));
                                                 }
                                             }

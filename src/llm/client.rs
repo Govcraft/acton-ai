@@ -4,6 +4,7 @@
 //! LLM providers (Anthropic, OpenAI, Ollama, etc.) allowing the LLMProvider
 //! actor to work with any backend.
 
+use crate::llm::config::SamplingParams;
 use crate::llm::error::LLMError;
 use crate::messages::{Message, StopReason, ToolCall, ToolDefinition};
 use async_trait::async_trait;
@@ -80,6 +81,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
     ///
     /// * `messages` - The conversation messages
     /// * `tools` - Optional tool definitions available to the LLM
+    /// * `sampling` - Optional sampling parameters for this request
     ///
     /// # Returns
     ///
@@ -92,6 +94,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMClientResponse, LLMError>;
 
     /// Sends a streaming request to the LLM.
@@ -100,6 +103,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
     ///
     /// * `messages` - The conversation messages
     /// * `tools` - Optional tool definitions available to the LLM
+    /// * `sampling` - Optional sampling parameters for this request
     ///
     /// # Returns
     ///
@@ -112,6 +116,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
         &self,
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
+        sampling: Option<&SamplingParams>,
     ) -> Result<LLMEventStream, LLMError>;
 
     /// Returns the name of this provider for logging/metrics.

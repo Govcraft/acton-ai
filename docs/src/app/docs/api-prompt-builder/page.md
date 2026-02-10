@@ -142,6 +142,98 @@ runtime.prompt("Summarize this text")
     .await?;
 ```
 
+### Sampling parameters
+
+Control the randomness and diversity of LLM output on a per-prompt basis. These override any defaults set on the [provider configuration](/docs/providers-and-configuration#sampling-parameters).
+
+#### `temperature()`
+
+```rust
+pub fn temperature(self, value: f64) -> Self
+```
+
+Sets the sampling temperature. Lower values (e.g. 0.0) make output more deterministic; higher values (e.g. 1.0) increase randomness.
+
+```rust
+runtime.prompt("Write a creative story")
+    .temperature(0.9)
+    .collect()
+    .await?;
+```
+
+#### `top_p()`
+
+```rust
+pub fn top_p(self, value: f64) -> Self
+```
+
+Sets nucleus sampling. The model considers only tokens within this cumulative probability mass. For example, `0.9` means the model picks from tokens comprising the top 90% probability.
+
+#### `top_k()`
+
+```rust
+pub fn top_k(self, value: u32) -> Self
+```
+
+Sets top-k sampling. The model considers only the `k` most likely tokens at each step. Supported by Anthropic and Ollama; ignored by OpenAI.
+
+#### `frequency_penalty()`
+
+```rust
+pub fn frequency_penalty(self, value: f64) -> Self
+```
+
+Penalizes tokens based on how often they appear in the text so far. OpenAI only.
+
+#### `presence_penalty()`
+
+```rust
+pub fn presence_penalty(self, value: f64) -> Self
+```
+
+Penalizes tokens that have appeared at all in the text so far. OpenAI only.
+
+#### `seed()`
+
+```rust
+pub fn seed(self, value: u64) -> Self
+```
+
+Sets a seed for deterministic output (best-effort). OpenAI only.
+
+#### `stop_sequences()`
+
+```rust
+pub fn stop_sequences(self, sequences: Vec<String>) -> Self
+```
+
+Sets custom stop sequences that cause the model to stop generating when encountered.
+
+#### `sampling()`
+
+```rust
+pub fn sampling(self, params: SamplingParams) -> Self
+```
+
+Sets all sampling parameters at once using a `SamplingParams` struct. Useful when you have a pre-built configuration.
+
+```rust
+use acton_ai::prelude::*;
+
+runtime.prompt("Analyze this data")
+    .sampling(SamplingParams {
+        temperature: Some(0.3),
+        top_p: Some(0.9),
+        ..Default::default()
+    })
+    .collect()
+    .await?;
+```
+
+{% callout type="note" title="Override behavior" %}
+Per-prompt sampling parameters are merged with provider defaults. Only the fields you set on the `PromptBuilder` override the provider -- unset fields fall back to the provider's configured defaults.
+{% /callout %}
+
 ### Tool registration
 
 There are three ways to register tools on a prompt, each offering a different level of control.
