@@ -53,7 +53,7 @@
 mod context;
 mod embeddings;
 mod error;
-mod persistence;
+pub mod persistence;
 mod store;
 
 // Re-export context window types
@@ -72,6 +72,18 @@ pub use persistence::{
     count_memories_for_agent, delete_agent_state, delete_memories_for_agent, delete_memory,
     load_memories_for_agent, save_memory, search_memories_by_embedding, AgentStateSnapshot,
     PersistenceConfig, SCHEMA_VERSION,
+};
+
+// Re-export session and heartbeat types
+pub use persistence::{
+    complete_entry, create_heartbeat_entry, create_session, delete_session, list_due_entries,
+    list_entries_for_session, list_sessions, resolve_session, touch_session,
+    update_entry_after_run, HeartbeatEntry, SessionInfo,
+};
+
+// Re-export memory graph types
+pub use persistence::{
+    create_memory_relation, find_memories_by_tag, get_related_memories, tag_memory, MemoryRelation,
 };
 
 // Re-export store types and messages

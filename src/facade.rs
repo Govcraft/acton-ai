@@ -614,8 +614,11 @@ impl ActonAIBuilder {
         self.from_config()
     }
 
-    /// Applies an ActonAIConfig to this builder.
-    fn apply_config(mut self, config: ActonAIConfig) -> Result<Self, ActonAIError> {
+    /// Applies an [`ActonAIConfig`] to this builder.
+    ///
+    /// This is useful when you've already loaded the configuration and want
+    /// to apply it to the builder without going through file loading again.
+    pub fn apply_config(mut self, config: ActonAIConfig) -> Result<Self, ActonAIError> {
         // Convert and add each provider
         for (name, provider_config) in config.providers {
             let runtime_config = provider_config.to_provider_config();

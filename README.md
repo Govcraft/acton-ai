@@ -39,6 +39,20 @@ Five lines to an interactive chat with file access and command execution.
 
 ## Installation
 
+### CLI (Arch Linux)
+
+```bash
+yay -S acton-ai-bin
+```
+
+### CLI (from source)
+
+```bash
+cargo install acton-ai
+```
+
+### Library
+
 ```bash
 cargo add acton-ai
 ```
@@ -245,6 +259,81 @@ Available when you call `.with_builtins()`:
 
 Select specific tools with `.with_builtin_tools(&["read_file", "glob", "bash"])`.
 
+## CLI
+
+Acton-ai ships a scriptable CLI with persistent sessions, autonomous task execution, and stdin/stdout piping.
+
+### Chat
+
+```bash
+# Single message
+acton-ai chat -m "What is Rust?"
+
+# Pipe from stdin
+echo "Explain ownership" | acton-ai chat
+
+# Persistent sessions — context carries across invocations
+acton-ai chat --session work --create -m "Start a new project plan"
+acton-ai chat --session work -m "Add a testing section"
+
+# JSON output for scripting
+acton-ai chat -m "List 3 colors" --json | jq .text
+
+# Interactive terminal chat
+acton-ai chat
+```
+
+### Jobs
+
+Define reusable jobs in `acton-ai.toml` with template substitution and agentic tool loops:
+
+```toml
+[jobs.summarize]
+system_prompt = "You are a summarization expert. Be concise."
+message_template = "Summarize:\n\n{{input}}"
+
+[jobs.translate]
+system_prompt = "Translate to the requested language. Output ONLY the translation."
+message_template = "Translate to {{lang}}: {{input}}"
+```
+
+```bash
+cat document.txt | acton-ai run-job summarize
+echo "Hello" | acton-ai run-job translate --param lang=Spanish
+```
+
+### Heartbeat
+
+Autonomous wake-up cycle for scheduled tasks. During chat, the agent can create heartbeat entries (recurring tasks). A systemd timer triggers `acton-ai heartbeat` to review and execute due tasks:
+
+```bash
+# Run all due heartbeat entries
+acton-ai heartbeat
+
+# Run entries for a specific session only
+acton-ai heartbeat --session main
+```
+
+Output is a JSON activity report to stdout, suitable for monitoring pipelines.
+
+### Session Management
+
+```bash
+acton-ai session list                  # List all sessions
+acton-ai session show work             # Session metadata + recent messages
+acton-ai session delete work --force   # Delete session and history
+```
+
+### Global Options
+
+```
+--json         Machine-readable JSON output
+--config PATH  Override config file path
+--provider NAME Override default LLM provider
+-v / -vv / -vvv Increase verbosity
+-q             Suppress stderr output
+```
+
 ## Architecture
 
 Acton-ai uses the actor model for fault-tolerant, concurrent AI systems:
@@ -260,7 +349,9 @@ ActonAI (Facade)
     │       │
     │       ├── Agent(s) ───────── Individual AI agents with reasoning
     │       │
-    │       └── ToolRegistry ───── Tool registration and execution
+    │       ├── ToolRegistry ───── Tool registration and execution
+    │       │
+    │       └── MemoryStore ───── Persistent sessions, memories, embeddings
     │
     └── BuiltinTools ──────────── File ops, bash, web fetch, etc.
 ```

@@ -71,5 +71,6 @@ pub use file::{from_path, from_str, load, search_paths, xdg_config_dir};
 
 // Re-export types
 pub use types::{
-    ActonAIConfig, NamedProviderConfig, RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig,
+    ActonAIConfig, CliFileConfig, JobConfig, NamedProviderConfig, PersistenceFileConfig,
+    RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig,
 };

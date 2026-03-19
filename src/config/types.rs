@@ -56,6 +56,18 @@ pub struct ActonAIConfig {
     /// including warmup counts, pool limits, and resource constraints.
     #[serde(default)]
     pub sandbox: Option<SandboxFileConfig>,
+
+    /// Persistence configuration for the database.
+    #[serde(default)]
+    pub persistence: Option<PersistenceFileConfig>,
+
+    /// CLI-specific configuration.
+    #[serde(default)]
+    pub cli: Option<CliFileConfig>,
+
+    /// Named job definitions for `acton-ai run-job`.
+    #[serde(default)]
+    pub jobs: Option<HashMap<String, JobConfig>>,
 }
 
 impl ActonAIConfig {
@@ -652,6 +664,75 @@ impl Default for RateLimitFileConfig {
     }
 }
 
+/// Persistence configuration for the `[persistence]` section.
+///
+/// ```toml
+/// [persistence]
+/// db_path = "~/.local/share/acton-ai/acton-ai.db"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PersistenceFileConfig {
+    /// Path to the database file.
+    ///
+    /// Default: `~/.local/share/acton-ai/acton-ai.db`
+    #[serde(default)]
+    pub db_path: Option<String>,
+}
+
+/// CLI-specific configuration for the `[cli]` section.
+///
+/// ```toml
+/// [cli]
+/// default_session = "main"
+/// default_system_prompt = "You are a helpful assistant."
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CliFileConfig {
+    /// Default session name when `--session` is not specified.
+    ///
+    /// Default: "main"
+    #[serde(default)]
+    pub default_session: Option<String>,
+
+    /// Default system prompt for new sessions.
+    #[serde(default)]
+    pub default_system_prompt: Option<String>,
+}
+
+/// Job configuration for `acton-ai run-job`.
+///
+/// ```toml
+/// [jobs.summarize]
+/// system_prompt = "You are a summarization expert."
+/// message_template = "Summarize:\n\n{{input}}"
+/// provider = "claude"
+/// tools = ["read_file", "glob"]
+/// max_tool_rounds = 10
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JobConfig {
+    /// System prompt for this job.
+    pub system_prompt: String,
+
+    /// Message template with `{{input}}` and `{{key}}` placeholders.
+    #[serde(default)]
+    pub message_template: Option<String>,
+
+    /// Provider name override for this job.
+    #[serde(default)]
+    pub provider: Option<String>,
+
+    /// Tool names to enable. Use `["*"]` for all builtins.
+    #[serde(default)]
+    pub tools: Option<Vec<String>>,
+
+    /// Maximum tool execution rounds before stopping.
+    ///
+    /// Default: 10
+    #[serde(default)]
+    pub max_tool_rounds: Option<usize>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1092,6 +1173,9 @@ max_execution_ms = 60000
                     max_memory_mb: Some(128),
                 }),
             }),
+            persistence: None,
+            cli: None,
+            jobs: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

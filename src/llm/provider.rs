@@ -335,9 +335,21 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             if let Some(client) = client {
                 tokio::spawn(async move {
                     if streaming {
-                        process_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
+                        process_streaming_request(
+                            &client,
+                            &request,
+                            &broker,
+                            merged_sampling.as_ref(),
+                        )
+                        .await;
                     } else {
-                        process_non_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
+                        process_non_streaming_request(
+                            &client,
+                            &request,
+                            &broker,
+                            merged_sampling.as_ref(),
+                        )
+                        .await;
                     }
                 });
             }
@@ -410,7 +422,13 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 // Spawn the request processing
                 tokio::spawn(async move {
                     if let Some(client) = client {
-                        process_streaming_request(&client, &request, &broker, merged_sampling.as_ref()).await;
+                        process_streaming_request(
+                            &client,
+                            &request,
+                            &broker,
+                            merged_sampling.as_ref(),
+                        )
+                        .await;
                     }
                 });
             } else {
@@ -606,7 +624,10 @@ async fn process_non_streaming_request(
     // Convert tools if present
     let tools = request.tools.as_deref();
 
-    match client.send_request(&request.messages, tools, sampling).await {
+    match client
+        .send_request(&request.messages, tools, sampling)
+        .await
+    {
         Ok(response) => {
             broker
                 .broadcast(LLMResponse {

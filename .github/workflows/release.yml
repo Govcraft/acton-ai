@@ -1,0 +1,231 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            archive: tar.gz
+            cross: true
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            archive: tar.gz
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install x86_64-unknown-none target (for hyperlight guests)
+        if: "!matrix.cross"
+        run: rustup target add x86_64-unknown-none
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux' && !matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang
+
+      - name: Install cross-compilation tools (aarch64-linux)
+        if: matrix.cross
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu clang
+
+      - name: Set cross-compile env (aarch64-linux)
+        if: matrix.cross
+        run: |
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          echo "CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++" >> "$GITHUB_ENV"
+
+      - name: Install system dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install llvm
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Determine version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Package binary
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ steps.version.outputs.version }}
+        shell: bash
+        run: |
+          BIN_NAME="acton-ai"
+          ARCHIVE_NAME="acton-ai-${VERSION}-${TARGET}"
+
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "staging/${ARCHIVE_NAME}/"
+          cp README.md LICENSE* 2>/dev/null || true
+
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+          echo "ASSET=staging/${ARCHIVE_NAME}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: acton-ai-${{ matrix.target }}
+          path: ${{ env.ASSET }}
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Determine version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Collect archives
+        run: |
+          mkdir -p release
+          find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          ls -la release/
+
+      - name: Generate checksums
+        working-directory: release
+        run: sha256sum *.tar.gz > checksums-sha256.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: acton-ai v${{ steps.version.outputs.version }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/checksums-sha256.txt
+
+  aur:
+    name: Update AUR package
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine version from tag
+        id: version
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Download checksums
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          curl -sL "https://github.com/Govcraft/acton-ai/releases/download/v${VERSION}/checksums-sha256.txt" -o checksums.txt
+          SHA_X86=$(grep x86_64-unknown-linux-gnu checksums.txt | awk '{print $1}')
+          SHA_ARM=$(grep aarch64-unknown-linux-gnu checksums.txt | awk '{print $1}')
+          echo "SHA256_X86_64=${SHA_X86}" >> "$GITHUB_ENV"
+          echo "SHA256_AARCH64=${SHA_ARM}" >> "$GITHUB_ENV"
+
+      - name: Configure SSH for AUR
+        env:
+          AUR_KEY: ${{ secrets.AUR_SSH_KEY }}
+        run: |
+          mkdir -p ~/.ssh
+          echo "$AUR_KEY" > ~/.ssh/aur
+          chmod 600 ~/.ssh/aur
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts 2>/dev/null
+          cat >> ~/.ssh/config <<EOF
+          Host aur.archlinux.org
+            IdentityFile ~/.ssh/aur
+            User aur
+          EOF
+
+      - name: Clone and update AUR package
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          git clone ssh://aur@aur.archlinux.org/acton-ai-bin.git aur-pkg
+          cd aur-pkg
+
+          T=$(printf '\t')
+
+          cat > PKGBUILD <<PKGBUILD_EOF
+          # Maintainer: Roland Rodriguez <roland@govcraft.ai>
+          pkgname=acton-ai-bin
+          pkgver=${VERSION}
+          pkgrel=1
+          pkgdesc="An agentic AI framework built on the actor model — scriptable CLI with persistent sessions"
+          arch=('x86_64' 'aarch64')
+          url="https://github.com/Govcraft/acton-ai"
+          license=('MIT')
+          provides=('acton-ai')
+          conflicts=('acton-ai')
+
+          source_x86_64=("\${url}/releases/download/v\${pkgver}/acton-ai-\${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
+          source_aarch64=("\${url}/releases/download/v\${pkgver}/acton-ai-\${pkgver}-aarch64-unknown-linux-gnu.tar.gz")
+          sha256sums_x86_64=('${SHA256_X86_64}')
+          sha256sums_aarch64=('${SHA256_AARCH64}')
+
+          package() {
+              install -Dm755 "acton-ai-\${pkgver}-\${CARCH}-unknown-linux-gnu/acton-ai" "\${pkgdir}/usr/bin/acton-ai"
+          }
+          PKGBUILD_EOF
+
+          cat > .SRCINFO <<SRCINFO_EOF
+          pkgbase = acton-ai-bin
+          ${T}pkgdesc = An agentic AI framework built on the actor model — scriptable CLI with persistent sessions
+          ${T}pkgver = ${VERSION}
+          ${T}pkgrel = 1
+          ${T}url = https://github.com/Govcraft/acton-ai
+          ${T}arch = x86_64
+          ${T}arch = aarch64
+          ${T}license = MIT
+          ${T}provides = acton-ai
+          ${T}conflicts = acton-ai
+          ${T}source_x86_64 = https://github.com/Govcraft/acton-ai/releases/download/v${VERSION}/acton-ai-${VERSION}-x86_64-unknown-linux-gnu.tar.gz
+          ${T}sha256sums_x86_64 = ${SHA256_X86_64}
+          ${T}source_aarch64 = https://github.com/Govcraft/acton-ai/releases/download/v${VERSION}/acton-ai-${VERSION}-aarch64-unknown-linux-gnu.tar.gz
+          ${T}sha256sums_aarch64 = ${SHA256_AARCH64}
+
+          pkgname = acton-ai-bin
+          SRCINFO_EOF
+
+          git config user.name "Roland Rodriguez"
+          git config user.email "roland@govcraft.ai"
+          git add PKGBUILD .SRCINFO
+          git commit -m "Update to ${VERSION}"
+          git push origin master

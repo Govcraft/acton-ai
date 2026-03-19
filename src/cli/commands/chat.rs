@@ -1,0 +1,181 @@
+//! The `chat` command — send messages and manage conversations.
+//!
+//! Supports single-shot messages (`--message`), stdin piping, and
+//! interactive terminal chat with session persistence.
+
+use crate::cli::error::CliError;
+use crate::cli::output::{OutputMode, OutputWriter};
+use crate::cli::runtime::CliRuntime;
+use crate::memory::persistence;
+use crate::messages::Message;
+use crate::types::AgentId;
+use serde::Serialize;
+use std::io::{self, Read as _};
+use std::path::PathBuf;
+
+/// Options for the chat command.
+#[derive(Debug, clap::Args)]
+pub struct ChatArgs {
+    /// Session name to use (default: "main").
+    #[arg(long, env = "ACTON_SESSION")]
+    pub session: Option<String>,
+
+    /// Message to send (reads from stdin if omitted and not a TTY).
+    #[arg(short, long)]
+    pub message: Option<String>,
+
+    /// System prompt override.
+    #[arg(long)]
+    pub system: Option<String>,
+
+    /// Create the session if it doesn't exist.
+    #[arg(long)]
+    pub create: bool,
+
+    /// Disable streaming output (collect full response before printing).
+    #[arg(long)]
+    pub no_stream: bool,
+}
+
+/// JSON response envelope for `--json` mode.
+#[derive(Serialize)]
+struct ChatResponse {
+    session: String,
+    role: String,
+    text: String,
+    token_count: usize,
+}
+
+/// Execute the chat command.
+pub async fn execute(
+    args: &ChatArgs,
+    output: &OutputWriter,
+    config_path: Option<&PathBuf>,
+    provider_override: Option<&str>,
+) -> Result<(), CliError> {
+    let rt = CliRuntime::new(config_path, provider_override).await?;
+
+    // Determine session name
+    let session_name = args.session.clone().unwrap_or_else(|| "main".to_string());
+
+    // Resolve or create session
+    let conn = rt.connection().await?;
+    let session = persistence::resolve_session(&conn, &session_name).await?;
+
+    let (conversation_id, system_prompt) = if let Some(info) = session {
+        (info.conversation_id, info.system_prompt)
+    } else if args.create || session_name == "main" {
+        // Auto-create for "main" or when --create is specified
+        let agent_id = AgentId::new();
+        let system = args
+            .system
+            .as_deref()
+            .unwrap_or("You are a helpful assistant.");
+        let conv_id =
+            persistence::create_session(&conn, &session_name, &agent_id, Some(system)).await?;
+        (conv_id, Some(system.to_string()))
+    } else {
+        return Err(CliError::session_not_found(&session_name));
+    };
+
+    // Load conversation history
+    let history = persistence::load_conversation_messages(&conn, &conversation_id).await?;
+
+    // Determine system prompt
+    let system = args
+        .system
+        .clone()
+        .or(system_prompt)
+        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+
+    // Build the Conversation
+    let conv = rt
+        .ai
+        .conversation()
+        .system(&system)
+        .restore(history)
+        .build()
+        .await;
+
+    // Determine message source
+    let message = resolve_message(args)?;
+
+    match message {
+        Some(msg) => {
+            // Single-shot mode: send one message and output response
+            let response = conv.send(&msg).await?;
+
+            // Persist user message and assistant response
+            let user_msg = Message::user(&msg);
+            let assistant_msg = Message::assistant(&response.text);
+            persistence::save_message(&conn, &conversation_id, &user_msg).await?;
+            persistence::save_message(&conn, &conversation_id, &assistant_msg).await?;
+            persistence::touch_session(&conn, &session_name).await?;
+
+            // Output
+            match output.mode() {
+                OutputMode::Json => {
+                    output.write_json(&ChatResponse {
+                        session: session_name,
+                        role: "assistant".to_string(),
+                        text: response.text,
+                        token_count: response.token_count,
+                    })?;
+                }
+                OutputMode::Plain => {
+                    output.write_line(&response.text)?;
+                }
+            }
+        }
+        None => {
+            // Interactive mode — only valid when stdin is a TTY
+            if !OutputWriter::stdin_is_tty() {
+                return Err(CliError::no_input());
+            }
+
+            // Run interactive chat loop
+            // The Conversation::run_chat_with already handles stdin/stdout
+            let chat_config = crate::conversation::ChatConfig::new()
+                .user_prompt("You: ")
+                .assistant_prompt("Assistant: ");
+
+            conv.run_chat_with(chat_config).await?;
+
+            // After interactive chat, persist any new messages
+            let current_history = conv.history();
+            for msg in current_history {
+                persistence::save_message(&conn, &conversation_id, &msg).await?;
+            }
+            persistence::touch_session(&conn, &session_name).await?;
+        }
+    }
+
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// Resolve the user's message from --message flag or stdin.
+///
+/// Returns:
+/// - `Some(msg)` if a message was provided via flag or stdin pipe
+/// - `None` if no message and stdin is a TTY (interactive mode)
+fn resolve_message(args: &ChatArgs) -> Result<Option<String>, CliError> {
+    // Explicit --message flag takes priority
+    if let Some(ref msg) = args.message {
+        return Ok(Some(msg.clone()));
+    }
+
+    // If stdin is not a TTY, read from it (piped input)
+    if !OutputWriter::stdin_is_tty() {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        let trimmed = input.trim();
+        if trimmed.is_empty() {
+            return Err(CliError::no_input());
+        }
+        return Ok(Some(trimmed.to_string()));
+    }
+
+    // stdin is a TTY and no --message → interactive mode
+    Ok(None)
+}

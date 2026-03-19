@@ -641,7 +641,9 @@ impl LLMClient for AnthropicClient {
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
     ) -> Result<LLMEventStream, LLMError> {
-        let stream = self.send_messages_streaming(messages, tools, sampling).await?;
+        let stream = self
+            .send_messages_streaming(messages, tools, sampling)
+            .await?;
         Ok(Box::pin(convert_anthropic_stream(stream)))
     }
 

@@ -57,6 +57,50 @@ CREATE TABLE IF NOT EXISTS agent_state (
     state TEXT NOT NULL,
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
+
+CREATE TABLE IF NOT EXISTS sessions (
+    name TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    system_prompt TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_active TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS heartbeat_entries (
+    id TEXT PRIMARY KEY,
+    session_name TEXT NOT NULL REFERENCES sessions(name) ON DELETE CASCADE,
+    summary TEXT NOT NULL,
+    schedule TEXT,
+    tools TEXT,
+    last_run TEXT,
+    next_due TEXT,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_heartbeat_session ON heartbeat_entries(session_name);
+CREATE INDEX IF NOT EXISTS idx_heartbeat_status ON heartbeat_entries(status);
+
+CREATE TABLE IF NOT EXISTS memory_relations (
+    id TEXT PRIMARY KEY,
+    source_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    target_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL,
+    weight REAL DEFAULT 1.0,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_relations_source ON memory_relations(source_id);
+CREATE INDEX IF NOT EXISTS idx_memory_relations_target ON memory_relations(target_id);
+
+CREATE TABLE IF NOT EXISTS memory_tags (
+    memory_id TEXT NOT NULL REFERENCES memories(id) ON DELETE CASCADE,
+    tag TEXT NOT NULL,
+    PRIMARY KEY (memory_id, tag)
+);
+
+CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
 ";
 
 /// Configuration for the persistence layer.
@@ -832,6 +876,523 @@ pub async fn count_memories_for_agent(
     } else {
         Ok(0)
     }
+}
+
+// =============================================================================
+// Session management
+// =============================================================================
+
+/// Information about a named session.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInfo {
+    /// Human-friendly session name.
+    pub name: String,
+    /// The underlying conversation ID.
+    pub conversation_id: ConversationId,
+    /// The agent ID that owns this session.
+    pub agent_id: AgentId,
+    /// Optional system prompt for this session.
+    pub system_prompt: Option<String>,
+    /// When the session was created.
+    pub created_at: String,
+    /// When the session was last active.
+    pub last_active: String,
+    /// Number of messages in the conversation.
+    pub message_count: usize,
+}
+
+/// Creates a new session, including its backing conversation.
+pub async fn create_session(
+    conn: &Connection,
+    name: &str,
+    agent_id: &AgentId,
+    system_prompt: Option<&str>,
+) -> Result<ConversationId, PersistenceError> {
+    let conv_id = create_conversation(conn, agent_id).await?;
+
+    conn.execute(
+        "INSERT INTO sessions (name, conversation_id, agent_id, system_prompt)
+         VALUES (?1, ?2, ?3, ?4)",
+        libsql::params![
+            name.to_string(),
+            conv_id.to_string(),
+            agent_id.to_string(),
+            system_prompt.map(|s| s.to_string()),
+        ],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("create_session", e.to_string()))?;
+
+    Ok(conv_id)
+}
+
+/// Resolves a session by name.
+pub async fn resolve_session(
+    conn: &Connection,
+    name: &str,
+) -> Result<Option<SessionInfo>, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT s.name, s.conversation_id, s.agent_id, s.system_prompt,
+                    s.created_at, s.last_active,
+                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count
+             FROM sessions s WHERE s.name = ?1",
+            [name.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("resolve_session", e.to_string()))?;
+
+    if let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("resolve_session", e.to_string()))?
+    {
+        Ok(Some(parse_session_row(&row)?))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Lists all sessions.
+pub async fn list_sessions(conn: &Connection) -> Result<Vec<SessionInfo>, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT s.name, s.conversation_id, s.agent_id, s.system_prompt,
+                    s.created_at, s.last_active,
+                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count
+             FROM sessions s ORDER BY s.last_active DESC",
+            (),
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_sessions", e.to_string()))?;
+
+    let mut sessions = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_sessions", e.to_string()))?
+    {
+        sessions.push(parse_session_row(&row)?);
+    }
+    Ok(sessions)
+}
+
+/// Deletes a session and its backing conversation.
+pub async fn delete_session(conn: &Connection, name: &str) -> Result<(), PersistenceError> {
+    // Get conversation_id first for cascade
+    let session = resolve_session(conn, name).await?;
+    if let Some(session) = session {
+        // Delete session (heartbeat entries cascade)
+        conn.execute("DELETE FROM sessions WHERE name = ?1", [name.to_string()])
+            .await
+            .map_err(|e| PersistenceError::query_failed("delete_session", e.to_string()))?;
+
+        // Delete conversation and its messages
+        delete_conversation(conn, &session.conversation_id).await?;
+    }
+    Ok(())
+}
+
+/// Updates the last_active timestamp for a session.
+pub async fn touch_session(conn: &Connection, name: &str) -> Result<(), PersistenceError> {
+    conn.execute(
+        "UPDATE sessions SET last_active = datetime('now') WHERE name = ?1",
+        [name.to_string()],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("touch_session", e.to_string()))?;
+    Ok(())
+}
+
+/// Parses a session row from a query result.
+fn parse_session_row(row: &libsql::Row) -> Result<SessionInfo, PersistenceError> {
+    let name: String = row
+        .get(0)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let conv_id_str: String = row
+        .get(1)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let agent_id_str: String = row
+        .get(2)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let system_prompt: Option<String> = row
+        .get(3)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let created_at: String = row
+        .get(4)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let last_active: String = row
+        .get(5)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let msg_count: i64 = row
+        .get(6)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+    Ok(SessionInfo {
+        name,
+        conversation_id: ConversationId::parse(&conv_id_str)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        agent_id: AgentId::parse(&agent_id_str)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        system_prompt,
+        created_at,
+        last_active,
+        message_count: msg_count as usize,
+    })
+}
+
+// =============================================================================
+// Heartbeat entries
+// =============================================================================
+
+/// A persistent heartbeat entry — a task/reminder for the autonomous wake-up cycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeartbeatEntry {
+    /// Unique entry ID.
+    pub id: String,
+    /// The session this entry references for context.
+    pub session_name: String,
+    /// Summary of what to do, in the agent's own words.
+    pub summary: String,
+    /// Schedule hint (e.g., "once", "every 30m", "daily", "hourly").
+    pub schedule: Option<String>,
+    /// JSON array of tool names needed.
+    pub tools: Option<String>,
+    /// Last execution timestamp.
+    pub last_run: Option<String>,
+    /// When this entry is next due.
+    pub next_due: Option<String>,
+    /// Status: "active", "paused", "completed".
+    pub status: String,
+    /// When the entry was created.
+    pub created_at: String,
+}
+
+/// Creates a new heartbeat entry.
+pub async fn create_heartbeat_entry(
+    conn: &Connection,
+    session_name: &str,
+    summary: &str,
+    schedule: Option<&str>,
+    tools: Option<&str>,
+) -> Result<String, PersistenceError> {
+    let id = format!("hb_{}", MemoryId::new());
+
+    conn.execute(
+        "INSERT INTO heartbeat_entries (id, session_name, summary, schedule, tools)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        libsql::params![
+            id.clone(),
+            session_name.to_string(),
+            summary.to_string(),
+            schedule.map(|s| s.to_string()),
+            tools.map(|s| s.to_string()),
+        ],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("create_heartbeat_entry", e.to_string()))?;
+
+    Ok(id)
+}
+
+/// Lists all due heartbeat entries (active entries where next_due <= now or next_due is null).
+pub async fn list_due_entries(conn: &Connection) -> Result<Vec<HeartbeatEntry>, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT id, session_name, summary, schedule, tools, last_run, next_due, status, created_at
+             FROM heartbeat_entries
+             WHERE status = 'active' AND (next_due IS NULL OR next_due <= datetime('now'))
+             ORDER BY created_at ASC",
+            (),
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_due_entries", e.to_string()))?;
+
+    let mut entries = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_due_entries", e.to_string()))?
+    {
+        entries.push(parse_heartbeat_row(&row)?);
+    }
+    Ok(entries)
+}
+
+/// Lists heartbeat entries for a specific session.
+pub async fn list_entries_for_session(
+    conn: &Connection,
+    session_name: &str,
+) -> Result<Vec<HeartbeatEntry>, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT id, session_name, summary, schedule, tools, last_run, next_due, status, created_at
+             FROM heartbeat_entries
+             WHERE session_name = ?1 AND status = 'active'
+             AND (next_due IS NULL OR next_due <= datetime('now'))
+             ORDER BY created_at ASC",
+            [session_name.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_entries_for_session", e.to_string()))?;
+
+    let mut entries = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_entries_for_session", e.to_string()))?
+    {
+        entries.push(parse_heartbeat_row(&row)?);
+    }
+    Ok(entries)
+}
+
+/// Updates a heartbeat entry after execution.
+pub async fn update_entry_after_run(
+    conn: &Connection,
+    id: &str,
+    next_due: Option<&str>,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "UPDATE heartbeat_entries SET last_run = datetime('now'), next_due = ?2 WHERE id = ?1",
+        libsql::params![id.to_string(), next_due.map(|s| s.to_string()),],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("update_entry_after_run", e.to_string()))?;
+    Ok(())
+}
+
+/// Marks a heartbeat entry as completed.
+pub async fn complete_entry(conn: &Connection, id: &str) -> Result<(), PersistenceError> {
+    conn.execute(
+        "UPDATE heartbeat_entries SET status = 'completed' WHERE id = ?1",
+        [id.to_string()],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("complete_entry", e.to_string()))?;
+    Ok(())
+}
+
+/// Parses a heartbeat entry row from a query result.
+fn parse_heartbeat_row(row: &libsql::Row) -> Result<HeartbeatEntry, PersistenceError> {
+    Ok(HeartbeatEntry {
+        id: row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        session_name: row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        summary: row
+            .get(2)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        schedule: row
+            .get(3)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        tools: row
+            .get(4)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        last_run: row
+            .get(5)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        next_due: row
+            .get(6)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        status: row
+            .get(7)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+        created_at: row
+            .get(8)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?,
+    })
+}
+
+// =============================================================================
+// Memory graph — relations and tags
+// =============================================================================
+
+/// A relation between two memories.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryRelation {
+    /// Unique relation ID.
+    pub id: String,
+    /// Source memory ID.
+    pub source_id: String,
+    /// Target memory ID.
+    pub target_id: String,
+    /// Relation type (e.g., "related_to", "derived_from", "contradicts").
+    pub relation_type: String,
+    /// Relation weight (default 1.0).
+    pub weight: f64,
+    /// When the relation was created.
+    pub created_at: String,
+}
+
+/// Creates a relation between two memories.
+pub async fn create_memory_relation(
+    conn: &Connection,
+    source_id: &str,
+    target_id: &str,
+    relation_type: &str,
+    weight: f64,
+) -> Result<String, PersistenceError> {
+    let id = format!("rel_{}", MemoryId::new());
+
+    conn.execute(
+        "INSERT INTO memory_relations (id, source_id, target_id, relation_type, weight)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        libsql::params![
+            id.clone(),
+            source_id.to_string(),
+            target_id.to_string(),
+            relation_type.to_string(),
+            weight,
+        ],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("create_memory_relation", e.to_string()))?;
+
+    Ok(id)
+}
+
+/// Gets memories related to a given memory via direct relations.
+pub async fn get_related_memories(
+    conn: &Connection,
+    memory_id: &str,
+    relation_type: Option<&str>,
+) -> Result<Vec<Memory>, PersistenceError> {
+    let query = if let Some(rel_type) = relation_type {
+        format!(
+            "SELECT m.id, m.agent_id, m.content, m.embedding, m.created_at
+             FROM memories m
+             INNER JOIN memory_relations r ON m.id = r.target_id
+             WHERE r.source_id = '{memory_id}' AND r.relation_type = '{rel_type}'
+             ORDER BY r.weight DESC"
+        )
+    } else {
+        format!(
+            "SELECT m.id, m.agent_id, m.content, m.embedding, m.created_at
+             FROM memories m
+             INNER JOIN memory_relations r ON m.id = r.target_id
+             WHERE r.source_id = '{memory_id}'
+             ORDER BY r.weight DESC"
+        )
+    };
+
+    let mut rows = conn
+        .query(&query, ())
+        .await
+        .map_err(|e| PersistenceError::query_failed("get_related_memories", e.to_string()))?;
+
+    let mut memories = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("get_related_memories", e.to_string()))?
+    {
+        let id: String = row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let agent_id: String = row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let content: String = row
+            .get(2)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let embedding_blob: Option<Vec<u8>> = row
+            .get(3)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let created_at: String = row
+            .get(4)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let embedding = embedding_blob
+            .map(|blob| Embedding::from_bytes(&blob))
+            .transpose()
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        memories.push(Memory {
+            id: MemoryId::parse(&id).unwrap_or_else(|_| MemoryId::new()),
+            agent_id: AgentId::parse(&agent_id).unwrap_or_else(|_| AgentId::new()),
+            content,
+            embedding,
+            created_at,
+        });
+    }
+
+    Ok(memories)
+}
+
+/// Adds tags to a memory.
+pub async fn tag_memory(
+    conn: &Connection,
+    memory_id: &str,
+    tags: &[&str],
+) -> Result<(), PersistenceError> {
+    for tag in tags {
+        conn.execute(
+            "INSERT OR IGNORE INTO memory_tags (memory_id, tag) VALUES (?1, ?2)",
+            libsql::params![memory_id.to_string(), tag.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("tag_memory", e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Finds memories that have a given tag.
+pub async fn find_memories_by_tag(
+    conn: &Connection,
+    tag: &str,
+) -> Result<Vec<Memory>, PersistenceError> {
+    let mut rows = conn
+        .query(
+            "SELECT m.id, m.agent_id, m.content, m.embedding, m.created_at
+             FROM memories m
+             INNER JOIN memory_tags t ON m.id = t.memory_id
+             WHERE t.tag = ?1
+             ORDER BY m.created_at DESC",
+            [tag.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("find_memories_by_tag", e.to_string()))?;
+
+    let mut memories = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("find_memories_by_tag", e.to_string()))?
+    {
+        let id: String = row
+            .get(0)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let agent_id: String = row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let content: String = row
+            .get(2)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let embedding_blob: Option<Vec<u8>> = row
+            .get(3)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        let created_at: String = row
+            .get(4)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        let embedding = embedding_blob
+            .map(|blob| Embedding::from_bytes(&blob))
+            .transpose()
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+
+        memories.push(Memory {
+            id: MemoryId::parse(&id).unwrap_or_else(|_| MemoryId::new()),
+            agent_id: AgentId::parse(&agent_id).unwrap_or_else(|_| AgentId::new()),
+            content,
+            embedding,
+            created_at,
+        });
+    }
+
+    Ok(memories)
 }
 
 #[cfg(test)]

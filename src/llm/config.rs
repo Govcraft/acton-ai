@@ -863,10 +863,7 @@ mod tests {
         assert_eq!(params.frequency_penalty, Some(0.5));
         assert_eq!(params.presence_penalty, Some(0.3));
         assert_eq!(params.seed, Some(42));
-        assert_eq!(
-            params.stop_sequences,
-            Some(vec!["END".to_string()])
-        );
+        assert_eq!(params.stop_sequences, Some(vec!["END".to_string()]));
     }
 
     #[test]
@@ -898,9 +895,7 @@ mod tests {
 
     #[test]
     fn sampling_params_serialization_roundtrip() {
-        let params = SamplingParams::new()
-            .with_temperature(0.7)
-            .with_top_k(40);
+        let params = SamplingParams::new().with_temperature(0.7).with_top_k(40);
 
         let json = serde_json::to_string(&params).unwrap();
         let deserialized: SamplingParams = serde_json::from_str(&json).unwrap();
