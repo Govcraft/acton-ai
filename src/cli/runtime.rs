@@ -1,14 +1,13 @@
 //! Shared runtime bootstrap for CLI commands.
 //!
-//! Initializes the ActonAI runtime, MemoryStore, and tracing from CLI options.
+//! Initializes the ActonAI runtime and database from CLI options.
 
 use crate::cli::error::CliError;
 use crate::cli::output::OutputWriter;
 use crate::config;
 use crate::facade::ActonAI;
 use crate::memory::persistence::{initialize_schema, open_database};
-use crate::memory::{InitMemoryStore, MemoryStore, PersistenceConfig};
-use acton_reactive::prelude::*;
+use crate::memory::PersistenceConfig;
 use libsql::Connection;
 use std::io::IsTerminal;
 use std::path::PathBuf;
@@ -19,8 +18,6 @@ use tracing_subscriber::util::SubscriberInitExt;
 pub struct CliRuntime {
     /// The ActonAI high-level API handle.
     pub ai: ActonAI,
-    /// The MemoryStore actor handle.
-    pub memory: ActorHandle,
     /// Database path for direct connection access.
     db_path: String,
 }
@@ -28,7 +25,9 @@ pub struct CliRuntime {
 impl CliRuntime {
     /// Bootstrap the full runtime from CLI options.
     ///
-    /// Loads config, launches ActonAI, spawns MemoryStore.
+    /// Loads config, launches ActonAI. Database connections are opened
+    /// on-demand via [`connection()`](Self::connection) to avoid lock
+    /// contention with SQLite.
     pub async fn new(
         config_path: Option<&PathBuf>,
         provider_override: Option<&str>,
@@ -56,27 +55,16 @@ impl CliRuntime {
 
         builder = builder.with_builtins();
 
-        let mut ai = builder.launch().await?;
-
-        // Spawn MemoryStore
-        let memory = MemoryStore::spawn(ai.runtime_mut()).await;
-
-        // Initialize with default or configured DB path
+        let ai = builder.launch().await?;
         let db_path = resolve_db_path(config_path);
-        memory
-            .send(InitMemoryStore {
-                config: PersistenceConfig::new(&db_path),
-            })
-            .await;
 
-        Ok(Self {
-            ai,
-            memory,
-            db_path,
-        })
+        Ok(Self { ai, db_path })
     }
 
-    /// Opens a direct database connection for persistence operations.
+    /// Opens a database connection and ensures the schema is initialized.
+    ///
+    /// Each call opens a fresh connection — callers should hold the
+    /// connection for the duration of their transaction, then drop it.
     pub async fn connection(&self) -> Result<Connection, CliError> {
         let config = PersistenceConfig::new(&self.db_path);
         let db = open_database(&config).await?;
@@ -133,7 +121,8 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
 
     let use_ansi = std::io::stderr().is_terminal() && OutputWriter::use_colors();
 
-    tracing_subscriber::registry()
+    // Use try_init to avoid panic if a subscriber is already set
+    let _ = tracing_subscriber::registry()
         .with(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
@@ -142,5 +131,5 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
                 .with_writer(std::io::stderr)
                 .with_ansi(use_ansi),
         )
-        .init();
+        .try_init();
 }
