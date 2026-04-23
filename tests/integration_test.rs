@@ -17,7 +17,7 @@ async fn test_spawn_kernel() {
     let kernel_handle = Kernel::spawn(&mut runtime).await;
 
     // The kernel should have a valid handle - check that root is "kernel"
-    let id_str = kernel_handle.id().root.to_string();
+    let id_str = kernel_handle.id().root().to_string();
     assert!(
         id_str.contains("kernel"),
         "Expected kernel in id: {}",
@@ -464,7 +464,7 @@ async fn test_spawn_tool_registry() {
     let registry = ToolRegistry::spawn(&mut runtime).await;
 
     // The registry should have a valid handle - check that root is "tool_registry"
-    let id_str = registry.id().root.to_string();
+    let id_str = registry.id().root().to_string();
     assert!(
         id_str.contains("tool_registry"),
         "Expected tool_registry in id: {}",
@@ -851,7 +851,7 @@ async fn test_spawn_memory_store() {
     let store_handle = MemoryStore::spawn(&mut runtime).await;
 
     // The store should have a valid handle - check that root is "memory_store"
-    let id_str = store_handle.id().root.to_string();
+    let id_str = store_handle.id().root().to_string();
     assert!(
         id_str.contains("memory_store"),
         "Expected memory_store in id: {}",
