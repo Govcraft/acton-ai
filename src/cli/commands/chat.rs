@@ -11,6 +11,7 @@
 use crate::cli::error::CliError;
 use crate::cli::output::{OutputMode, OutputWriter};
 use crate::cli::runtime::CliRuntime;
+use crate::conversation::DEFAULT_SYSTEM_PROMPT;
 use crate::memory::persistence;
 use crate::messages::Message;
 use crate::types::AgentId;
@@ -91,10 +92,7 @@ pub async fn execute(
     } else if args.create || session_name == "main" {
         // Auto-create for "main" or when --create is specified
         let agent_id = AgentId::new();
-        let system = args
-            .system
-            .as_deref()
-            .unwrap_or("You are a helpful assistant.");
+        let system = args.system.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let conv_id =
             persistence::create_session(&conn, &session_name, &agent_id, Some(system)).await?;
         (conv_id, Some(system.to_string()))
@@ -105,12 +103,13 @@ pub async fn execute(
     // Load conversation history
     let history = persistence::load_conversation_messages(&conn, &conversation_id).await?;
 
-    // Determine system prompt
+    // Determine system prompt — CLI flag wins, then whatever was persisted
+    // on the session, then the library-canonical default.
     let system = args
         .system
         .clone()
         .or(system_prompt)
-        .unwrap_or_else(|| "You are a helpful assistant.".to_string());
+        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
 
     // Build the Conversation
     let conv = rt

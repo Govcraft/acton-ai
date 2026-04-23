@@ -51,6 +51,8 @@ type InputMapperFn = Box<dyn FnMut(&str) -> String + Send>;
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
 You are a helpful assistant with access to various tools. \
 Use tools when appropriate to help the user. \
+If a task might be covered by an agent skill, call list_skills to discover what's \
+available, then activate_skill to load its instructions before proceeding. \
 When the user wants to end the conversation (says goodbye, bye, quit, exit, etc.), \
 use the exit_conversation tool.";
 
