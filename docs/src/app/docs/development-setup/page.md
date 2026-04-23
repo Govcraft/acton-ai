@@ -68,7 +68,7 @@ ollama pull qwen2.5:7b
 ## Cloning the repository
 
 ```bash
-git clone https://github.com/rodzilla/acton-ai.git
+git clone https://github.com/Govcraft/acton-ai.git
 cd acton-ai
 ```
 

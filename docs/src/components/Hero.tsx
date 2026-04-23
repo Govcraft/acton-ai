@@ -56,7 +56,7 @@ export function Hero() {
               </p>
               <div className="mt-8 flex gap-4 md:justify-center lg:justify-start">
                 <Button href="/">Get started</Button>
-                <Button href="https://github.com/acton-ai/acton-ai" variant="secondary">
+                <Button href="https://github.com/Govcraft/acton-ai" variant="secondary">
                   View on GitHub
                 </Button>
               </div>
