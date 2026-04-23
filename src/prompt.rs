@@ -97,14 +97,36 @@ where
 }
 
 /// Adapter to wrap built-in tool executors as `ToolExecutorFn`.
+///
+/// When `sandbox` is `Some`, tool invocations are dispatched through the
+/// sandbox factory's `Sandbox::execute` path. Otherwise the in-process
+/// executor runs the tool directly. This is how facade-configured
+/// `ProcessSandbox` actually reaches the bash/write_file/edit_file call
+/// sites — prior to this wiring the factory existed in memory but the
+/// prompt path skipped it entirely.
 struct BuiltinToolExecutorAdapter {
+    tool_name: String,
     executor: Arc<crate::tools::BoxedToolExecutor>,
+    sandbox: Option<Arc<dyn crate::tools::sandbox::SandboxFactory>>,
 }
 
 impl ToolExecutorFn for BuiltinToolExecutorAdapter {
     fn call(&self, args: serde_json::Value) -> ToolFuture {
-        let executor = Arc::clone(&self.executor);
-        Box::pin(async move { executor.execute(args).await })
+        match self.sandbox.clone() {
+            Some(factory) => {
+                let name = self.tool_name.clone();
+                Box::pin(async move {
+                    let mut sandbox = factory.create().await?;
+                    let result = sandbox.execute(&name, args).await;
+                    sandbox.destroy();
+                    result
+                })
+            }
+            None => {
+                let executor = Arc::clone(&self.executor);
+                Box::pin(async move { executor.execute(args).await })
+            }
+        }
     }
 }
 
@@ -670,9 +692,22 @@ impl PromptBuilder {
     #[must_use]
     pub fn use_builtins(mut self) -> Self {
         if let Some(builtins) = self.runtime.builtins() {
+            let factory = self.runtime.sandbox_factory().cloned();
             for (name, config) in builtins.configs() {
                 if let Some(executor) = builtins.get_executor(name) {
-                    let adapter = BuiltinToolExecutorAdapter { executor };
+                    // Only sandboxed tools route through the factory. Non-
+                    // sandboxed tools (e.g. `calculate`, `read_file`) skip
+                    // the subprocess roundtrip even when a factory exists.
+                    let sandbox = if config.sandboxed {
+                        factory.clone()
+                    } else {
+                        None
+                    };
+                    let adapter = BuiltinToolExecutorAdapter {
+                        tool_name: name.clone(),
+                        executor,
+                        sandbox,
+                    };
                     self.tools.push(ToolSpec {
                         definition: config.definition.clone(),
                         executor: Arc::new(adapter),

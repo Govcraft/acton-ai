@@ -5,9 +5,9 @@ default_provider = "ollama"
 
 [providers.ollama]
 type = "ollama"
-model = "qwen2.5:7b"
+model = "gemma4:26b"
 # Change this to your Ollama server URL
-base_url = "http://100.64.0.13:11434/v1"
+base_url = "http://127.0.0.1:11434/v1"
 timeout_secs = 300
 
 [providers.ollama.rate_limit]
@@ -27,19 +27,18 @@ tokens_per_minute = 1000000
 # api_key_env = "OPENAI_API_KEY"
 
 # Sandbox configuration (optional)
-# Uncomment to enable Hyperlight sandbox for tool execution isolation
-# Requires a hypervisor (KVM on Linux, Hyper-V on Windows)
+# Uncomment to enable the portable ProcessSandbox for tool execution
+# isolation. The parent re-execs the current binary, applies rlimits, and
+# (on Linux) installs a best-effort landlock + seccomp filter before
+# running the tool. No hypervisor required; works on Linux, macOS, and
+# Windows.
 
 # [sandbox]
-# # Number of sandboxes to pre-warm per guest type (default: 4)
-# pool_warmup = 4
-# # Maximum sandboxes per guest type (default: 32)
-# pool_max_per_type = 32
-# # Max executions before recycling a sandbox (default: 1000)
-# max_executions_before_recycle = 1000
+# # OS-hardening policy: "off" | "besteffort" (default) | "enforce"
+# hardening = "besteffort"
 #
 # [sandbox.limits]
 # # Maximum execution time in milliseconds (default: 30000)
 # max_execution_ms = 30000
-# # Maximum memory in MB (default: 64)
-# max_memory_mb = 64
+# # Maximum memory (address space) in MB (default: 256)
+# max_memory_mb = 256

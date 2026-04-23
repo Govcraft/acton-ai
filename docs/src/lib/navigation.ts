@@ -26,6 +26,7 @@ export const navigation = [
         href: '/docs/multi-agent-collaboration',
       },
       { title: 'Secure Tool Execution', href: '/docs/secure-tool-execution' },
+      { title: 'Process Sandbox', href: '/docs/sandbox' },
       {
         title: 'Conversation Management',
         href: '/docs/conversation-management',

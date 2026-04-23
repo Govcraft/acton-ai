@@ -797,8 +797,10 @@ mod tests {
 
     #[test]
     fn add_message_respects_max_length() {
-        let mut agent = Agent::default();
-        agent.max_conversation_length = 5;
+        let mut agent = Agent {
+            max_conversation_length: 5,
+            ..Agent::default()
+        };
 
         for i in 0..10 {
             agent.add_message(Message::user(format!("Message {}", i)));
@@ -809,8 +811,10 @@ mod tests {
 
     #[test]
     fn add_message_preserves_system_message() {
-        let mut agent = Agent::default();
-        agent.max_conversation_length = 3;
+        let mut agent = Agent {
+            max_conversation_length: 3,
+            ..Agent::default()
+        };
 
         // Add system message first
         agent.add_message(Message::system("You are helpful"));
@@ -830,8 +834,10 @@ mod tests {
 
     #[test]
     fn clear_conversation_empties_history() {
-        let mut agent = Agent::default();
-        agent.max_conversation_length = 10;
+        let mut agent = Agent {
+            max_conversation_length: 10,
+            ..Agent::default()
+        };
         agent.add_message(Message::user("Hello"));
         agent.add_message(Message::assistant("Hi"));
 

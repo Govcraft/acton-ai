@@ -79,8 +79,7 @@ use crate::llm::{LLMProvider, ProviderConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
-use crate::tools::sandbox::hyperlight::PoolConfig;
-use crate::tools::sandbox::{HyperlightSandboxFactory, SandboxConfig, SandboxFactory, SandboxPool};
+use crate::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
@@ -138,6 +137,12 @@ pub(crate) struct ActonAIInner {
     pub(crate) builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
     pub(crate) auto_builtins: bool,
+    /// Shared sandbox factory used to wrap sandboxed builtin tool calls.
+    ///
+    /// `None` when no sandbox is configured; in that case sandboxed tools
+    /// still execute in-process (matching pre-ProcessSandbox behavior) but
+    /// with no OS-level isolation.
+    pub(crate) sandbox_factory: Option<Arc<dyn SandboxFactory>>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -305,6 +310,17 @@ impl ActonAI {
         self.inner.builtins.as_ref()
     }
 
+    /// Returns the sandbox factory shared by sandboxed builtin tool calls.
+    ///
+    /// Populated when the builder was configured with
+    /// [`with_process_sandbox`](ActonAIBuilder::with_process_sandbox) or
+    /// [`with_process_sandbox_config`](ActonAIBuilder::with_process_sandbox_config)
+    /// (or an equivalent TOML `[sandbox]` section). Returns `None` otherwise.
+    #[must_use]
+    pub(crate) fn sandbox_factory(&self) -> Option<&Arc<dyn SandboxFactory>> {
+        self.inner.sandbox_factory.as_ref()
+    }
+
     /// Returns whether built-in tools are enabled.
     #[must_use]
     pub fn has_builtins(&self) -> bool {
@@ -422,27 +438,12 @@ enum BuiltinToolsConfig {
 /// Configuration for sandbox execution.
 #[derive(Default, Clone)]
 enum SandboxMode {
-    /// No sandbox (default)
+    /// No sandbox (default). Sandboxed tools execute in-process.
     #[default]
     None,
-    /// Use Hyperlight sandbox factory
-    Hyperlight(SandboxConfig),
-    /// Use sandbox pool with pre-warmed instances
-    Pool {
-        /// Pool size (number of pre-warmed sandboxes)
-        pool_size: usize,
-        /// Configuration for each sandbox
-        sandbox_config: SandboxConfig,
-        /// Configuration for the pool itself
-        pool_config: PoolConfig,
-    },
-    /// Use sandbox pool from file config
-    PoolFromConfig {
-        /// Sandbox configuration from file
-        sandbox_config: SandboxConfig,
-        /// Pool configuration from file
-        pool_config: PoolConfig,
-    },
+    /// Use the portable [`ProcessSandbox`](crate::tools::sandbox::ProcessSandbox)
+    /// with the supplied configuration.
+    Process(ProcessSandboxConfig),
 }
 
 /// Builder for configuring and launching ActonAI.
@@ -644,13 +645,7 @@ impl ActonAIBuilder {
     fn apply_sandbox_file_config(mut self, config: &SandboxFileConfig) -> Self {
         // Only apply file config if no sandbox mode has been explicitly set
         if matches!(self.sandbox_mode, SandboxMode::None) {
-            let sandbox_config = config.to_sandbox_config();
-            let pool_config = config.to_pool_config();
-
-            self.sandbox_mode = SandboxMode::PoolFromConfig {
-                sandbox_config,
-                pool_config,
-            };
+            self.sandbox_mode = SandboxMode::Process(config.to_process_config());
         }
         self
     }
@@ -912,11 +907,14 @@ impl ActonAIBuilder {
         self
     }
 
-    /// Enables Hyperlight sandbox for hardware-isolated tool execution.
+    /// Enables the portable [`ProcessSandbox`](crate::tools::sandbox::ProcessSandbox)
+    /// for sandboxed tool execution.
     ///
-    /// Uses Microsoft's Hyperlight micro-VM technology for strong isolation
-    /// with 1-2ms cold start times. Requires a hypervisor (KVM on Linux,
-    /// Hyper-V on Windows).
+    /// Each sandboxed tool call re-execs the current binary as a child
+    /// process, applies rlimits, and on Linux kernels supporting landlock +
+    /// seccomp (5.13+) installs best-effort filesystem and syscall filters
+    /// before running the tool. The parent enforces a wall-clock timeout
+    /// and kills the child's process group on overrun.
     ///
     /// # Example
     ///
@@ -924,95 +922,39 @@ impl ActonAIBuilder {
     /// let runtime = ActonAI::builder()
     ///     .app_name("my-app")
     ///     .ollama("qwen2.5:7b")
-    ///     .with_hyperlight_sandbox()
+    ///     .with_process_sandbox()
     ///     .launch()
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn with_hyperlight_sandbox(mut self) -> Self {
-        self.sandbox_mode = SandboxMode::Hyperlight(SandboxConfig::default());
+    pub fn with_process_sandbox(mut self) -> Self {
+        self.sandbox_mode = SandboxMode::Process(ProcessSandboxConfig::default());
         self
     }
 
-    /// Enables Hyperlight sandbox with custom configuration.
+    /// Enables the [`ProcessSandbox`](crate::tools::sandbox::ProcessSandbox)
+    /// with a custom configuration.
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// use acton_ai::tools::sandbox::SandboxConfig;
+    /// use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
     /// use std::time::Duration;
     ///
-    /// let config = SandboxConfig::new()
-    ///     .with_memory_limit(128 * 1024 * 1024)
-    ///     .with_timeout(Duration::from_secs(60));
+    /// let cfg = ProcessSandboxConfig::new()
+    ///     .with_timeout(Duration::from_secs(60))
+    ///     .with_hardening(HardeningMode::Enforce);
     ///
     /// let runtime = ActonAI::builder()
     ///     .app_name("my-app")
     ///     .ollama("qwen2.5:7b")
-    ///     .with_hyperlight_sandbox_config(config)
+    ///     .with_process_sandbox_config(cfg)
     ///     .launch()
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn with_hyperlight_sandbox_config(mut self, config: SandboxConfig) -> Self {
-        self.sandbox_mode = SandboxMode::Hyperlight(config);
-        self
-    }
-
-    /// Enables a pool of pre-warmed Hyperlight sandboxes.
-    ///
-    /// Pool size determines how many sandboxes are kept ready for immediate use,
-    /// reducing latency for tool executions. Recommended for high-throughput
-    /// scenarios.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// let runtime = ActonAI::builder()
-    ///     .app_name("my-app")
-    ///     .ollama("qwen2.5:7b")
-    ///     .with_sandbox_pool(4)  // Keep 4 sandboxes warm
-    ///     .launch()
-    ///     .await?;
-    /// ```
-    #[must_use]
-    pub fn with_sandbox_pool(mut self, pool_size: usize) -> Self {
-        self.sandbox_mode = SandboxMode::Pool {
-            pool_size,
-            sandbox_config: SandboxConfig::default(),
-            pool_config: PoolConfig::default(),
-        };
-        self
-    }
-
-    /// Enables a pool of pre-warmed Hyperlight sandboxes with custom configuration.
-    ///
-    /// # Example
-    ///
-    /// ```rust,ignore
-    /// use acton_ai::tools::sandbox::SandboxConfig;
-    ///
-    /// let config = SandboxConfig::new()
-    ///     .with_memory_limit(64 * 1024 * 1024);
-    ///
-    /// let runtime = ActonAI::builder()
-    ///     .app_name("my-app")
-    ///     .ollama("qwen2.5:7b")
-    ///     .with_sandbox_pool_config(4, config)
-    ///     .launch()
-    ///     .await?;
-    /// ```
-    #[must_use]
-    pub fn with_sandbox_pool_config(
-        mut self,
-        pool_size: usize,
-        sandbox_config: SandboxConfig,
-    ) -> Self {
-        self.sandbox_mode = SandboxMode::Pool {
-            pool_size,
-            sandbox_config,
-            pool_config: PoolConfig::default(),
-        };
+    pub fn with_process_sandbox_config(mut self, config: ProcessSandboxConfig) -> Self {
+        self.sandbox_mode = SandboxMode::Process(config);
         self
     }
 
@@ -1065,69 +1007,29 @@ impl ActonAIBuilder {
             providers.insert(name, handle);
         }
 
-        // Initialize sandbox if configured
-        {
-            use crate::tools::sandbox::hyperlight::WarmPool;
-
-            match self.sandbox_mode {
-                SandboxMode::None => {}
-                SandboxMode::Hyperlight(config) => {
-                    // Use fallback factory that gracefully handles missing hypervisor
-                    let factory = HyperlightSandboxFactory::with_config_fallback(config);
-                    if !factory.is_available() {
-                        tracing::warn!(
-                            "Hyperlight sandbox configured but hypervisor not available; \
-                             sandboxed tools will fail"
-                        );
-                    }
-                    // Store the factory for tool registry configuration
-                    // Note: The tool registry will be configured separately
-                    let _factory = Arc::new(factory);
-                    tracing::info!("Hyperlight sandbox factory initialized");
-                }
-                SandboxMode::Pool {
-                    pool_size,
-                    sandbox_config,
-                    pool_config,
-                } => {
-                    // Spawn the sandbox pool actor with provided configs
-                    let pool_handle =
-                        SandboxPool::spawn(&mut runtime, sandbox_config, pool_config).await;
-
-                    // Warm up the pool for all guest types
-                    pool_handle
-                        .send(WarmPool {
-                            count: pool_size,
-                            guest_type: None,
-                        })
-                        .await;
-
-                    tracing::info!(pool_size, "Hyperlight sandbox pool initialized and warmed");
-                }
-                SandboxMode::PoolFromConfig {
-                    sandbox_config,
-                    pool_config,
-                } => {
-                    // Spawn the sandbox pool actor with config from file
-                    let warmup_count = pool_config.warmup_count;
-                    let pool_handle =
-                        SandboxPool::spawn(&mut runtime, sandbox_config, pool_config).await;
-
-                    // Warm up the pool for all guest types using warmup count from config
-                    pool_handle
-                        .send(WarmPool {
-                            count: warmup_count,
-                            guest_type: None,
-                        })
-                        .await;
-
-                    tracing::info!(
-                        warmup_count,
-                        "Hyperlight sandbox pool initialized from config and warmed"
-                    );
-                }
+        // Initialize sandbox if configured.
+        //
+        // Ownership note: the produced factory is retained on
+        // `ActonAIInner::sandbox_factory` so `.use_builtins()` can wrap
+        // sandboxed tool executors at prompt construction time. Prior to
+        // this refactor the factory was constructed and dropped, which
+        // silently bypassed sandboxing for all facade callers.
+        let sandbox_factory: Option<Arc<dyn SandboxFactory>> = match self.sandbox_mode {
+            SandboxMode::None => None,
+            SandboxMode::Process(cfg) => {
+                let factory = ProcessSandboxFactory::new(cfg).map_err(|err| {
+                    ActonAIError::new(ActonAIErrorKind::Configuration {
+                        field: "sandbox".to_string(),
+                        reason: format!("failed to initialize process sandbox: {err}"),
+                    })
+                })?;
+                tracing::info!(
+                    exe = %factory.exe().display(),
+                    "process sandbox factory initialized"
+                );
+                Some(Arc::new(factory) as Arc<dyn SandboxFactory>)
             }
-        }
+        };
 
         // Load built-in tools if configured
         let builtins = match self.builtins {
@@ -1151,6 +1053,7 @@ impl ActonAIBuilder {
                 default_provider: default_provider_name,
                 builtins,
                 auto_builtins: self.auto_builtins,
+                sandbox_factory,
                 is_shutdown: AtomicBool::new(false),
             }),
         })

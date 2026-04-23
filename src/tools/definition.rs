@@ -110,8 +110,9 @@ pub trait ToolExecutorTrait: Send + Sync + Debug {
 
     /// Returns whether this tool requires sandbox execution.
     ///
-    /// Sandboxed tools run in isolated environments (e.g., Hyperlight micro-VMs)
-    /// for security when executing untrusted code.
+    /// Sandboxed tools run in isolated environments (e.g., the
+    /// [`super::sandbox::ProcessSandbox`] subprocess layer) for security
+    /// when executing untrusted code.
     fn requires_sandbox(&self) -> bool {
         false
     }

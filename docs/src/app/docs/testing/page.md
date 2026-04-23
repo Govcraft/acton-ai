@@ -473,59 +473,44 @@ mod sandbox_tests {
 
 ## Testing sandbox configuration
 
-`SandboxConfig` and `PoolConfig` have validation methods that can be tested without a hypervisor:
+`ProcessSandboxConfig` has a `validate()` method that can be tested without spawning a child process:
 
 ```rust
-use acton_ai::tools::sandbox::SandboxConfig;
-use acton_ai::tools::sandbox::hyperlight::PoolConfig;
+use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use std::time::Duration;
 
 #[test]
 fn valid_sandbox_config_passes_validation() {
-    let config = SandboxConfig::new()
-        .with_memory_limit(128 * 1024 * 1024)
+    let config = ProcessSandboxConfig::new()
         .with_timeout(Duration::from_secs(60))
-        .with_pool_size(Some(8));
+        .with_memory_limit(Some(128 * 1024 * 1024))
+        .with_hardening(HardeningMode::Enforce);
 
     assert!(config.validate().is_ok());
-}
-
-#[test]
-fn rejects_memory_below_1mb() {
-    let config = SandboxConfig::new().with_memory_limit(1000);
-    assert!(config.validate().is_err());
 }
 
 #[test]
 fn rejects_zero_timeout() {
-    let config = SandboxConfig::new().with_timeout(Duration::ZERO);
+    let config = ProcessSandboxConfig::new().with_timeout(Duration::ZERO);
     assert!(config.validate().is_err());
 }
 
 #[test]
-fn rejects_zero_pool_size() {
-    let config = SandboxConfig::new().with_pool_size(Some(0));
+fn rejects_zero_memory_limit() {
+    let config = ProcessSandboxConfig::new().with_memory_limit(Some(0));
     assert!(config.validate().is_err());
 }
 
 #[test]
-fn none_pool_size_is_valid() {
-    let config = SandboxConfig::new().without_pool();
+fn unlimited_memory_is_valid() {
+    let config = ProcessSandboxConfig::new().with_memory_limit(None);
     assert!(config.validate().is_ok());
 }
 
 #[test]
-fn pool_config_validation() {
-    let config = PoolConfig::new()
-        .with_warmup_count(8)
-        .with_max_per_type(64)
-        .with_max_executions_before_recycle(500);
-
-    assert!(config.validate().is_ok());
-
-    // Zero max_per_type is invalid
-    let bad = PoolConfig::new().with_max_per_type(0);
-    assert!(bad.validate().is_err());
+fn rejects_empty_env_allowlist() {
+    let config = ProcessSandboxConfig::new().with_env_allowlist(Vec::<String>::new());
+    assert!(config.validate().is_err());
 }
 ```
 
@@ -682,7 +667,7 @@ fn chat_config_input_mapper() {
 | `DelegationTracker` | No | No | Track/complete tasks and check counts |
 | Error types and classification | No | No | Construct errors and test predicates |
 | `PathValidator` | No | No | Create temp dirs and validate paths |
-| `SandboxConfig` / `PoolConfig` | No | No | Builder methods and `validate()` |
+| `ProcessSandboxConfig` | No | No | Builder methods and `validate()` |
 | `StubSandbox` execution | Yes | No | `#[tokio::test]` with stub |
 | Tool definitions | No | No | `get_tool_definition()` and schema checks |
 | Prompt execution | Yes | Yes | `#[ignore]` with running Ollama |
@@ -694,5 +679,5 @@ fn chat_config_input_mapper() {
 ## Next steps
 
 - [Error Handling](/docs/error-handling) -- understand all error types for test assertions
-- [Secure Tool Execution](/docs/secure-tool-execution) -- learn about `StubSandbox` vs `HyperlightSandbox`
+- [Secure Tool Execution](/docs/secure-tool-execution) -- learn about `StubSandbox` vs `ProcessSandbox`
 - [Multi-Agent Collaboration](/docs/multi-agent-collaboration) -- test delegation and agent coordination

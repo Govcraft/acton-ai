@@ -17,7 +17,6 @@
 //! ### Execution Tools
 //! - **bash**: Execute shell commands (sandboxed by default)
 //! - **calculate**: Evaluate mathematical expressions
-//! - **rust_code**: Execute compiler-verified Rust code (requires hyperlight feature)
 //!
 //! ### Web Tools
 //! - **web_fetch**: Fetch content from URLs
@@ -69,7 +68,6 @@ mod glob;
 mod grep;
 mod list_directory;
 mod read_file;
-mod rust_code;
 mod web_fetch;
 mod write_file;
 
@@ -88,8 +86,6 @@ pub use list_directory::{ListDirectoryTool, ListDirectoryToolActor};
 pub use read_file::{ReadFileTool, ReadFileToolActor};
 pub use web_fetch::{WebFetchTool, WebFetchToolActor};
 pub use write_file::{WriteFileTool, WriteFileToolActor};
-
-pub use rust_code::{RustCodeTool, RustCodeToolActor};
 
 #[cfg(feature = "agent-skills")]
 pub use skill_activate::{ActivateSkillTool, ActivateSkillToolActor};
@@ -202,10 +198,6 @@ impl BuiltinTools {
     }
 
     /// Lists all available built-in tool names.
-    ///
-    /// Note: Not all tools may be registered in `all()`. Some tools like `rust_code`
-    /// require external dependencies (Rust toolchain) and are only available via
-    /// `spawn_tool_actor()`.
     #[must_use]
     pub fn available() -> Vec<&'static str> {
         vec![
@@ -218,7 +210,6 @@ impl BuiltinTools {
             "bash",
             "calculate",
             "web_fetch",
-            "rust_code",
         ]
     }
 
@@ -335,11 +326,6 @@ pub async fn spawn_tool_actor(
             let definition = WebFetchToolActor::definition();
             Ok((handle, definition))
         }
-        "rust_code" => {
-            let handle = RustCodeToolActor::spawn(runtime).await;
-            let definition = RustCodeToolActor::definition();
-            Ok((handle, definition))
-        }
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -364,7 +350,6 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
         "bash" => Ok(BashToolActor::definition()),
         "calculate" => Ok(CalculateToolActor::definition()),
         "web_fetch" => Ok(WebFetchToolActor::definition()),
-        "rust_code" => Ok(RustCodeToolActor::definition()),
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -431,11 +416,7 @@ mod tests {
         let tools = BuiltinTools::all();
         assert_eq!(tools.len(), 9);
 
-        // rust_code is not in all() because it requires toolchain
-        for name in BuiltinTools::available()
-            .iter()
-            .filter(|n| **n != "rust_code")
-        {
+        for name in BuiltinTools::available() {
             assert!(
                 tools.get_config(name).is_some(),
                 "missing config for {name}"
@@ -466,7 +447,7 @@ mod tests {
     #[test]
     fn builtin_tools_available_returns_all_names() {
         let names = BuiltinTools::available();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 9);
 
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -477,7 +458,6 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"calculate"));
         assert!(names.contains(&"web_fetch"));
-        assert!(names.contains(&"rust_code"));
     }
 
     #[test]

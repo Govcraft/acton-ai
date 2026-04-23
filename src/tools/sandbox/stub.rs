@@ -9,14 +9,15 @@ use serde_json::Value;
 
 /// A stub sandbox implementation for development and testing.
 ///
-/// This implementation does not actually sandbox code - it's a placeholder
-/// until Hyperlight integration is complete. It should NOT be used for
-/// executing untrusted code in production.
+/// This implementation does not actually sandbox code — it echoes the
+/// request back as a canned response. It must NOT be used for executing
+/// untrusted code in production.
 ///
 /// # Warning
 ///
 /// Commands executed through this sandbox run directly on the host system
-/// without any isolation. Use `HyperlightSandbox` for production workloads.
+/// without any isolation. Use [`super::ProcessSandbox`] for production
+/// workloads.
 #[derive(Debug, Default)]
 pub struct StubSandbox {
     /// Whether the sandbox has been destroyed
@@ -40,7 +41,7 @@ impl Sandbox for StubSandbox {
         }
 
         // Stub implementation just returns a placeholder response
-        // In production, this would execute code in a Hyperlight micro-VM
+        // In production, this would route through ProcessSandbox.
         let code_preview = if code.len() > 50 {
             code[..50].to_string()
         } else {

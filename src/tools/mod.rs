@@ -5,7 +5,7 @@
 //! - **Tool Registry**: Central actor that manages tool registration and dispatch
 //! - **Tool Executor**: Supervised child actors for executing individual tools
 //! - **Tool Actors**: Per-agent tool actors for isolated tool execution
-//! - **Sandbox**: Interface for sandboxed code execution (Hyperlight integration)
+//! - **Sandbox**: Interface for sandboxed code execution (ProcessSandbox backend)
 //!
 //! ## Architecture
 //!
@@ -79,7 +79,6 @@
 
 pub mod actor;
 pub mod builtins;
-pub mod compiler;
 pub mod definition;
 pub mod error;
 pub mod executor;
@@ -101,12 +100,6 @@ pub use registry::{
 };
 pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 pub use security::{PathValidationError, PathValidator};
-
-// Compiler module re-exports
-pub use compiler::{
-    CacheConfig, CacheStats, CodeHash, CodeTemplate, CompilationCache, CompilationError,
-    CompilationErrorKind, CompiledBinary, RustCompiler,
-};
 
 // Stub implementation is only available in tests (security concern in production)
 #[cfg(test)]

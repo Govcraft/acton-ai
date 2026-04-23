@@ -390,7 +390,7 @@ async fn main() -> anyhow::Result<()> {
 
 ## Next steps
 
-- [Secure Tool Execution](/docs/secure-tool-execution) -- sandbox agent tool calls in Hyperlight micro-VMs
+- [Secure Tool Execution](/docs/secure-tool-execution) -- sandbox agent tool calls with the portable ProcessSandbox
 - [Conversation Management](/docs/conversation-management) -- manage multi-turn state across agents
 - [Error Handling](/docs/error-handling) -- handle errors from multi-agent operations with `MultiAgentError`
 - [Testing Your Agents](/docs/testing) -- test multi-agent workflows with mock providers

@@ -33,7 +33,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Tool execution loop** — Automatic tool calling and result handling until completion
 - **Two API levels** — Simple facade for common cases, full actor access for advanced control
 - **TOML configuration** — Define providers and settings in config files
-- **Hyperlight sandboxing** — Hardware-isolated execution for untrusted code (KVM/Hyper-V)
+- **Process sandboxing** — Portable subprocess isolation for tool execution with rlimits, timeouts, and optional Linux hardening (landlock + seccomp)
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -202,14 +202,15 @@ type = "anthropic"
 model = "claude-sonnet-4-20250514"
 api_key_env = "ANTHROPIC_API_KEY"
 
-# Optional: Hyperlight sandbox for tool isolation
+# Optional: ProcessSandbox for tool isolation
+# Runs sandboxed tools in a subprocess with rlimits, timeouts, and
+# (on Linux) best-effort landlock + seccomp hardening.
 [sandbox]
-pool_warmup = 4
-pool_max_per_type = 32
+hardening = "besteffort"    # "off" | "besteffort" | "enforce"
 
 [sandbox.limits]
 max_execution_ms = 30000
-max_memory_mb = 64
+max_memory_mb = 256
 ```
 
 Load the configuration:
@@ -236,7 +237,7 @@ let runtime = ActonAI::builder()
         ProviderConfig::ollama("qwen2.5:7b"))
     .default_provider("local")
     .with_builtins()
-    .with_sandbox_pool(4)  // Pre-warm 4 Hyperlight sandboxes
+    .with_process_sandbox()  // Isolate sandboxed tools in a subprocess
     .launch()
     .await?;
 ```
@@ -377,8 +378,8 @@ cargo run --example multi_provider
 # Custom tool definitions
 cargo run --example ollama_tools
 
-# Hyperlight sandboxed execution
-cargo run --example bash_sandbox
+# Process-sandboxed execution
+cargo run --example process_sandbox
 
 # Per-agent tool configuration
 cargo run --example per_agent_tools

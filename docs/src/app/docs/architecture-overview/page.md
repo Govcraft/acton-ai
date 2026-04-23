@@ -48,9 +48,9 @@ The framework is built on three principles:
         |                    |                    |
         v                    v                    v
 +----------------+  +------------------+  +-------------------+
-| Tool Actors    |  | Memory Store     |  | Sandbox Pool      |
-| (per-agent,    |  | (libSQL/Turso    |  | (Hyperlight       |
-|  supervised)   |  |  persistence)    |  |  micro-VMs)       |
+| Tool Actors    |  | Memory Store     |  | ProcessSandbox    |
+| (per-agent,    |  | (libSQL/Turso    |  | (subprocess +     |
+|  supervised)   |  |  persistence)    |  |  rlimits/landlock)|
 +----------------+  +------------------+  +-------------------+
 ```
 
@@ -107,9 +107,8 @@ Key types:
 The tool system. Provides infrastructure for tool registration, execution, and sandboxing. Tools can be registered globally (via `ToolRegistry`) or per-agent (via `ToolActor`). The per-agent approach is recommended because each tool actor is supervised as a child of its owning agent.
 
 Key submodules:
-- `builtins/` -- pre-built tools (read_file, write_file, edit_file, list_directory, glob, grep, bash, calculate, web_fetch, rust_code)
-- `sandbox/` -- sandboxed execution via Hyperlight micro-VMs
-- `compiler/` -- Rust code compilation, caching, and templates for the `rust_code` tool
+- `builtins/` -- pre-built tools (read_file, write_file, edit_file, list_directory, glob, grep, bash, calculate, web_fetch)
+- `sandbox/` -- `Sandbox`/`SandboxFactory` traits plus the `process/` implementation (re-exec + rlimits + optional landlock/seccomp). See [Process Sandbox](/docs/sandbox).
 - `security/` -- path validation and sanitization (`PathValidator`)
 - `actor.rs` -- per-agent `ToolActor` implementation and the `ToolExecutor` trait
 - `registry.rs` -- global `ToolRegistry` actor (legacy approach)
@@ -179,11 +178,10 @@ ActorRuntime (tokio-based)
   |
   +-- LLMProvider "default" (one per registered provider)
   +-- LLMProvider "claude" ...
-  +-- SandboxPool (optional, manages pre-warmed Hyperlight VMs)
   +-- MemoryStore (optional, for persistence)
 ```
 
-The Kernel supervises agents. Each agent supervises its own tool actors. LLM providers and the sandbox pool are top-level actors managed directly by the runtime. This hierarchy ensures that when an agent fails, only its tools are affected -- other agents and the rest of the system continue operating.
+The Kernel supervises agents. Each agent supervises its own tool actors. LLM providers are top-level actors managed directly by the runtime. The ProcessSandbox, when enabled, is a stateless factory: each sandboxed tool call spawns a child process on demand. This hierarchy ensures that when an agent fails, only its tools are affected -- other agents and the rest of the system continue operating.
 
 ---
 
@@ -281,7 +279,7 @@ Agent receives LLMStreamToolCall
   |
   +-- ToolActor executes the tool (via ToolExecutorTrait)
   |     |
-  |     +-- (optional) Runs in Hyperlight sandbox
+  |     +-- (optional) Runs inside a ProcessSandbox child
   |
   +-- ToolActor responds with ToolActorResponse
   |

@@ -462,45 +462,48 @@ runtime.prompt("List files").use_builtins().collect().await?;
 
 ### Sandbox configuration
 
-#### `with_hyperlight_sandbox()`
+See [Process Sandbox](/docs/sandbox) for the full sandbox model, hardening modes, and threat model.
+
+#### `with_process_sandbox()`
 
 ```rust
-pub fn with_hyperlight_sandbox(self) -> Self
+pub fn with_process_sandbox(self) -> Self
 ```
 
-Enables Hyperlight sandbox for hardware-isolated tool execution with default settings. Requires a hypervisor (KVM on Linux, Hyper-V on Windows).
-
-#### `with_hyperlight_sandbox_config()`
-
-```rust
-pub fn with_hyperlight_sandbox_config(self, config: SandboxConfig) -> Self
-```
-
-Enables Hyperlight sandbox with custom configuration.
-
-#### `with_sandbox_pool()`
-
-```rust
-pub fn with_sandbox_pool(self, pool_size: usize) -> Self
-```
-
-Enables a pool of pre-warmed Hyperlight sandboxes. Recommended for high-throughput scenarios.
+Enables the portable [`ProcessSandbox`](/docs/sandbox) with default configuration: 30-second wall-clock timeout, 256 MB address-space ceiling, and `HardeningMode::BestEffort` (landlock + seccomp on Linux kernels 5.13+, rlimits-only elsewhere).
 
 ```rust
 ActonAI::builder()
     .ollama("qwen2.5:7b")
-    .with_sandbox_pool(4)  // Keep 4 sandboxes warm
+    .with_builtins()
+    .with_process_sandbox()
     .launch()
     .await?;
 ```
 
-#### `with_sandbox_pool_config()`
+#### `with_process_sandbox_config()`
 
 ```rust
-pub fn with_sandbox_pool_config(self, pool_size: usize, sandbox_config: SandboxConfig) -> Self
+pub fn with_process_sandbox_config(self, config: ProcessSandboxConfig) -> Self
 ```
 
-Enables a pool of pre-warmed Hyperlight sandboxes with custom configuration.
+Enables the ProcessSandbox with a custom configuration. Use this to tighten or loosen timeouts, memory ceilings, environment allowlists, or hardening mode.
+
+```rust
+use acton_ai::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
+use std::time::Duration;
+
+let cfg = ProcessSandboxConfig::new()
+    .with_timeout(Duration::from_secs(60))
+    .with_hardening(HardeningMode::Enforce);
+
+ActonAI::builder()
+    .ollama("qwen2.5:7b")
+    .with_builtins()
+    .with_process_sandbox_config(cfg)
+    .launch()
+    .await?;
+```
 
 ### Launch
 

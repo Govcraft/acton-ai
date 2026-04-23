@@ -166,7 +166,6 @@ let runtime = ActonAI::builder()
 | `bash` | Execute shell commands |
 | `calculate` | Evaluate mathematical expressions |
 | `web_fetch` | Fetch content from URLs |
-| `rust_code` | Execute compiler-verified Rust code (requires Rust toolchain) |
 
 ### Auto-builtins vs manual builtins
 

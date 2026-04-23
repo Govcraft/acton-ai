@@ -40,15 +40,14 @@ Xcode Command Line Tools are sufficient:
 xcode-select --install
 ```
 
-### Optional: Hypervisor for sandbox testing
+### Sandbox testing
 
-The tool sandbox system uses [Hyperlight](https://github.com/hyperlight-dev/hyperlight) micro-VMs. If you plan to work on sandbox-related code, you need a hypervisor:
+The tool sandbox is a cross-platform process sandbox. No hypervisor is required. Sandboxed tool calls re-exec the current binary as a child process, apply rlimits and a wall-clock timeout, and on Linux additionally install a best-effort `landlock` + `seccomp` filter before running the tool.
 
-- **Linux**: KVM (`sudo apt-get install qemu-kvm` or verify with `ls /dev/kvm`)
-- **Windows**: Hyper-V (enable via Windows Features)
+The hardening layer is gated by the `sandbox-hardening` Cargo feature, which is enabled by default on Linux and compiled out on other platforms. Sandbox tests build and run on Linux (x86_64 + aarch64), macOS (Intel + Apple Silicon), and Windows x86_64 without any extra system dependencies.
 
-{% callout type="note" title="Sandbox is optional for most development" %}
-If you do not have a hypervisor available, the rest of the framework builds and tests fine. Sandbox-specific tests will be skipped or will use the stub implementation.
+{% callout type="note" title="Running sandbox tests without hardening" %}
+To test the rlimits-only path (useful when reproducing behavior on older Linux kernels), build with `--no-default-features`. The sandbox still enforces resource limits and timeouts; only the landlock/seccomp layer is skipped.
 {% /callout %}
 
 ### Optional: Ollama for integration testing
@@ -149,7 +148,7 @@ The `examples/` directory contains runnable examples demonstrating various featu
 | `multi_provider` | Using multiple LLM providers |
 | `multi_agent` | Multi-agent collaboration |
 | `per_agent_tools` | Per-agent tool configuration |
-| `bash_sandbox` | Sandboxed bash execution |
+| `process_sandbox` | Process-sandboxed bash execution |
 | `agent_skills` | Agent skills system (requires `agent-skills` feature) |
 
 Run an example:

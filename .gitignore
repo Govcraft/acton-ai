@@ -5,10 +5,11 @@
 !**/.env.example
 !.github
 
-# Text and markdown files (except README.md, example skills, and docs)
+# Text and markdown files (except README.md, CHANGELOG.md, example skills, and docs)
 *.txt
 *.md
 !README.md
+!CHANGELOG.md
 !examples/skills/*.md
 !docs/**/*.md
 

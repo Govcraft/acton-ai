@@ -19,7 +19,8 @@ pub type SandboxFactoryFuture =
 /// Trait for sandboxed code execution.
 ///
 /// Sandboxes provide isolated environments for executing untrusted code.
-/// The primary implementation uses Hyperlight micro-VMs for hardware isolation.
+/// The primary implementation is [`super::ProcessSandbox`], a portable
+/// subprocess-based sandbox with best-effort OS hardening on Linux.
 ///
 /// # Thread Safety
 ///
@@ -29,12 +30,12 @@ pub type SandboxFactoryFuture =
 /// # Example
 ///
 /// ```rust,ignore
-/// use acton_ai::tools::sandbox::{Sandbox, SandboxFactory, HyperlightSandboxFactory};
+/// use acton_ai::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
 ///
-/// let factory = HyperlightSandboxFactory::new()?;
+/// let factory = ProcessSandboxFactory::new(ProcessSandboxConfig::default())?;
 /// let sandbox = factory.create().await?;
 ///
-/// let result = sandbox.execute("echo hello", serde_json::json!({})).await?;
+/// let result = sandbox.execute("bash", serde_json::json!({"command": "echo hi"})).await?;
 /// sandbox.destroy();
 /// ```
 pub trait Sandbox: Send + Sync + Debug {
@@ -68,8 +69,7 @@ pub trait Sandbox: Send + Sync + Debug {
     /// Executes code synchronously (for use in blocking contexts).
     ///
     /// This method is intended for use with `tokio::task::spawn_blocking`
-    /// when the sandbox implementation requires synchronous execution
-    /// (e.g., Hyperlight's `MultiUseSandbox::call`).
+    /// when the sandbox implementation requires synchronous execution.
     ///
     /// # Arguments
     ///
@@ -100,14 +100,14 @@ pub trait Sandbox: Send + Sync + Debug {
 /// # Availability
 ///
 /// Use `is_available()` to check if the factory can create sandboxes
-/// on the current system (e.g., hypervisor presence).
+/// on the current system.
 ///
 /// # Example
 ///
 /// ```rust,ignore
-/// use acton_ai::tools::sandbox::{SandboxFactory, HyperlightSandboxFactory};
+/// use acton_ai::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
 ///
-/// let factory = HyperlightSandboxFactory::new_with_fallback();
+/// let factory = ProcessSandboxFactory::new(ProcessSandboxConfig::default())?;
 /// if factory.is_available() {
 ///     let sandbox = factory.create().await?;
 ///     // Use sandbox...
@@ -127,8 +127,8 @@ pub trait SandboxFactory: Send + Sync + Debug {
 
     /// Returns whether this factory can create sandboxes.
     ///
-    /// For Hyperlight, this checks if a hypervisor is available.
-    /// For stub implementations, this returns `true`.
+    /// For [`super::ProcessSandbox`], this verifies the target executable
+    /// exists. For stub implementations, this returns `true`.
     fn is_available(&self) -> bool {
         true
     }

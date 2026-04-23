@@ -16,8 +16,11 @@ include = [
 ]
 
 [features]
-default = []
+default = ["sandbox-hardening"]
 agent-skills = ["dep:agent-skills"]
+# Enables Linux-specific OS hardening (landlock + seccomp) for the process
+# sandbox child. A no-op on non-Linux platforms.
+sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
@@ -56,14 +59,21 @@ fasteval = "0.2"
 regex = "1"
 url = "2"
 
-# Sandboxing (required - framework only runs with hypervisor)
-hyperlight-host = "0.12"
 agent-skills = { version = "0.2.0", optional = true }
 clap = { version = "4.6.0", features = ["derive", "env"] }
+rlimit = "0.11.0"
+tempfile = "3"
 
 [dev-dependencies]
 anyhow = "1.0.100"
 colored = "3.1.1"
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 tokio-test = "0.4"
-tempfile = "3"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+landlock = { version = "0.4.4", optional = true }
+libc = { version = "0.2.186", optional = true }
+seccompiler = { version = "0.5.0", optional = true }
+
+[target."cfg(unix)".dependencies]
+nix = { version = "0.31.2", features = ["signal"] }

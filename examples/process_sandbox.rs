@@ -1,12 +1,17 @@
-//! Example: Bash Tool with Hyperlight Sandbox
+//! Example: bash tool routed through the portable ProcessSandbox.
 //!
-//! This example demonstrates how to use the built-in bash tool with
-//! Hyperlight micro-VM sandboxing for hardware-isolated command execution.
+//! This example shows how to enable the [`ProcessSandbox`] for sandboxed
+//! builtin tool execution. Each bash invocation re-execs the current binary
+//! as a child process, applies rlimits (address space, CPU, file size), and
+//! on Linux kernels 5.13+ installs best-effort landlock + seccomp filters
+//! before the tool runs. The parent enforces a wall-clock timeout and kills
+//! the child's process group on overrun.
 //!
-//! # Features
-//!
-//! - Bash commands execute inside a Hyperlight micro-VM with hardware isolation
-//! - Requires KVM on Linux or Hyper-V on Windows
+//! This is NOT hardware isolation — there is no VM or hypervisor. The aim
+//! is pragmatic: a small, auditable, cross-platform fence that catches the
+//! realistic failure modes (runaway processes, accidental /etc writes,
+//! syscall-based escape tricks) without pinning the crate to a single host
+//! architecture.
 //!
 //! # Configuration
 //!
@@ -22,11 +27,24 @@
 //! base_url = "http://localhost:11434/v1"
 //! ```
 //!
+//! Optional sandbox tuning:
+//!
+//! ```toml
+//! [sandbox]
+//! hardening = "besteffort"    # "off" | "besteffort" | "enforce"
+//!
+//! [sandbox.limits]
+//! max_execution_ms = 30000
+//! max_memory_mb = 256
+//! ```
+//!
 //! # Usage
 //!
 //! ```bash
-//! cargo run --example bash_sandbox
+//! cargo run --example process_sandbox
 //! ```
+//!
+//! [`ProcessSandbox`]: acton_ai::tools::sandbox::ProcessSandbox
 
 use acton_ai::prelude::*;
 use std::io::Write;
@@ -35,22 +53,25 @@ use std::io::Write;
 async fn main() -> anyhow::Result<()> {
     eprintln!("Loading configuration from acton-ai.toml...");
 
-    // Build the runtime with bash tool enabled from config file
-    // The bash tool is marked as `sandboxed: true` by default
+    // Build the runtime with bash tool enabled from config file.
+    // The bash tool is marked as `sandboxed: true` by default, so with a
+    // ProcessSandbox factory registered the bash invocations below are
+    // routed through a subprocess instead of running in-process.
     let builder = ActonAI::builder()
-        .app_name("bash-sandbox-example")
+        .app_name("process-sandbox-example")
         .from_config()?
-        .with_builtin_tools(&["bash"]); // Enable only the bash tool
+        .with_builtin_tools(&["bash"]) // Enable only the bash tool
+        .with_process_sandbox();
 
-    // Configure Hyperlight sandbox for command execution
-    eprintln!("Hyperlight sandbox ENABLED - commands execute in micro-VM");
-    let builder = builder.with_hyperlight_sandbox();
+    eprintln!(
+        "ProcessSandbox ENABLED - bash commands execute in a re-execed child \
+         with rlimits + (on Linux) landlock/seccomp"
+    );
 
     let runtime = builder.launch().await?;
 
     eprintln!("\nAsking LLM to run a simple bash command...\n");
 
-    // Ask the LLM to run a command - it will use the bash tool
     let response = runtime
         .prompt("What is the current date and time?")
         .system(
@@ -81,8 +102,7 @@ async fn main() -> anyhow::Result<()> {
         println!("    {:?}", tc.result);
     }
 
-    // Demonstrate a more complex command
-    eprintln!("\n--- Second prompt: listing files ---\n");
+    eprintln!("\n--- Second prompt: current working directory ---\n");
 
     let response = runtime
         .prompt("What is the current working directory?")
@@ -91,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
              When asked to run commands like `date` or `ls`, use the bash tool. \
              Report the command output clearly.",
         )
-        .use_builtins() // Make built-in tools available to the LLM
+        .use_builtins()
         .on_token(|token| {
             print!("{token}");
             std::io::stdout().flush().ok();
@@ -114,7 +134,6 @@ async fn main() -> anyhow::Result<()> {
         println!("    {:?}", tc.result);
     }
 
-    // Shutdown cleanly
     runtime.shutdown().await?;
 
     Ok(())

@@ -216,14 +216,9 @@ Run Clippy with:
 cargo clippy --all-targets --all-features
 ```
 
-### Known warnings
+### Clippy policy
 
-There are two pre-existing `derivable_impls` warnings that are intentionally left in place:
-
-1. `src/llm/config.rs` -- a `Default` impl that could be derived but is kept explicit for clarity
-2. `src/tools/sandbox/hyperlight/config.rs` -- same reason
-
-These warnings are tracked and should not be "fixed" by replacing them with derives, as the explicit implementations serve as documentation of the default values.
+The tree is expected to build clean under `cargo clippy --all-targets --all-features -- -D warnings`. Any existing or new lint should be fixed rather than suppressed.
 
 {% callout type="warning" title="Do not suppress Clippy warnings" %}
 Do not add `#[allow(clippy::...)]` attributes without discussion. If Clippy flags something in new code, fix it. If you believe a lint is a false positive, raise it in the PR.

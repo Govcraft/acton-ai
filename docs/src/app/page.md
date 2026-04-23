@@ -185,14 +185,14 @@ ActonAI::builder()
 
 ### Sandboxed tool execution
 
-Tools run inside [Hyperlight](https://github.com/hyperlight-dev/hyperlight) micro-VMs for hardware-level isolation, with 1-2ms cold start times. Requires a hypervisor (KVM on Linux, Hyper-V on Windows).
+Sandboxed tool calls run in a subprocess with rlimits and a wall-clock timeout. On Linux (kernel 5.13+) the child additionally installs a best-effort `landlock` + `seccomp` filter before running the tool. No hypervisor required; works on Linux, macOS, and Windows.
 
 ```rust
 let runtime = ActonAI::builder()
     .app_name("sandboxed")
     .from_config()?
     .with_builtins()
-    .with_sandbox_pool(4)   // keep 4 micro-VMs warm
+    .with_process_sandbox()   // Isolate sandboxed tools in a subprocess
     .launch()
     .await?;
 ```

@@ -22,7 +22,7 @@ Registry of built-in tools. Provides methods to access tool configurations and e
 pub fn all() -> Self
 ```
 
-Creates a registry containing all built-in tools (except `rust_code`, which requires a Rust toolchain and is only available via `spawn_tool_actor()`). Returns 9 tools.
+Creates a registry containing all built-in tools. Returns 9 tools.
 
 #### `select()`
 
@@ -44,7 +44,7 @@ let tools = BuiltinTools::select(&["read_file", "write_file", "glob"])?;
 pub fn available() -> Vec<&'static str>
 ```
 
-Lists all available built-in tool names (10 total, including `rust_code`).
+Lists all available built-in tool names (9 total).
 
 #### `get_config()`
 
@@ -405,7 +405,7 @@ Executes shell commands and captures output.
 - Killed after the timeout expires.
 
 {% callout type="warning" title="Security" %}
-The `bash` tool executes arbitrary shell commands. In production, consider enabling the Hyperlight sandbox (`with_hyperlight_sandbox()` or `with_sandbox_pool()`) for hardware-level isolation.
+The `bash` tool executes arbitrary shell commands. In production, enable the [Process Sandbox](/docs/sandbox) via `with_process_sandbox()` so each command runs in a subprocess with rlimits, a timeout, and (on Linux) best-effort landlock + seccomp filters.
 {% /callout %}
 
 ---
@@ -502,50 +502,6 @@ Fetches content from a URL. Supports GET and POST methods with custom headers.
 
 ---
 
-### rust_code
-
-Executes Rust code in a secure Hyperlight sandbox. Code is compiler-verified before execution.
-
-**Parameters:**
-
-```json
-{
-  "type": "object",
-  "properties": {
-    "code": {
-      "type": "string",
-      "description": "Rust function body. Receives `input: String`, must return `String`. Example: `input.to_uppercase()`"
-    },
-    "input": {
-      "type": "string",
-      "description": "Input string passed to the function (default: empty string)"
-    },
-    "timeout_secs": {
-      "type": "integer",
-      "description": "Timeout in seconds (default: 30, max: 300)"
-    }
-  },
-  "required": ["code"]
-}
-```
-
-**Returns:** `{ output, success }`
-
-**Behavior:**
-- Code is wrapped in a `no_std` template with `#![forbid(unsafe_code)]`.
-- Clippy runs with `-D warnings` before compilation.
-- Compiled to `x86_64-unknown-none` target.
-- Binary executes inside a Hyperlight micro-VM with hardware isolation.
-- Defense-in-depth security: compile-time checks, unsafe forbidden, hardware sandbox.
-- Requires the Rust toolchain to be installed.
-- Not included in `BuiltinTools::all()`. Available via `spawn_tool_actor("rust_code")`.
-
-{% callout type="note" title="Requires Hyperlight" %}
-The `rust_code` tool requires a hypervisor (KVM on Linux, Hyper-V on Windows) and the Rust toolchain. It is designed for scenarios where you need safe, isolated code execution.
-{% /callout %}
-
----
-
 ## Feature-gated tools
 
 The following tools are only available when the `agent-skills` feature is enabled.
@@ -627,11 +583,10 @@ let skill_tools = spawn_skill_tool_actors(&mut runtime, registry).await;
 | `grep` | No | Filesystem | Search file contents with regex |
 | `bash` | Yes | Execution | Execute shell commands |
 | `calculate` | No | Computation | Evaluate math expressions |
-| `rust_code` | Yes | Execution | Compiler-verified Rust code execution |
 | `web_fetch` | No | Web | Fetch content from URLs |
 | `list_skills` | No | Skills | List available agent skills |
 | `activate_skill` | No | Skills | Activate a skill for the agent |
 
 {% callout type="note" title="Sandboxed tools" %}
-Tools marked as sandboxed (`write_file`, `edit_file`, `bash`, `rust_code`) are flagged for execution in a Hyperlight micro-VM when sandbox mode is enabled. Without sandbox mode, they still execute but without hardware isolation.
+Tools marked as sandboxed (`write_file`, `edit_file`, `bash`) run inside a [`ProcessSandbox`](/docs/sandbox) child process when sandbox mode is enabled via `with_process_sandbox()`. Without sandbox mode, they still execute but directly in the parent process.
 {% /callout %}

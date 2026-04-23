@@ -13,8 +13,32 @@ env:
 
 jobs:
   build:
-    name: Build x86_64-unknown-linux-gnu
-    runs-on: ubuntu-latest
+    name: Build ${{ matrix.target }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-24.04-arm
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: x86_64-apple-darwin
+            runner: macos-13
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: aarch64-apple-darwin
+            runner: macos-14
+            archive_ext: tar.gz
+            binary_ext: ""
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+            archive_ext: zip
+            binary_ext: ".exe"
     steps:
       - uses: actions/checkout@v4
         with:
@@ -23,44 +47,62 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: ${{ matrix.target }}
 
-      - name: Install x86_64-unknown-none target (for hyperlight guests)
-        run: rustup target add x86_64-unknown-none
-
-      - name: Install system dependencies
+      - name: Install Linux system dependencies
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y clang
 
       - name: Build release binary
-        run: cargo build --release --target x86_64-unknown-linux-gnu
+        run: cargo build --release --target ${{ matrix.target }}
 
       - name: Determine version from tag
         id: version
+        shell: bash
         env:
           REF_NAME: ${{ github.ref_name }}
         run: echo "version=${REF_NAME#v}" >> "$GITHUB_OUTPUT"
 
-      - name: Package binary
+      - name: Package binary (tar.gz)
+        if: matrix.archive_ext == 'tar.gz'
+        shell: bash
         env:
           VERSION: ${{ steps.version.outputs.version }}
-        shell: bash
+          TARGET: ${{ matrix.target }}
+          BIN_EXT: ${{ matrix.binary_ext }}
         run: |
-          ARCHIVE_NAME="acton-ai-${VERSION}-x86_64-unknown-linux-gnu"
-
+          ARCHIVE_NAME="acton-ai-${VERSION}-${TARGET}"
           mkdir -p "staging/${ARCHIVE_NAME}"
-          cp "target/x86_64-unknown-linux-gnu/release/acton-ai" "staging/${ARCHIVE_NAME}/"
-          cp README.md LICENSE* 2>/dev/null || true
-
+          cp "target/${TARGET}/release/acton-ai${BIN_EXT}" "staging/${ARCHIVE_NAME}/"
+          for f in README.md LICENSE LICENSE-MIT LICENSE-APACHE; do
+            if [ -f "$f" ]; then cp "$f" "staging/${ARCHIVE_NAME}/"; fi
+          done
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+
+      - name: Package binary (zip)
+        if: matrix.archive_ext == 'zip'
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TARGET: ${{ matrix.target }}
+          BIN_EXT: ${{ matrix.binary_ext }}
+        run: |
+          $archiveName = "acton-ai-$env:VERSION-$env:TARGET"
+          New-Item -ItemType Directory -Force -Path "staging/$archiveName" | Out-Null
+          Copy-Item "target/$env:TARGET/release/acton-ai$env:BIN_EXT" "staging/$archiveName/"
+          foreach ($f in @('README.md','LICENSE','LICENSE-MIT','LICENSE-APACHE')) {
+            if (Test-Path $f) { Copy-Item $f "staging/$archiveName/" }
+          }
+          Compress-Archive -Path "staging/$archiveName" -DestinationPath "staging/$archiveName.zip"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: acton-ai-x86_64-unknown-linux-gnu
-          path: staging/*.tar.gz
+          name: acton-ai-${{ matrix.target }}
+          path: staging/*.${{ matrix.archive_ext }}
 
   release:
     name: Create GitHub Release
@@ -84,11 +126,12 @@ jobs:
         run: |
           mkdir -p release
           find artifacts -name '*.tar.gz' -exec cp {} release/ \;
+          find artifacts -name '*.zip' -exec cp {} release/ \;
           ls -la release/
 
       - name: Generate checksums
         working-directory: release
-        run: sha256sum *.tar.gz > checksums-sha256.txt
+        run: sha256sum * > checksums-sha256.txt
 
       - name: Create release
         uses: softprops/action-gh-release@v2
@@ -97,6 +140,7 @@ jobs:
           generate_release_notes: true
           files: |
             release/*.tar.gz
+            release/*.zip
             release/checksums-sha256.txt
 
   aur:
