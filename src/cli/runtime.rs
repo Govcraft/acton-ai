@@ -28,9 +28,15 @@ impl CliRuntime {
     /// Loads config, launches ActonAI. Database connections are opened
     /// on-demand via [`connection()`](Self::connection) to avoid lock
     /// contention with SQLite.
+    ///
+    /// When the `agent-skills` feature is enabled, `skill_paths` appends to
+    /// whatever `[skills] paths` the loaded config supplied — CLI and config
+    /// union. Passing `&[]` is equivalent to supplying no programmatic skill
+    /// paths.
     pub async fn new(
         config_path: Option<&PathBuf>,
         provider_override: Option<&str>,
+        #[cfg(feature = "agent-skills")] skill_paths: &[PathBuf],
     ) -> Result<Self, CliError> {
         // Load config — try explicit path first, then default search paths
         let loaded_config = if let Some(path) = config_path {
@@ -45,6 +51,14 @@ impl CliRuntime {
         };
 
         let mut builder = ActonAI::builder().app_name("acton-ai");
+
+        // Stage CLI-supplied skill paths before apply_config so they appear
+        // first in the resulting list; config-supplied paths append.
+        #[cfg(feature = "agent-skills")]
+        if !skill_paths.is_empty() {
+            builder = builder.with_skill_paths(skill_paths);
+        }
+
         if let Some(cfg) = loaded_config {
             builder = builder.apply_config(cfg)?;
         }

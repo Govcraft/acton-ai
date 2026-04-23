@@ -29,6 +29,14 @@ pub struct AgentConfig {
     /// Paths to skill files or directories to load for this agent.
     ///
     /// Only available when the `agent-skills` feature is enabled.
+    ///
+    /// **Note:** This field records a per-agent preference but is not
+    /// auto-loaded by any runtime today. For runtime-wide skills shared
+    /// across every prompt, use
+    /// [`ActonAIBuilder::with_skill_paths`](crate::ActonAI::builder) — that
+    /// path loads a shared registry at launch and auto-registers the
+    /// `list_skills` / `activate_skill` tools on every prompt the facade
+    /// hands out.
     #[cfg(feature = "agent-skills")]
     #[serde(default)]
     pub skill_paths: Vec<PathBuf>,

@@ -74,3 +74,5 @@ pub use types::{
     ActonAIConfig, ActonAIDefaults, CliFileConfig, JobConfig, NamedProviderConfig,
     PersistenceFileConfig, RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig,
 };
+#[cfg(feature = "agent-skills")]
+pub use types::SkillsFileConfig;

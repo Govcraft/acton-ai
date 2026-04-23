@@ -58,7 +58,13 @@ pub async fn execute(
     config_path: Option<&PathBuf>,
     provider_override: Option<&str>,
 ) -> Result<(), CliError> {
-    let rt = CliRuntime::new(config_path, provider_override).await?;
+    let rt = CliRuntime::new(
+        config_path,
+        provider_override,
+        #[cfg(feature = "agent-skills")]
+        &[],
+    )
+    .await?;
     let conn = rt.connection().await?;
 
     // Query due entries — either all or filtered by session.

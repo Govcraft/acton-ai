@@ -83,6 +83,8 @@ use crate::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, Sandbox
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::path::Path;
+#[cfg(feature = "agent-skills")]
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -137,6 +139,13 @@ pub(crate) struct ActonAIInner {
     pub(crate) builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
     pub(crate) auto_builtins: bool,
+    /// Loaded skill registry shared across every prompt (if configured).
+    ///
+    /// When present, [`ActonAI::prompt`] and [`ActonAI::continue_with`]
+    /// auto-register `list_skills` and `activate_skill` tools backed by this
+    /// registry so skills are available without per-call wiring.
+    #[cfg(feature = "agent-skills")]
+    pub(crate) skills: Option<Arc<crate::skills::SkillRegistry>>,
     /// Shared sandbox factory used to wrap sandboxed builtin tool calls.
     ///
     /// `None` when no sandbox is configured; in that case sandboxed tools
@@ -223,6 +232,7 @@ impl ActonAI {
         if self.inner.auto_builtins && self.inner.builtins.is_some() {
             builder = builder.use_builtins();
         }
+        builder = self.inject_skill_tools(builder);
         builder
     }
 
@@ -331,6 +341,18 @@ impl ActonAI {
         self.inner.builtins.as_ref()
     }
 
+    /// Returns a reference to the loaded skill registry, if configured.
+    ///
+    /// Populated when the builder was given
+    /// [`with_skill_paths`](ActonAIBuilder::with_skill_paths) (or picked up
+    /// `[skills] paths = [...]` from a TOML config). Returns `None`
+    /// otherwise.
+    #[cfg(feature = "agent-skills")]
+    #[must_use]
+    pub fn skills(&self) -> Option<&Arc<crate::skills::SkillRegistry>> {
+        self.inner.skills.as_ref()
+    }
+
     /// Returns the sandbox factory shared by sandboxed builtin tool calls.
     ///
     /// Populated when the builder was configured with
@@ -390,6 +412,36 @@ impl ActonAI {
         builder = builder.messages(messages);
         if self.inner.auto_builtins && self.inner.builtins.is_some() {
             builder = builder.use_builtins();
+        }
+        builder = self.inject_skill_tools(builder);
+        builder
+    }
+
+    /// Registers the `list_skills` / `activate_skill` tools on `builder` when
+    /// a skill registry is configured. No-op otherwise, and a total no-op
+    /// when the `agent-skills` feature is disabled.
+    ///
+    /// Called from both [`prompt`](Self::prompt) and
+    /// [`continue_with`](Self::continue_with) so every `PromptBuilder` the
+    /// facade hands out — including the ones [`Conversation`] rebuilds per
+    /// turn — has the skill tools available without per-call wiring.
+    #[inline]
+    fn inject_skill_tools(&self, builder: PromptBuilder) -> PromptBuilder {
+        #[cfg(feature = "agent-skills")]
+        {
+            if let Some(registry) = &self.inner.skills {
+                use crate::tools::builtins::{ActivateSkillTool, ListSkillsTool};
+                use crate::tools::ToolExecutorTrait;
+                let list_tool = ListSkillsTool::new(Arc::clone(registry));
+                let activate_tool = ActivateSkillTool::new(Arc::clone(registry));
+                return builder
+                    .with_tool(ListSkillsTool::config().definition, move |args| {
+                        list_tool.execute(args)
+                    })
+                    .with_tool(ActivateSkillTool::config().definition, move |args| {
+                        activate_tool.execute(args)
+                    });
+            }
         }
         builder
     }
@@ -510,6 +562,11 @@ pub struct ActonAIBuilder {
     builtins: BuiltinToolsConfig,
     auto_builtins: bool,
     sandbox_mode: SandboxMode,
+    /// Skill paths staged by [`ActonAIBuilder::with_skill_paths`] /
+    /// [`with_skill_path`]. Loaded once in [`launch`](Self::launch) into a
+    /// shared [`SkillRegistry`](crate::skills::SkillRegistry).
+    #[cfg(feature = "agent-skills")]
+    skill_paths: Vec<PathBuf>,
     /// Framework-wide default for the agentic tool-call loop cap.
     ///
     /// `None` means "use whatever [`apply_config`](Self::apply_config) finds
@@ -692,6 +749,14 @@ impl ActonAIBuilder {
             if let Some(defaults) = config.defaults {
                 self.default_max_tool_rounds = defaults.max_tool_rounds;
             }
+        }
+
+        // Merge `[skills] paths` onto whatever was staged programmatically so
+        // CLI flags and config union (matching how providers are merged
+        // above). Builder-stage paths come first; config-stage paths append.
+        #[cfg(feature = "agent-skills")]
+        if let Some(skills_cfg) = config.skills {
+            self.skill_paths.extend(skills_cfg.paths);
         }
 
         Ok(self)
@@ -965,6 +1030,51 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Stages skill paths to be loaded into a shared
+    /// [`SkillRegistry`](crate::skills::SkillRegistry) at launch.
+    ///
+    /// Each path may be a directory (scanned recursively for `.md` files) or
+    /// a single skill file. Calling this replaces any previously-staged
+    /// paths; use [`with_skill_path`](Self::with_skill_path) to append one at
+    /// a time.
+    ///
+    /// Once loaded, the registry is shared across every prompt produced by
+    /// [`prompt()`](ActonAI::prompt), [`continue_with()`](ActonAI::continue_with),
+    /// and [`conversation()`](ActonAI::conversation): each call auto-registers
+    /// `list_skills` and `activate_skill` tools without per-call wiring.
+    ///
+    /// Only available when the `agent-skills` feature is enabled.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use std::path::PathBuf;
+    ///
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_skill_paths(&[PathBuf::from("./skills")])
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "agent-skills")]
+    #[must_use]
+    pub fn with_skill_paths(mut self, paths: &[PathBuf]) -> Self {
+        self.skill_paths = paths.to_vec();
+        self
+    }
+
+    /// Appends a single skill path to the set staged by
+    /// [`with_skill_paths`](Self::with_skill_paths).
+    ///
+    /// Only available when the `agent-skills` feature is enabled.
+    #[cfg(feature = "agent-skills")]
+    #[must_use]
+    pub fn with_skill_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.skill_paths.push(path.into());
+        self
+    }
+
     /// Enables the portable [`ProcessSandbox`](crate::tools::sandbox::ProcessSandbox)
     /// for sandboxed tool execution.
     ///
@@ -1108,6 +1218,26 @@ impl ActonAIBuilder {
             .default_max_tool_rounds
             .unwrap_or(crate::prompt::DEFAULT_MAX_TOOL_ROUNDS);
 
+        // Load the skill registry if any skill paths were staged. The paths
+        // were pre-validated at the CLI boundary in most cases, but a stray
+        // missing path still surfaces cleanly here as a Configuration error.
+        #[cfg(feature = "agent-skills")]
+        let skills = if self.skill_paths.is_empty() {
+            None
+        } else {
+            let path_refs: Vec<&Path> = self.skill_paths.iter().map(PathBuf::as_path).collect();
+            let registry = crate::skills::SkillRegistry::from_paths(&path_refs)
+                .await
+                .map_err(|e| {
+                    ActonAIError::new(ActonAIErrorKind::Configuration {
+                        field: "skills".to_string(),
+                        reason: e.to_string(),
+                    })
+                })?;
+            tracing::info!(count = registry.len(), "skill registry loaded");
+            Some(Arc::new(registry))
+        };
+
         Ok(ActonAI {
             inner: Arc::new(ActonAIInner {
                 runtime,
@@ -1115,6 +1245,8 @@ impl ActonAIBuilder {
                 default_provider: default_provider_name,
                 builtins,
                 auto_builtins: self.auto_builtins,
+                #[cfg(feature = "agent-skills")]
+                skills,
                 sandbox_factory,
                 default_max_tool_rounds,
                 is_shutdown: AtomicBool::new(false),
@@ -1466,5 +1598,98 @@ mod tests {
         assert_eq!(prompt.current_max_tool_rounds(), 3);
         // Runtime default unchanged for subsequent prompts.
         assert_eq!(runtime.prompt("other").current_max_tool_rounds(), 25);
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[test]
+    fn builder_with_skill_paths_stores_paths() {
+        // We can't observe the private field directly, but launch() is the
+        // observable boundary and is tested below. Here we just confirm the
+        // builder methods chain and don't drop what they're given by calling
+        // `with_skill_path` after `with_skill_paths`.
+        let builder = ActonAI::builder()
+            .ollama("test")
+            .with_skill_paths(&[PathBuf::from("./a"), PathBuf::from("./b")])
+            .with_skill_path("./c");
+        assert_eq!(
+            builder.skill_paths,
+            vec![
+                PathBuf::from("./a"),
+                PathBuf::from("./b"),
+                PathBuf::from("./c"),
+            ]
+        );
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn launch_with_skills_exposes_registry() {
+        // Stage a temp dir containing one minimal skill file, launch with it,
+        // and assert the registry is exposed and holds the skill.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let skill_path = dir.path().join("sample.md");
+        std::fs::write(
+            &skill_path,
+            "---\nname: sample\ndescription: A sample skill\n---\n\n# Sample\n\nContent.\n",
+        )
+        .expect("write skill file");
+
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .with_skill_path(dir.path().to_path_buf())
+            .launch()
+            .await
+            .expect("launch");
+
+        let registry = runtime.skills().expect("skill registry present");
+        assert_eq!(registry.len(), 1);
+        let names: Vec<String> = registry.list().iter().map(|s| s.name.clone()).collect();
+        assert!(names.contains(&"sample".to_string()), "names = {names:?}");
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn launch_without_skills_has_no_registry() {
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .launch()
+            .await
+            .expect("launch");
+        assert!(runtime.skills().is_none());
+    }
+
+    #[cfg(feature = "agent-skills")]
+    #[tokio::test]
+    async fn apply_config_merges_skills_section() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let toml_path = dir.path().join("toml-skill.md");
+        std::fs::write(
+            &toml_path,
+            "---\nname: from-toml\ndescription: From the [skills] section\n---\n\n# TOML\n",
+        )
+        .expect("write skill");
+
+        let config = crate::config::ActonAIConfig::new()
+            .with_provider(
+                "ollama",
+                crate::config::NamedProviderConfig::ollama("test"),
+            )
+            .with_default_provider("ollama");
+        let config = crate::config::ActonAIConfig {
+            skills: Some(crate::config::SkillsFileConfig {
+                paths: vec![toml_path.clone()],
+            }),
+            ..config
+        };
+
+        let runtime = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        let registry = runtime.skills().expect("registry");
+        assert_eq!(registry.len(), 1);
     }
 }

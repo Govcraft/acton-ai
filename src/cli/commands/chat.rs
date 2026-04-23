@@ -2,6 +2,11 @@
 //!
 //! Supports single-shot messages (`--message`), stdin piping, and
 //! interactive terminal chat with session persistence.
+//!
+//! The entire module is gated behind the `agent-skills` feature at its
+//! declaration in `src/cli/commands/mod.rs`: building without the feature
+//! drops the subcommand from the CLI entirely and clap reports `chat` as
+//! an unrecognized subcommand.
 
 use crate::cli::error::CliError;
 use crate::cli::output::{OutputMode, OutputWriter};
@@ -35,6 +40,14 @@ pub struct ChatArgs {
     /// Disable streaming output (collect full response before printing).
     #[arg(long)]
     pub no_stream: bool,
+
+    /// Skill file or directory to load (repeatable).
+    ///
+    /// Each occurrence appends one path. Paths may point at a single `.md`
+    /// skill or a directory that's scanned recursively. Appends to any
+    /// `[skills] paths = [...]` entries in the config file.
+    #[arg(long = "skill-dir", short = 's', value_name = "PATH")]
+    pub skill_dirs: Vec<PathBuf>,
 }
 
 /// JSON response envelope for `--json` mode.
@@ -53,7 +66,18 @@ pub async fn execute(
     config_path: Option<&PathBuf>,
     provider_override: Option<&str>,
 ) -> Result<(), CliError> {
-    let rt = CliRuntime::new(config_path, provider_override).await?;
+    // Pre-validate skill paths so a typo surfaces as a friendly CliError
+    // instead of the framework's generic Configuration error at launch.
+    for path in &args.skill_dirs {
+        if !path.exists() {
+            return Err(CliError::configuration(format!(
+                "--skill-dir path not found: {}",
+                path.display()
+            )));
+        }
+    }
+
+    let rt = CliRuntime::new(config_path, provider_override, &args.skill_dirs).await?;
 
     // Determine session name
     let session_name = args.session.clone().unwrap_or_else(|| "main".to_string());
