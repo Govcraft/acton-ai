@@ -55,6 +55,13 @@ use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
+/// Framework fallback for the agentic tool-call loop.
+///
+/// Used when neither a `[defaults]` TOML block nor a builder override
+/// supplies `max_tool_rounds`. Per-prompt calls to
+/// [`PromptBuilder::max_tool_rounds`] still win over this value.
+pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+
 /// Type alias for start callbacks.
 type StartCallback = Box<dyn FnMut() + Send + 'static>;
 
@@ -227,6 +234,7 @@ impl PromptBuilder {
     /// This is called internally by `ActonAI::prompt()`.
     #[must_use]
     pub(crate) fn new(runtime: ActonAI, user_content: String) -> Self {
+        let max_tool_rounds = runtime.default_max_tool_rounds();
         Self {
             runtime,
             user_content,
@@ -236,11 +244,17 @@ impl PromptBuilder {
             on_token: None,
             on_end: None,
             tools: Vec::new(),
-            max_tool_rounds: 10,
+            max_tool_rounds,
             provider_name: None,
             token_target: None,
             sampling: None,
         }
+    }
+
+    /// Returns the current `max_tool_rounds` value that will be enforced.
+    #[must_use]
+    pub fn current_max_tool_rounds(&self) -> usize {
+        self.max_tool_rounds
     }
 
     /// Sets the system prompt for this request.

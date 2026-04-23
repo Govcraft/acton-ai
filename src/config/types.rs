@@ -67,6 +67,15 @@ pub struct ActonAIConfig {
     /// Named job definitions for `acton-ai run-job`.
     #[serde(default)]
     pub jobs: Option<HashMap<String, JobConfig>>,
+
+    /// Framework-wide defaults applied to every prompt unless overridden.
+    ///
+    /// Currently carries `max_tool_rounds`; this block is the designated
+    /// home for future cross-prompt defaults (temperature, timeout, etc.)
+    /// so they share one TOML namespace rather than each getting a
+    /// top-level key.
+    #[serde(default)]
+    pub defaults: Option<ActonAIDefaults>,
 }
 
 impl ActonAIConfig {
@@ -448,6 +457,41 @@ impl NamedProviderConfig {
         }
 
         config
+    }
+}
+
+/// Framework-wide defaults for the `[defaults]` section.
+///
+/// ```toml
+/// [defaults]
+/// max_tool_rounds = 20
+/// ```
+///
+/// These values seed every `PromptBuilder` created through the runtime.
+/// Per-prompt calls (e.g. `.max_tool_rounds(5)`) still override them.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ActonAIDefaults {
+    /// Default cap on agentic tool-call rounds per prompt.
+    ///
+    /// When unset, the framework fallback
+    /// ([`DEFAULT_MAX_TOOL_ROUNDS`](crate::prompt::DEFAULT_MAX_TOOL_ROUNDS))
+    /// is used.
+    #[serde(default)]
+    pub max_tool_rounds: Option<usize>,
+}
+
+impl ActonAIDefaults {
+    /// Creates an empty defaults block.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Sets the default `max_tool_rounds`.
+    #[must_use]
+    pub fn with_max_tool_rounds(mut self, max: usize) -> Self {
+        self.max_tool_rounds = Some(max);
+        self
     }
 }
 
@@ -1083,6 +1127,7 @@ max_execution_ms = 60000
             persistence: None,
             cli: None,
             jobs: None,
+            defaults: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1108,6 +1153,51 @@ max_execution_ms = 60000
         let config = SandboxFileConfig::new().with_hardening(HardeningMode::Enforce);
         let cloned = config.clone();
         assert_eq!(config.hardening, cloned.hardening);
+    }
+
+    #[test]
+    fn defaults_absent_parses_as_none() {
+        let toml_str = r#"
+default_provider = "ollama"
+
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        assert!(config.defaults.is_none());
+    }
+
+    #[test]
+    fn defaults_parses_max_tool_rounds() {
+        let toml_str = r#"
+[defaults]
+max_tool_rounds = 25
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let defaults = config.defaults.expect("defaults block should parse");
+        assert_eq!(defaults.max_tool_rounds, Some(25));
+    }
+
+    #[test]
+    fn defaults_empty_block_parses_with_none_fields() {
+        // An empty `[defaults]` block should parse (all fields are Option),
+        // leaving every knob at its framework fallback.
+        let toml_str = r#"
+[defaults]
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let defaults = config.defaults.expect("defaults block should parse");
+        assert!(defaults.max_tool_rounds.is_none());
+    }
+
+    #[test]
+    fn defaults_builder_sets_max_tool_rounds() {
+        let defaults = ActonAIDefaults::new().with_max_tool_rounds(42);
+        assert_eq!(defaults.max_tool_rounds, Some(42));
     }
 
     #[test]

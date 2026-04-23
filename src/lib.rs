@@ -78,7 +78,9 @@ pub mod skills;
 /// Prelude module for convenient imports
 pub mod prelude {
     // High-level API (recommended for most use cases)
-    pub use crate::config::{ActonAIConfig, NamedProviderConfig, RateLimitFileConfig};
+    pub use crate::config::{
+        ActonAIConfig, ActonAIDefaults, NamedProviderConfig, RateLimitFileConfig,
+    };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
     };

@@ -43,6 +43,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `with_process_sandbox_config(ProcessSandboxConfig)` on `ActonAIBuilder`.
 - `examples/process_sandbox.rs` replaces the retired `bash_sandbox`
   example and demonstrates sandboxed bash tool calls end-to-end.
+- `[defaults]` TOML block and `ActonAIDefaults` type, currently carrying
+  `max_tool_rounds`. Framework-wide default for the agentic tool-call
+  loop now cascades through `DEFAULT_MAX_TOOL_ROUNDS` (10) → `[defaults]`
+  → `ActonAIBuilder::max_tool_rounds(n)` → per-prompt
+  `PromptBuilder::max_tool_rounds(n)`. Previously the cap was hardcoded
+  at 10 with no way to raise it for chat/conversation flows.
+- `ActonAI::default_max_tool_rounds()` getter exposes the resolved value
+  for introspection. `PromptBuilder::current_max_tool_rounds()` returns
+  the value that will actually be enforced for this request.
 
 ### Changed
 

@@ -143,6 +143,11 @@ pub(crate) struct ActonAIInner {
     /// still execute in-process (matching pre-ProcessSandbox behavior) but
     /// with no OS-level isolation.
     pub(crate) sandbox_factory: Option<Arc<dyn SandboxFactory>>,
+    /// Default `max_tool_rounds` seeded into every new `PromptBuilder`.
+    ///
+    /// Resolved at launch from the cascade:
+    /// `DEFAULT_MAX_TOOL_ROUNDS → [defaults] TOML → builder override`.
+    pub(crate) default_max_tool_rounds: usize,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -170,6 +175,10 @@ impl std::fmt::Debug for ActonAI {
             .field("auto_builtins", &self.inner.auto_builtins)
             .field("provider_count", &self.inner.providers.len())
             .field("default_provider", &self.inner.default_provider)
+            .field(
+                "default_max_tool_rounds",
+                &self.inner.default_max_tool_rounds,
+            )
             .finish_non_exhaustive()
     }
 }
@@ -275,6 +284,18 @@ impl ActonAI {
     #[must_use]
     pub fn default_provider_name(&self) -> &str {
         &self.inner.default_provider
+    }
+
+    /// Returns the default `max_tool_rounds` seeded into every new prompt.
+    ///
+    /// Resolved at launch from the cascade
+    /// [`DEFAULT_MAX_TOOL_ROUNDS`](crate::prompt::DEFAULT_MAX_TOOL_ROUNDS)
+    /// → `[defaults]` TOML → [`ActonAIBuilder::max_tool_rounds`]. Per-prompt
+    /// [`PromptBuilder::max_tool_rounds`](crate::prompt::PromptBuilder::max_tool_rounds)
+    /// calls still override this value.
+    #[must_use]
+    pub fn default_max_tool_rounds(&self) -> usize {
+        self.inner.default_max_tool_rounds
     }
 
     /// Returns an iterator over the names of all registered providers.
@@ -489,6 +510,12 @@ pub struct ActonAIBuilder {
     builtins: BuiltinToolsConfig,
     auto_builtins: bool,
     sandbox_mode: SandboxMode,
+    /// Framework-wide default for the agentic tool-call loop cap.
+    ///
+    /// `None` means "use whatever [`apply_config`](Self::apply_config) finds
+    /// in the TOML, else fall back to
+    /// [`DEFAULT_MAX_TOOL_ROUNDS`](crate::prompt::DEFAULT_MAX_TOOL_ROUNDS)".
+    default_max_tool_rounds: Option<usize>,
 }
 
 impl ActonAIBuilder {
@@ -546,6 +573,29 @@ impl ActonAIBuilder {
     #[must_use]
     pub fn default_provider(mut self, name: impl Into<String>) -> Self {
         self.default_provider_name = Some(name.into());
+        self
+    }
+
+    /// Sets the framework-wide default cap on agentic tool-call rounds.
+    ///
+    /// Takes precedence over a `[defaults] max_tool_rounds` value loaded from
+    /// a config file. Per-prompt
+    /// [`PromptBuilder::max_tool_rounds`](crate::prompt::PromptBuilder::max_tool_rounds)
+    /// calls override this on a per-request basis.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .max_tool_rounds(25)  // raise cap for this application
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn max_tool_rounds(mut self, max: usize) -> Self {
+        self.default_max_tool_rounds = Some(max);
         self
     }
 
@@ -634,6 +684,14 @@ impl ActonAIBuilder {
         // Apply sandbox configuration if present and no programmatic sandbox was set
         if let Some(sandbox_config) = config.sandbox {
             self = self.apply_sandbox_file_config(&sandbox_config);
+        }
+
+        // Apply [defaults] block — only if the builder hasn't been given an
+        // explicit override already. Builder > config, constant is the floor.
+        if self.default_max_tool_rounds.is_none() {
+            if let Some(defaults) = config.defaults {
+                self.default_max_tool_rounds = defaults.max_tool_rounds;
+            }
         }
 
         Ok(self)
@@ -1046,6 +1104,10 @@ impl ActonAIBuilder {
             }
         };
 
+        let default_max_tool_rounds = self
+            .default_max_tool_rounds
+            .unwrap_or(crate::prompt::DEFAULT_MAX_TOOL_ROUNDS);
+
         Ok(ActonAI {
             inner: Arc::new(ActonAIInner {
                 runtime,
@@ -1054,6 +1116,7 @@ impl ActonAIBuilder {
                 builtins,
                 auto_builtins: self.auto_builtins,
                 sandbox_factory,
+                default_max_tool_rounds,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
@@ -1301,5 +1364,107 @@ mod tests {
         let result = builder.resolve_default_provider_name();
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("nonexistent"));
+    }
+
+    // max_tool_rounds cascade tests:
+    // constant (DEFAULT_MAX_TOOL_ROUNDS) → [defaults] TOML → builder override
+    // → per-prompt PromptBuilder.max_tool_rounds() (not exercised here — that
+    // path is a trivial setter covered in prompt.rs).
+
+    #[tokio::test]
+    async fn default_max_tool_rounds_falls_back_to_constant() {
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(
+            runtime.default_max_tool_rounds(),
+            crate::prompt::DEFAULT_MAX_TOOL_ROUNDS
+        );
+
+        let prompt = runtime.prompt("hi");
+        assert_eq!(
+            prompt.current_max_tool_rounds(),
+            crate::prompt::DEFAULT_MAX_TOOL_ROUNDS
+        );
+    }
+
+    #[tokio::test]
+    async fn builder_max_tool_rounds_is_applied_to_runtime_and_prompts() {
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .max_tool_rounds(42)
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(runtime.default_max_tool_rounds(), 42);
+        assert_eq!(runtime.prompt("hi").current_max_tool_rounds(), 42);
+    }
+
+    #[tokio::test]
+    async fn toml_defaults_max_tool_rounds_is_applied() {
+        let config = crate::config::ActonAIConfig::new()
+            .with_provider(
+                "ollama",
+                crate::config::NamedProviderConfig::ollama("test"),
+            )
+            .with_default_provider("ollama");
+        // Inject the [defaults] block manually.
+        let config = crate::config::ActonAIConfig {
+            defaults: Some(crate::config::ActonAIDefaults::new().with_max_tool_rounds(33)),
+            ..config
+        };
+
+        let runtime = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(runtime.default_max_tool_rounds(), 33);
+    }
+
+    #[tokio::test]
+    async fn builder_max_tool_rounds_overrides_toml_defaults() {
+        // Builder wins: user explicitly set 7 in code, config says 33.
+        let config = crate::config::ActonAIConfig::new()
+            .with_provider(
+                "ollama",
+                crate::config::NamedProviderConfig::ollama("test"),
+            )
+            .with_default_provider("ollama");
+        let config = crate::config::ActonAIConfig {
+            defaults: Some(crate::config::ActonAIDefaults::new().with_max_tool_rounds(33)),
+            ..config
+        };
+
+        let runtime = ActonAI::builder()
+            .max_tool_rounds(7)
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(runtime.default_max_tool_rounds(), 7);
+    }
+
+    #[tokio::test]
+    async fn per_prompt_max_tool_rounds_still_overrides_runtime_default() {
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .max_tool_rounds(25)
+            .launch()
+            .await
+            .expect("launch");
+
+        let prompt = runtime.prompt("hi").max_tool_rounds(3);
+        assert_eq!(prompt.current_max_tool_rounds(), 3);
+        // Runtime default unchanged for subsequent prompts.
+        assert_eq!(runtime.prompt("other").current_max_tool_rounds(), 25);
     }
 }

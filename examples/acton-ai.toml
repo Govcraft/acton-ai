@@ -3,6 +3,12 @@
 
 default_provider = "ollama"
 
+# Framework-wide defaults. Every prompt inherits these unless it calls
+# `.max_tool_rounds(n)` on its own PromptBuilder. Omit the block to use
+# the built-in fallback (10 rounds).
+# [defaults]
+# max_tool_rounds = 20
+
 [providers.ollama]
 type = "ollama"
 model = "gemma4:26b"
