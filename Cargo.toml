@@ -24,7 +24,7 @@ sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
-acton-reactive = "7"
+acton-reactive = "8"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
