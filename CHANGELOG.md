@@ -25,6 +25,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and `max_executions_before_recycle` with `hardening` (values: `"off"`,
   `"besteffort"`, `"enforce"`). Old keys are ignored rather than rejected,
   so existing TOMLs still parse.
+- Removed the `ConfigureSandbox` message and the `sandbox_factory` field on
+  `ToolRegistry`. The registry-routed sandbox wiring was never reachable —
+  nothing sent `ConfigureSandbox` and the factory was always `None`. The
+  facade drives sandboxing directly through `PromptBuilder::use_builtins()`
+  now. `ToolRegistry::ExecuteTool` runs tools inline; the `ToolConfig::sandboxed`
+  flag is advisory metadata for the facade and is ignored by the registry.
 
 ### Added
 

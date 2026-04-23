@@ -95,8 +95,8 @@ pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExe
 pub use error::{ToolError, ToolErrorKind};
 pub use executor::{Execute, InitExecutor, ToolExecutor};
 pub use registry::{
-    ConfigureSandbox, InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics,
-    ToolListResponse, ToolRegistry, UnregisterTool,
+    InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics, ToolListResponse,
+    ToolRegistry, UnregisterTool,
 };
 pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 pub use security::{PathValidationError, PathValidator};
