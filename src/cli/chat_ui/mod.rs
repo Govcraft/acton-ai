@@ -119,6 +119,10 @@ pub async fn run(
     // remaining token and tool-call renders from the still-running stream.
     // The bool is cleared at the top of each turn.
     let muted: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
+    // Flipped true the first time a token lands for a turn so the "Assistant:"
+    // label is printed exactly once — and only when the model actually
+    // produced text. Empty / errored turns leave no orphan label.
+    let label_printed: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // Chat-UI actor.
     //
@@ -133,6 +137,8 @@ pub async fn run(
 
     let slot_for_actor = spinner_slot.clone();
     let muted_for_token = muted.clone();
+    let label_for_actor = theme.assistant_label.clone();
+    let label_printed_for_actor = label_printed.clone();
     token_actor.mutate_on::<StreamToken>(move |_actor, ctx| {
         if muted_for_token.load(Ordering::Relaxed) {
             return Reply::ready();
@@ -142,6 +148,12 @@ pub async fn run(
         // immediately.
         if let Some(pb) = take_spinner(&slot_for_actor) {
             pb.finish_and_clear();
+        }
+        // Print the "Assistant:" label once per turn, right before the first
+        // token. Deferring the label keeps the spinner on a clean line and
+        // avoids an orphan label when a turn ends without any tokens.
+        if !label_printed_for_actor.swap(true, Ordering::Relaxed) {
+            print!("{label_for_actor}");
         }
         print!("{}", ctx.message().text);
         std::io::stdout().flush().ok();
@@ -234,19 +246,20 @@ pub async fn run(
             continue;
         }
 
+        let turn_ctx = TurnContext {
+            conv,
+            token_handle: &token_handle,
+            theme: &theme,
+            spinner_slot: &spinner_slot,
+            muted: &muted,
+            label_printed: &label_printed,
+            render_markdown,
+        };
+
         match slash::parse(trimmed) {
             slash::SlashAction::NotSlash => {
                 last_user_message = Some(trimmed.to_string());
-                let outcome = send_turn(
-                    conv,
-                    &token_handle,
-                    trimmed,
-                    &theme,
-                    &spinner_slot,
-                    &muted,
-                    render_markdown,
-                )
-                .await?;
+                let outcome = send_turn(&turn_ctx, trimmed).await?;
                 flush_new_messages(conv, &persist, &mut persist_cursor).await?;
                 if matches!(outcome, TurnOutcome::Canceled) {
                     // Stream aborted by Ctrl+C — loop back to the prompt.
@@ -272,16 +285,7 @@ pub async fn run(
             slash::SlashAction::Exit => break Ok(()),
             slash::SlashAction::Retry => match last_user_message.clone() {
                 Some(prev) => {
-                    let outcome = send_turn(
-                        conv,
-                        &token_handle,
-                        &prev,
-                        &theme,
-                        &spinner_slot,
-                        &muted,
-                        render_markdown,
-                    )
-                    .await?;
+                    let outcome = send_turn(&turn_ctx, &prev).await?;
                     flush_new_messages(conv, &persist, &mut persist_cursor).await?;
                     if matches!(outcome, TurnOutcome::Canceled) {
                         continue;
@@ -325,28 +329,32 @@ enum TurnOutcome {
 /// through `termimad` when the stream ends.
 ///
 /// Returns whether the turn completed normally or was canceled mid-stream.
-async fn send_turn(
-    conv: &Conversation,
-    token_handle: &ActorHandle,
-    content: &str,
-    theme: &Theme,
-    spinner_slot: &SpinnerSlot,
-    muted: &Arc<AtomicBool>,
+/// All per-turn state that `send_turn` needs. Bundled into one struct so the
+/// signature stays tidy as follow-up UX toggles land.
+struct TurnContext<'a> {
+    conv: &'a Conversation,
+    token_handle: &'a ActorHandle,
+    theme: &'a Theme,
+    spinner_slot: &'a SpinnerSlot,
+    muted: &'a Arc<AtomicBool>,
+    label_printed: &'a Arc<AtomicBool>,
     render_markdown: bool,
-) -> Result<TurnOutcome, ActonAIError> {
-    // Clear any residual mute from a previous cancel so this turn renders.
-    muted.store(false, Ordering::Relaxed);
+}
 
-    if !render_markdown {
-        print!("{}", theme.assistant_label);
-        std::io::stdout().flush().ok();
-    }
+async fn send_turn(
+    ctx: &TurnContext<'_>,
+    content: &str,
+) -> Result<TurnOutcome, ActonAIError> {
+    // Reset per-turn signals so the token handler emits the label again and
+    // any previous cancel no longer silences output.
+    ctx.muted.store(false, Ordering::Relaxed);
+    ctx.label_printed.store(false, Ordering::Relaxed);
 
     // Park a spinner in the shared slot. In streaming mode the token handler
-    // dismisses it on first token; in render mode it stays up until we
-    // clear it ourselves post-stream.
+    // dismisses it on first token (and prints the "Assistant:" label); in
+    // render mode it stays up until we clear it ourselves post-stream.
     let pb = spinner::build("thinking…");
-    if let Ok(mut slot) = spinner_slot.lock() {
+    if let Ok(mut slot) = ctx.spinner_slot.lock() {
         *slot = Some(pb.clone());
     }
 
@@ -357,19 +365,19 @@ async fn send_turn(
     // In render mode we use the non-streaming `send` path so tokens never
     // reach the actor (nothing to display live). Tool-call events still
     // broadcast and render inline via the existing subscriber.
-    let outcome = if render_markdown {
+    let outcome = if ctx.render_markdown {
         tokio::select! {
-            res = conv.send(content) => TurnSelectResult::Done(res),
+            res = ctx.conv.send(content) => TurnSelectResult::Done(res),
             _ = tokio::signal::ctrl_c() => {
-                muted.store(true, Ordering::Relaxed);
+                ctx.muted.store(true, Ordering::Relaxed);
                 TurnSelectResult::Canceled
             }
         }
     } else {
         tokio::select! {
-            res = conv.send_streaming(content, token_handle) => TurnSelectResult::Done(res),
+            res = ctx.conv.send_streaming(content, ctx.token_handle) => TurnSelectResult::Done(res),
             _ = tokio::signal::ctrl_c() => {
-                muted.store(true, Ordering::Relaxed);
+                ctx.muted.store(true, Ordering::Relaxed);
                 TurnSelectResult::Canceled
             }
         }
@@ -377,18 +385,17 @@ async fn send_turn(
 
     // Empty responses (errors, tools-only turns, canceled) may not emit a
     // `StreamToken` so the slot can still be occupied. Clear any leftover.
-    if let Some(pb) = take_spinner(spinner_slot) {
+    if let Some(pb) = take_spinner(ctx.spinner_slot) {
         pb.finish_and_clear();
     }
 
     match outcome {
         TurnSelectResult::Done(res) => {
             let response = res?;
-            if render_markdown {
-                // Render header + markdown as one block. The header uses the
-                // same bold-magenta label as streaming mode to keep the UX
-                // recognisable.
-                print!("{}", theme.assistant_label);
+            if ctx.render_markdown {
+                // Render header + markdown as one block. Same bold-magenta
+                // label as streaming mode keeps the UX recognisable.
+                print!("{}", ctx.theme.assistant_label);
                 std::io::stdout().flush().ok();
                 println!();
                 render::render_to_stdout(&response.text);
@@ -400,8 +407,8 @@ async fn send_turn(
         TurnSelectResult::Canceled => {
             eprintln!(
                 "\n{}^C canceled{}",
-                theme.warn_open,
-                if theme.colors_enabled { "\x1b[0m" } else { "" },
+                ctx.theme.warn_open,
+                if ctx.theme.colors_enabled { "\x1b[0m" } else { "" },
             );
             Ok(TurnOutcome::Canceled)
         }
