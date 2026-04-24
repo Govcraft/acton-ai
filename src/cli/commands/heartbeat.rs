@@ -187,9 +187,19 @@ async fn execute_entry(
     entry: &persistence::HeartbeatEntry,
 ) -> Result<(String, usize), CliError> {
     // Resolve session to get the conversation ID.
-    let session_info = persistence::resolve_session(conn, &entry.session_name)
-        .await?
-        .ok_or_else(|| CliError::session_not_found(&entry.session_name))?;
+    let session_info = match persistence::resolve_session(conn, &entry.session_name).await? {
+        Some(info) => info,
+        None => {
+            let available = persistence::list_sessions(conn)
+                .await
+                .map(|rows| rows.into_iter().map(|s| s.name).collect())
+                .unwrap_or_default();
+            return Err(CliError::session_not_found(
+                &entry.session_name,
+                available,
+            ));
+        }
+    };
 
     // Load conversation history for context.
     let messages =

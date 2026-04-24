@@ -98,7 +98,8 @@ pub async fn run(cli: Cli) -> i32 {
     match result {
         Ok(()) => exit_code::SUCCESS,
         Err(err) => {
-            let _ = output.error(&err.to_string());
+            let hint = err.hint();
+            let _ = output.error_with_hint(&err.to_string(), hint.as_deref());
             err.exit_code()
         }
     }

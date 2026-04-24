@@ -18,6 +18,22 @@ use std::path::PathBuf;
 
 /// Options for the chat command.
 #[derive(Debug, clap::Args)]
+#[command(
+    about = "Send a message or start an interactive chat session.",
+    long_about = "Send a single message, pipe input, or open an interactive \
+                  REPL with persistent per-session history.\n\n\
+                  \x20 EXAMPLES\n\
+                  \x20   Single-shot:    acton-ai chat -m \"what is rust?\"\n\
+                  \x20   From file:      acton-ai chat < question.txt\n\
+                  \x20   From pipe:      git log | acton-ai chat -m \"summarize\"\n\
+                  \x20   Interactive:    acton-ai chat\n\
+                  \x20   Resume session: acton-ai chat --session work\n\n\
+                  \x20 JSON OUTPUT\n\
+                  \x20   With --json, single-shot responses are emitted as one line:\n\
+                  \x20     {\"schemaVersion\":1,\"session\":\"main\",\"role\":\"assistant\",\n\
+                  \x20      \"text\":\"...\",\"tokenCount\":42}\n\
+                  \x20   Schema is versioned — consumers should branch on schemaVersion."
+)]
 pub struct ChatArgs {
     /// Session name to use (default: "main").
     #[arg(long, env = "ACTON_SESSION")]
@@ -48,14 +64,22 @@ pub struct ChatArgs {
     pub skill_dirs: Vec<PathBuf>,
 }
 
-/// JSON response envelope for `--json` mode.
+/// Versioned JSON response envelope for `--json` mode. Bumping
+/// `schema_version` is the signal to consumers that the shape has changed.
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct ChatResponse {
+    /// Schema version for this envelope. Start at 1 — bump on breaking
+    /// changes (renamed fields, removed fields, changed types).
+    schema_version: u32,
     session: String,
     role: String,
     text: String,
     token_count: usize,
 }
+
+/// Current `--json` envelope version.
+const CHAT_RESPONSE_SCHEMA_VERSION: u32 = 1;
 
 /// Execute the chat command.
 pub async fn execute(
@@ -94,7 +118,11 @@ pub async fn execute(
             persistence::create_session(&conn, &session_name, &agent_id, Some(system)).await?;
         (conv_id, Some(system.to_string()), "created")
     } else {
-        return Err(CliError::session_not_found(&session_name));
+        let available = persistence::list_sessions(&conn)
+            .await
+            .map(|rows| rows.into_iter().map(|s| s.name).collect())
+            .unwrap_or_default();
+        return Err(CliError::session_not_found(&session_name, available));
     };
 
     // Load conversation history
@@ -161,6 +189,7 @@ pub async fn execute(
             match output.mode() {
                 OutputMode::Json => {
                     output.write_json(&ChatResponse {
+                        schema_version: CHAT_RESPONSE_SCHEMA_VERSION,
                         session: session_name,
                         role: "assistant".to_string(),
                         text: response.text,

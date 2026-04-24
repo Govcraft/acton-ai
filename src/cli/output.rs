@@ -66,10 +66,29 @@ impl OutputWriter {
         io::stdin().is_terminal()
     }
 
-    /// Returns true if colors should be used (respects NO_COLOR env var).
+    /// Returns true if colours should be used.
+    ///
+    /// Follows the convention used by `clicolor.org` + NO_COLOR:
+    ///
+    ///   * `CLICOLOR_FORCE=1` (or any non-`0` value) forces colours on even
+    ///     when stderr isn't a TTY.
+    ///   * `NO_COLOR` set (to any value) forces colours off.
+    ///   * `CLICOLOR=0` forces colours off.
+    ///   * Otherwise, colours are on iff stderr is a terminal.
     #[must_use]
     pub fn use_colors() -> bool {
-        std::env::var("NO_COLOR").is_err() && io::stderr().is_terminal()
+        if let Ok(v) = std::env::var("CLICOLOR_FORCE") {
+            if v != "0" && !v.is_empty() {
+                return true;
+            }
+        }
+        if std::env::var("NO_COLOR").is_ok() {
+            return false;
+        }
+        if matches!(std::env::var("CLICOLOR").as_deref(), Ok("0")) {
+            return false;
+        }
+        io::stderr().is_terminal()
     }
 
     /// Write a response to stdout.
@@ -115,10 +134,26 @@ impl OutputWriter {
         stderr.flush()
     }
 
-    /// Write an error message to stderr.
+    /// Write an error message to stderr, styled with bold-red `error:` when
+    /// colours are enabled.
     pub fn error(&self, msg: &str) -> io::Result<()> {
+        self.error_with_hint(msg, None)
+    }
+
+    /// Write an error message followed by an optional dim-styled hint line.
+    pub fn error_with_hint(&self, msg: &str, hint: Option<&str>) -> io::Result<()> {
         let mut stderr = io::stderr().lock();
-        writeln!(stderr, "error: {msg}")?;
+        if Self::use_colors() {
+            writeln!(stderr, "\x1b[1;31merror:\x1b[0m {msg}")?;
+            if let Some(h) = hint {
+                writeln!(stderr, "  \x1b[2mhint: {h}\x1b[0m")?;
+            }
+        } else {
+            writeln!(stderr, "error: {msg}")?;
+            if let Some(h) = hint {
+                writeln!(stderr, "  hint: {h}")?;
+            }
+        }
         stderr.flush()
     }
 }

@@ -136,7 +136,12 @@ async fn execute_show(
 ) -> Result<(), CliError> {
     let session = resolve_session(conn, name)
         .await?
-        .ok_or_else(|| CliError::session_not_found(name))?;
+        .ok_or_else(|| {
+            // `ok_or_else` is sync, so we can't run the async list_sessions
+            // here. Pass an empty available list — the hint still tells the
+            // user how to list sessions.
+            CliError::session_not_found(name, Vec::new())
+        })?;
 
     // Load recent messages
     let all_messages = load_conversation_messages(conn, &session.conversation_id).await?;
@@ -194,7 +199,12 @@ async fn execute_delete(
     // Verify the session exists
     let _session = resolve_session(conn, name)
         .await?
-        .ok_or_else(|| CliError::session_not_found(name))?;
+        .ok_or_else(|| {
+            // `ok_or_else` is sync, so we can't run the async list_sessions
+            // here. Pass an empty available list — the hint still tells the
+            // user how to list sessions.
+            CliError::session_not_found(name, Vec::new())
+        })?;
 
     if !force {
         output.error(&format!(

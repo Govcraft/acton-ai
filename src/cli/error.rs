@@ -28,7 +28,14 @@ pub enum CliErrorKind {
     /// Configuration error (bad config file, missing provider, etc.).
     Configuration(String),
     /// Session not found by name.
-    SessionNotFound { name: String },
+    SessionNotFound {
+        name: String,
+        /// Existing session names (for "did you mean?" suggestions and
+        /// listing).
+        available: Vec<String>,
+        /// Closest-match suggestion derived from `available` via strsim.
+        suggestion: Option<String>,
+    },
     /// Session already exists (when --create is not appropriate).
     SessionAlreadyExists { name: String },
     /// Job not found by name.
@@ -63,11 +70,19 @@ impl CliError {
         }
     }
 
-    /// Creates a session not found error.
+    /// Creates a session not found error, computing a "did you mean?"
+    /// suggestion from the list of existing sessions via Jaro-Winkler
+    /// similarity.
     #[must_use]
-    pub fn session_not_found(name: impl Into<String>) -> Self {
+    pub fn session_not_found(name: impl Into<String>, available: Vec<String>) -> Self {
+        let name = name.into();
+        let suggestion = closest_match(&name, &available, 0.75);
         Self {
-            kind: CliErrorKind::SessionNotFound { name: name.into() },
+            kind: CliErrorKind::SessionNotFound {
+                name,
+                available,
+                suggestion,
+            },
         }
     }
 
@@ -109,12 +124,69 @@ impl CliError {
     }
 }
 
+impl CliError {
+    /// Actionable advice rendered on a second, dim line after the primary
+    /// `error: ...` line. Returns `None` when the error text already tells
+    /// the user everything useful.
+    #[must_use]
+    pub fn hint(&self) -> Option<String> {
+        match &self.kind {
+            CliErrorKind::SessionNotFound {
+                available,
+                suggestion,
+                ..
+            } => {
+                let mut parts = Vec::new();
+                if let Some(s) = suggestion {
+                    parts.push(format!("did you mean '{s}'?"));
+                }
+                if !available.is_empty() {
+                    parts.push(format!(
+                        "existing sessions: {}",
+                        available.join(", ")
+                    ));
+                } else {
+                    parts.push("pass --create to create a new session".to_string());
+                }
+                parts.push("run `acton-ai session list` for details".to_string());
+                Some(parts.join("  "))
+            }
+            CliErrorKind::SessionAlreadyExists { .. } => Some(
+                "pass a different --session name or drop --create to resume".to_string(),
+            ),
+            CliErrorKind::NoInput => Some(
+                "pipe input (`echo hi | acton-ai chat`) or pass `-m \"...\"`".to_string(),
+            ),
+            CliErrorKind::ProviderUnavailable { .. } => Some(
+                "check the provider config in acton-ai.toml; run with `-vv` for details"
+                    .to_string(),
+            ),
+            CliErrorKind::Configuration(_) => {
+                Some("see acton-ai.toml search paths: ./acton-ai.toml then ~/.config/acton-ai/config.toml".to_string())
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Return the closest string in `candidates` to `input` above `threshold`,
+/// measured by Jaro-Winkler similarity. Returns `None` when nothing is
+/// close enough.
+fn closest_match(input: &str, candidates: &[String], threshold: f64) -> Option<String> {
+    candidates
+        .iter()
+        .map(|c| (c.clone(), strsim::jaro_winkler(input, c)))
+        .filter(|(_, score)| *score >= threshold)
+        .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(c, _)| c)
+}
+
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match &self.kind {
             CliErrorKind::Configuration(msg) => write!(f, "configuration error: {msg}"),
-            CliErrorKind::SessionNotFound { name } => {
-                write!(f, "session '{name}' not found; use --create to create it")
+            CliErrorKind::SessionNotFound { name, .. } => {
+                write!(f, "session '{name}' not found")
             }
             CliErrorKind::SessionAlreadyExists { name } => {
                 write!(f, "session '{name}' already exists")
