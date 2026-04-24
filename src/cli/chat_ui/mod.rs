@@ -14,16 +14,20 @@ pub mod tool_render;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use acton_reactive::prelude::*;
 use indicatif::ProgressBar;
+use libsql::Connection;
 use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
 
 use crate::conversation::{Conversation, StreamToken};
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
+use crate::memory::persistence;
 use crate::messages::{LLMStreamToolCall, Message};
+use crate::types::ConversationId;
 
 use self::style::Theme;
 
@@ -67,6 +71,15 @@ fn sanitize_session_for_path(session: &str) -> String {
 #[derive(Default, Debug)]
 struct ChatUiActor;
 
+/// Per-session persistence handles passed to [`run`]. When present, each turn
+/// is flushed to the database as it completes so a Ctrl+C or crash loses at
+/// most the in-flight turn.
+pub struct PersistCtx<'a> {
+    pub conn: &'a Connection,
+    pub conversation_id: &'a ConversationId,
+    pub session_name: &'a str,
+}
+
 /// Run the interactive chat REPL.
 ///
 /// Drives a reedline-based input loop, dispatches slash commands, and streams
@@ -81,9 +94,14 @@ pub async fn run(
     conv: &Conversation,
     ai: &ActonAI,
     history_path: Option<PathBuf>,
+    persist: Option<PersistCtx<'_>>,
 ) -> Result<(), ActonAIError> {
     let theme = Theme::resolve();
     let spinner_slot: SpinnerSlot = Arc::new(Mutex::new(None));
+    // When the user cancels a turn with Ctrl+C we flip this to silence the
+    // remaining token and tool-call renders from the still-running stream.
+    // The bool is cleared at the top of each turn.
+    let muted: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
     // Chat-UI actor.
     //
@@ -97,7 +115,11 @@ pub async fn run(
     let mut token_actor = actor_runtime.new_actor::<ChatUiActor>();
 
     let slot_for_actor = spinner_slot.clone();
+    let muted_for_token = muted.clone();
     token_actor.mutate_on::<StreamToken>(move |_actor, ctx| {
+        if muted_for_token.load(Ordering::Relaxed) {
+            return Reply::ready();
+        }
         // Mutex contention is limited to the first token per turn — on
         // subsequent tokens `.take()` returns None and the lock is released
         // immediately.
@@ -111,7 +133,11 @@ pub async fn run(
 
     let theme_for_tool = theme.clone();
     let slot_for_tool = spinner_slot.clone();
+    let muted_for_tool = muted.clone();
     token_actor.mutate_on::<LLMStreamToolCall>(move |_actor, ctx| {
+        if muted_for_tool.load(Ordering::Relaxed) {
+            return Reply::ready();
+        }
         // Stop the spinner (tools fire after initial tokens may have streamed
         // or, for tools-first turns, before any tokens) so the inline line
         // isn't overlapped by the spinner animation.
@@ -139,6 +165,8 @@ pub async fn run(
     );
 
     let mut last_user_message: Option<String> = None;
+    // Index of the next history message to flush. Reset to 0 on /clear.
+    let mut persist_cursor: usize = conv.len();
 
     let result = loop {
         // reedline's `read_line` is blocking — move it to a dedicated thread
@@ -192,7 +220,13 @@ pub async fn run(
         match slash::parse(trimmed) {
             slash::SlashAction::NotSlash => {
                 last_user_message = Some(trimmed.to_string());
-                send_turn(conv, &token_handle, trimmed, &theme, &spinner_slot).await?;
+                let outcome =
+                    send_turn(conv, &token_handle, trimmed, &theme, &spinner_slot, &muted).await?;
+                flush_new_messages(conv, &persist, &mut persist_cursor).await?;
+                if matches!(outcome, TurnOutcome::Canceled) {
+                    // Stream aborted by Ctrl+C — loop back to the prompt.
+                    continue;
+                }
                 if conv.should_exit() {
                     break Ok(());
                 }
@@ -201,6 +235,9 @@ pub async fn run(
             slash::SlashAction::Clear => {
                 conv.clear();
                 last_user_message = None;
+                // The DB still has historical rows; truncating would be a
+                // destructive surprise. New messages simply start fresh.
+                persist_cursor = 0;
                 println!(
                     "{}(history cleared){}",
                     theme.dim_open, theme.dim_close
@@ -210,7 +247,19 @@ pub async fn run(
             slash::SlashAction::Exit => break Ok(()),
             slash::SlashAction::Retry => match last_user_message.clone() {
                 Some(prev) => {
-                    send_turn(conv, &token_handle, &prev, &theme, &spinner_slot).await?;
+                    let outcome = send_turn(
+                        conv,
+                        &token_handle,
+                        &prev,
+                        &theme,
+                        &spinner_slot,
+                        &muted,
+                    )
+                    .await?;
+                    flush_new_messages(conv, &persist, &mut persist_cursor).await?;
+                    if matches!(outcome, TurnOutcome::Canceled) {
+                        continue;
+                    }
                     if conv.should_exit() {
                         break Ok(());
                     }
@@ -234,15 +283,29 @@ pub async fn run(
     result
 }
 
+/// Outcome of a single chat turn, distinguishing normal completion from a
+/// user-initiated cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TurnOutcome {
+    Completed,
+    Canceled,
+}
+
 /// Print the assistant prefix, show a spinner until the first token arrives,
-/// stream the response, and close with a newline.
+/// stream the response (racing against `Ctrl+C`), and close with a newline.
+///
+/// Returns whether the turn completed normally or was canceled mid-stream.
 async fn send_turn(
     conv: &Conversation,
     token_handle: &ActorHandle,
     content: &str,
     theme: &Theme,
     spinner_slot: &SpinnerSlot,
-) -> Result<(), ActonAIError> {
+    muted: &Arc<AtomicBool>,
+) -> Result<TurnOutcome, ActonAIError> {
+    // Clear any residual mute from a previous cancel so this turn renders.
+    muted.store(false, Ordering::Relaxed);
+
     print!("{}", theme.assistant_label);
     std::io::stdout().flush().ok();
 
@@ -253,16 +316,74 @@ async fn send_turn(
         *slot = Some(pb.clone());
     }
 
-    let result = conv.send_streaming(content, token_handle).await;
+    // Race the stream against a SIGINT. Reedline releases raw-mode at the
+    // prompt, so Ctrl+C during streaming delivers a real SIGINT that
+    // `tokio::signal::ctrl_c()` resolves on.
+    let outcome = tokio::select! {
+        res = conv.send_streaming(content, token_handle) => {
+            TurnSelectResult::Done(res)
+        }
+        _ = tokio::signal::ctrl_c() => {
+            // Silence any remaining tokens/tool-calls from the in-flight
+            // stream so they don't bleed past our cancel message.
+            muted.store(true, Ordering::Relaxed);
+            TurnSelectResult::Canceled
+        }
+    };
 
-    // Empty responses (errors, tools-only turns) never emit a `StreamToken`
-    // so the slot can still be occupied. Clear any leftover spinner here.
+    // Empty responses (errors, tools-only turns, canceled) may not emit a
+    // `StreamToken` so the slot can still be occupied. Clear any leftover.
     if let Some(pb) = take_spinner(spinner_slot) {
         pb.finish_and_clear();
     }
 
-    result?;
-    println!();
+    match outcome {
+        TurnSelectResult::Done(res) => {
+            res?;
+            println!();
+            Ok(TurnOutcome::Completed)
+        }
+        TurnSelectResult::Canceled => {
+            eprintln!(
+                "\n{}^C canceled{}",
+                theme.warn_open,
+                if theme.colors_enabled { "\x1b[0m" } else { "" },
+            );
+            Ok(TurnOutcome::Canceled)
+        }
+    }
+}
+
+/// Intermediate enum used inside `send_turn` — kept private so the public
+/// surface only exposes the broader `TurnOutcome`.
+enum TurnSelectResult {
+    Done(Result<crate::stream::CollectedResponse, ActonAIError>),
+    Canceled,
+}
+
+/// Persist messages added since the last flush. No-op when no persist
+/// context was supplied (e.g. tests driving the loop directly).
+async fn flush_new_messages(
+    conv: &Conversation,
+    persist: &Option<PersistCtx<'_>>,
+    cursor: &mut usize,
+) -> Result<(), ActonAIError> {
+    let Some(ctx) = persist.as_ref() else {
+        return Ok(());
+    };
+    let history = conv.history();
+    if history.len() <= *cursor {
+        return Ok(());
+    }
+    for msg in &history[*cursor..] {
+        persistence::save_message(ctx.conn, ctx.conversation_id, msg)
+            .await
+            .map_err(|e| ActonAIError::prompt_failed(format!("failed to save message: {e}")))?;
+    }
+    persistence::touch_session(ctx.conn, ctx.session_name)
+        .await
+        .map_err(|e| ActonAIError::prompt_failed(format!("failed to touch session: {e}")))?;
+    *cursor = history.len();
     Ok(())
 }
 

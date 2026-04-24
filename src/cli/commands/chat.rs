@@ -194,17 +194,25 @@ pub async fn execute(
             };
             crate::cli::chat_ui::banner::print_startup(&banner_info, output, &theme);
 
-            let started_at = std::time::Instant::now();
-            let run_result = crate::cli::chat_ui::run(&conv, &rt.ai, history_path).await;
+            // Per-turn persistence: each finished turn (and its tool-result
+            // messages) is flushed inside the REPL. A Ctrl+C or crash
+            // therefore loses at most the current in-flight turn.
+            let persist = crate::cli::chat_ui::PersistCtx {
+                conn: &conn,
+                conversation_id: &conversation_id,
+                session_name: &session_name,
+            };
 
-            // Persist any new messages regardless of how the loop exited, so
-            // a streaming error or panic cannot orphan a partial session.
-            let current_history = conv.history();
-            let history_len = current_history.len();
-            for msg in current_history {
-                persistence::save_message(&conn, &conversation_id, &msg).await?;
-            }
+            let started_at = std::time::Instant::now();
+            let run_result =
+                crate::cli::chat_ui::run(&conv, &rt.ai, history_path, Some(persist)).await;
+
+            // The REPL flushes every turn as it completes, so by the time we
+            // land here the DB is already up to date. `touch_session` is
+            // idempotent and cheap — call it once more to bump the
+            // last-used timestamp on clean exit.
             persistence::touch_session(&conn, &session_name).await?;
+            let history_len = conv.history().len();
 
             if run_result.is_ok() {
                 crate::cli::chat_ui::banner::print_exit_summary(
