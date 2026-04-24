@@ -833,9 +833,26 @@ impl PromptBuilder {
             on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
         let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
+        // Build one long-lived StreamCollector for this entire `collect()`
+        // call. Spawning a fresh collector per round leaks broker
+        // subscriptions — `UnsubscribeBroker` ships unimplemented in
+        // acton-reactive, so the only reliable way to avoid dead-channel
+        // spam is to reuse a single subscriber across rounds.
+        let collector_session = build_stream_collector(
+            &runtime,
+            &StreamRoundCallbacks {
+                on_start: on_start.clone(),
+                on_token: on_token.clone(),
+                on_end: on_end.clone(),
+                token_target: token_target.clone(),
+            },
+        )
+        .await;
+
         loop {
             rounds += 1;
             if rounds > max_tool_rounds {
+                collector_session.shutdown().await;
                 return Err(ActonAIError::prompt_failed(format!(
                     "exceeded maximum tool rounds ({max_tool_rounds})",
                 )));
@@ -858,20 +875,21 @@ impl PromptBuilder {
                 sampling: sampling.clone(),
             };
 
-            // Collect stream response
-            let (text, stop_reason, token_count, tool_calls) = collect_stream_round(
-                &runtime,
+            // Collect stream response — reuses the long-lived collector.
+            let (text, stop_reason, token_count, tool_calls) = match run_stream_round(
+                &collector_session,
                 &provider_handle,
                 &request,
                 correlation_id,
-                StreamRoundCallbacks {
-                    on_start: on_start.clone(),
-                    on_token: on_token.clone(),
-                    on_end: on_end.clone(),
-                    token_target: token_target.clone(),
-                },
             )
-            .await?;
+            .await
+            {
+                Ok(data) => data,
+                Err(e) => {
+                    collector_session.shutdown().await;
+                    return Err(e);
+                }
+            };
 
             final_text = text.clone();
             total_token_count += token_count;
@@ -926,6 +944,10 @@ impl PromptBuilder {
             }
         }
 
+        // One shutdown for the long-lived collector — no broker
+        // subscriptions leaked across rounds.
+        collector_session.shutdown().await;
+
         Ok(CollectedResponse::with_tool_calls(
             final_text,
             StopReason::EndTurn,
@@ -935,7 +957,8 @@ impl PromptBuilder {
     }
 }
 
-/// Callbacks and token target for a single stream round.
+/// Callbacks and token target shared across every round of a single
+/// `collect()` call.
 struct StreamRoundCallbacks {
     on_start: Option<WrappedStartCallback>,
     on_token: Option<WrappedTokenCallback>,
@@ -943,160 +966,179 @@ struct StreamRoundCallbacks {
     token_target: Option<ActorHandle>,
 }
 
-/// Collects a single stream round.
-///
-/// This function creates a `StreamCollector` actor that owns all collection state
-/// internally. All mutable state (buffer, token_count, stop_reason, tool_calls)
-/// is owned by the actor and accessed directly in handlers via `actor.model`,
-/// eliminating the need for external Mutex-protected shared state during streaming.
-///
-/// The only synchronization is a single-use Mutex for the final result, which is
-/// filled once when streaming ends and read once to retrieve results. This is
-/// a minimal, single-write single-read pattern with no contention during streaming.
-async fn collect_stream_round(
-    runtime: &ActonAI,
-    provider_handle: &ActorHandle,
-    request: &LLMRequest,
-    correlation_id: CorrelationId,
-    callbacks: StreamRoundCallbacks,
-) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
-    let StreamRoundCallbacks {
-        on_start,
-        on_token,
-        on_end,
-        token_target,
-    } = callbacks;
-    // Set up completion signal
-    let stream_done = Arc::new(Notify::new());
-    let stream_done_signal = stream_done.clone();
+/// Long-lived stream collector. Owns broker subscriptions for the entire
+/// `collect()` call; each tool round sends a [`ResetStreamRound`] to reset
+/// state and swap the correlation-ID filter before firing the next request.
+struct StreamCollectorSession {
+    handle: ActorHandle,
+    completion: Arc<Notify>,
+    result_container: Arc<std::sync::Mutex<Option<CollectorResultData>>>,
+}
 
-    // Result container - filled once when stream ends, read once to retrieve
-    // This replaces the original per-token Mutex with a single-use pattern
+impl StreamCollectorSession {
+    /// Stop the underlying actor. Call once after all rounds complete.
+    async fn shutdown(self) {
+        let _ = self.handle.stop().await;
+    }
+}
+
+/// Build and start a long-lived `StreamCollector` actor subscribed to all
+/// four streaming event types. The caller drives individual rounds via
+/// [`run_stream_round`], which reuses this handle for every round.
+async fn build_stream_collector(
+    runtime: &ActonAI,
+    callbacks: &StreamRoundCallbacks,
+) -> StreamCollectorSession {
+    let completion = Arc::new(Notify::new());
+    let completion_signal = completion.clone();
+
     let result_container: Arc<std::sync::Mutex<Option<CollectorResultData>>> =
         Arc::new(std::sync::Mutex::new(None));
-    let result_container_clone = result_container.clone();
+    let result_container_for_handler = result_container.clone();
 
-    // Create the collector actor
     let mut actor_runtime = runtime.runtime().clone();
     let mut collector = actor_runtime.new_actor::<StreamCollector>();
 
-    // Clone for the start handler
-    let on_start_clone = on_start.clone();
-    let expected_id = correlation_id.clone();
-
-    // Handle stream start - callback captured in closure
-    collector.mutate_on::<LLMStreamStart>(move |_actor, envelope| {
-        if envelope.message().correlation_id == expected_id {
-            if let Some(ref callback) = on_start_clone {
-                if let Ok(mut f) = callback.lock() {
-                    f();
-                }
+    // Stream start — fire the caller's on_start callback for our round.
+    let on_start_clone = callbacks.on_start.clone();
+    collector.mutate_on::<LLMStreamStart>(move |actor, envelope| {
+        if actor.model.expected_correlation_id.as_ref()
+            != Some(&envelope.message().correlation_id)
+        {
+            return Reply::ready();
+        }
+        if let Some(ref callback) = on_start_clone {
+            if let Ok(mut f) = callback.lock() {
+                f();
             }
         }
         Reply::ready()
     });
 
-    // Clone for the token handler
-    let on_token_clone = on_token.clone();
-    let token_target_clone = token_target.clone();
-    let expected_id = correlation_id.clone();
-
-    // Handle tokens - accumulates to actor-owned buffer (no Mutex during streaming)
+    // Stream token — accumulate, fire caller's callback, forward to target.
+    let on_token_clone = callbacks.on_token.clone();
+    let token_target_clone = callbacks.token_target.clone();
     collector.mutate_on::<LLMStreamToken>(move |actor, envelope| {
-        if envelope.message().correlation_id == expected_id {
-            let token = &envelope.message().token;
+        if actor.model.expected_correlation_id.as_ref()
+            != Some(&envelope.message().correlation_id)
+        {
+            return Reply::ready();
+        }
+        let token = envelope.message().token.clone();
+        actor.model.buffer.push_str(&token);
+        actor.model.token_count += 1;
 
-            // State owned by actor - no external Mutex access during streaming
-            actor.model.buffer.push_str(token);
-            actor.model.token_count += 1;
-
-            if let Some(ref callback) = on_token_clone {
-                if let Ok(mut f) = callback.lock() {
-                    f(token);
-                }
+        if let Some(ref callback) = on_token_clone {
+            if let Ok(mut f) = callback.lock() {
+                f(&token);
             }
+        }
 
-            // Forward token to target actor if set
-            if let Some(ref target) = token_target_clone {
-                let target = target.clone();
-                let text = token.to_string();
-                return Reply::pending(async move {
-                    target.send(StreamToken { text }).await;
-                });
-            }
+        if let Some(ref target) = token_target_clone {
+            let target = target.clone();
+            return Reply::pending(async move {
+                target.send(StreamToken { text: token }).await;
+            });
         }
         Reply::ready()
     });
 
-    // Clone for the tool call handler
-    let expected_id = correlation_id.clone();
-
-    // Handle tool calls - accumulates to actor-owned vec (no Mutex during streaming)
+    // Stream tool call — accumulate into per-round state.
     collector.mutate_on::<LLMStreamToolCall>(move |actor, envelope| {
-        if envelope.message().correlation_id == expected_id {
-            // State owned by actor - no external Mutex access during streaming
-            actor
-                .model
-                .tool_calls
-                .push(envelope.message().tool_call.clone());
+        if actor.model.expected_correlation_id.as_ref()
+            != Some(&envelope.message().correlation_id)
+        {
+            return Reply::ready();
         }
+        actor
+            .model
+            .tool_calls
+            .push(envelope.message().tool_call.clone());
         Reply::ready()
     });
 
-    // Clone for the end handler
-    let on_end_clone = on_end.clone();
-    let expected_id = correlation_id.clone();
-
-    // Handle stream end - collects results, signals completion
+    // Stream end — take the accumulated state into the shared result slot
+    // and signal completion so the caller can pick up the round result.
+    let on_end_clone = callbacks.on_end.clone();
     collector.mutate_on::<LLMStreamEnd>(move |actor, envelope| {
-        if envelope.message().correlation_id == expected_id {
-            // Set stop reason in actor state
-            actor.model.stop_reason = Some(envelope.message().stop_reason);
-
-            // Invoke end callback
-            if let Some(ref callback) = on_end_clone {
-                if let Ok(mut f) = callback.lock() {
-                    f(envelope.message().stop_reason);
-                }
-            }
-
-            // Collect all results from actor state into the result container
-            // This is a single write - no contention during streaming
-            if let Ok(mut container) = result_container_clone.lock() {
-                *container = Some(CollectorResultData {
-                    buffer: std::mem::take(&mut actor.model.buffer),
-                    stop_reason: actor.model.stop_reason,
-                    token_count: actor.model.token_count,
-                    tool_calls: std::mem::take(&mut actor.model.tool_calls),
-                });
-            }
-
-            // Signal completion
-            stream_done_signal.notify_one();
+        if actor.model.expected_correlation_id.as_ref()
+            != Some(&envelope.message().correlation_id)
+        {
+            return Reply::ready();
         }
+        actor.model.stop_reason = Some(envelope.message().stop_reason);
+        if let Some(ref callback) = on_end_clone {
+            if let Ok(mut f) = callback.lock() {
+                f(envelope.message().stop_reason);
+            }
+        }
+
+        if let Ok(mut container) = result_container_for_handler.lock() {
+            *container = Some(CollectorResultData {
+                buffer: std::mem::take(&mut actor.model.buffer),
+                stop_reason: actor.model.stop_reason,
+                token_count: actor.model.token_count,
+                tool_calls: std::mem::take(&mut actor.model.tool_calls),
+            });
+        }
+        // Clear the correlation-ID filter so stray late events from the
+        // just-finished round don't land in the next round's state.
+        actor.model.expected_correlation_id = None;
+
+        completion_signal.notify_one();
         Reply::ready()
     });
 
-    // Subscribe to streaming events BEFORE starting
+    // Reset per-round state — reliably delivered BEFORE any event for the
+    // new correlation_id because the provider is only told to send the
+    // request after this message has been acknowledged.
+    collector.mutate_on::<ResetStreamRound>(move |actor, envelope| {
+        let msg = envelope.message();
+        actor.model.buffer.clear();
+        actor.model.token_count = 0;
+        actor.model.stop_reason = None;
+        actor.model.tool_calls.clear();
+        actor.model.expected_correlation_id = Some(msg.expected_id.clone());
+        Reply::ready()
+    });
+
+    // Subscribe BEFORE starting so no broadcast can slip past us.
     collector.handle().subscribe::<LLMStreamStart>().await;
     collector.handle().subscribe::<LLMStreamToken>().await;
     collector.handle().subscribe::<LLMStreamToolCall>().await;
     collector.handle().subscribe::<LLMStreamEnd>().await;
 
-    // Start the collector
-    let collector_handle = collector.start().await;
+    let handle = collector.start().await;
+    StreamCollectorSession {
+        handle,
+        completion,
+        result_container,
+    }
+}
 
-    // Send the request to the provider
+/// Run a single stream round on the supplied long-lived collector.
+async fn run_stream_round(
+    session: &StreamCollectorSession,
+    provider_handle: &ActorHandle,
+    request: &LLMRequest,
+    correlation_id: CorrelationId,
+) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
+    // Ack: reset state and install the new round's correlation ID.
+    session
+        .handle
+        .send(ResetStreamRound {
+            expected_id: correlation_id,
+        })
+        .await;
+
+    // Fire the request.
     provider_handle.send(request.clone()).await;
 
-    // Wait for stream completion
-    stream_done.notified().await;
+    // Wait for the stream-end handler to fill the result slot.
+    session.completion.notified().await;
 
-    // Stop the collector
-    let _ = collector_handle.stop().await;
-
-    // Extract the collected data - single read, no contention
-    let result = result_container
+    let result = session
+        .result_container
         .lock()
         .ok()
         .and_then(|mut guard| guard.take())
@@ -1146,16 +1188,35 @@ async fn execute_tool_with_callback(
 /// the need for external Mutex-protected shared state. All mutable state
 /// (buffer, token_count, stop_reason, tool_calls) is owned by the actor
 /// and accessed directly in handlers via `actor.model`.
+///
+/// The collector is **long-lived across all tool rounds of a single
+/// `collect()` call** — subscribing once at the top and resetting per-round
+/// state via [`ResetStreamRound`]. Spawning a fresh collector per round
+/// leaks broker subscriptions (acton-reactive's `UnsubscribeBroker` ships
+/// as an unimplemented stub: see `common/src/message/unsubscribe_broker.rs`).
 #[acton_actor]
 struct StreamCollector {
-    /// Accumulated response buffer
+    /// Accumulated response buffer for the current round
     buffer: String,
-    /// Count of tokens received
+    /// Count of tokens received in the current round
     token_count: usize,
-    /// Stop reason when stream ends
+    /// Stop reason when the current round's stream ends
     stop_reason: Option<StopReason>,
-    /// Accumulated tool calls
+    /// Accumulated tool calls from the current round
     tool_calls: Vec<ToolCall>,
+    /// Correlation ID of the round currently being collected. Handlers
+    /// ignore any event whose correlation ID doesn't match — protects the
+    /// collector from stray events emitted by other concurrent streams
+    /// that the provider may broadcast to the same broker channel.
+    expected_correlation_id: Option<CorrelationId>,
+}
+
+/// Per-round reset message. Sent to the collector before starting each
+/// round's LLM request so state is fresh and the correlation-ID filter
+/// accepts the new round's events.
+#[derive(Clone, Debug)]
+struct ResetStreamRound {
+    expected_id: CorrelationId,
 }
 
 /// Collected stream data returned from the actor.
