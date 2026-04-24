@@ -3,6 +3,7 @@
 //! Provides a scriptable CLI with session management, autonomous heartbeat,
 //! chat, and job execution capabilities.
 
+pub mod chat_ui;
 pub mod commands;
 pub mod error;
 pub mod output;

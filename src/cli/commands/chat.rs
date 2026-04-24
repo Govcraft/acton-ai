@@ -124,12 +124,15 @@ pub async fn execute(
         "system prompt",
     );
 
-    // Build the Conversation
+    // Build the Conversation. The exit tool is always enabled for the CLI
+    // because the interactive REPL below depends on the model being able to
+    // terminate the session via the `exit_conversation` tool.
     let conv = rt
         .ai
         .conversation()
         .system(&system)
         .restore(history)
+        .with_exit_tool()
         .build()
         .await;
 
@@ -176,13 +179,10 @@ pub async fn execute(
             }
 
             tracing::info!(mode = "interactive", "entering chat loop");
-            // Run interactive chat loop
-            // The Conversation::run_chat_with already handles stdin/stdout
-            let chat_config = crate::conversation::ChatConfig::new()
-                .user_prompt("You: ")
-                .assistant_prompt("Assistant: ");
-
-            conv.run_chat_with(chat_config).await?;
+            // Drive the richer CLI REPL: reedline line editor, persistent
+            // per-session history, and slash commands.
+            let history_path = crate::cli::chat_ui::history_path_for_session(&session_name);
+            crate::cli::chat_ui::run(&conv, &rt.ai, history_path).await?;
 
             // After interactive chat, persist any new messages
             let current_history = conv.history();
