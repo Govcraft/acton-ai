@@ -27,6 +27,31 @@ pub fn render_tool_call(tool: &ToolCall, theme: &Theme) {
     );
 }
 
+/// Render the outcome of a tool call (success or error) as an indented
+/// follow-up line to the preceding `[tool]` invocation. Successes render
+/// dim; errors render in the theme's warn colour so they stand out.
+pub fn render_tool_result(tool_name: &str, success: bool, summary: &str, theme: &Theme) {
+    if success {
+        println!(
+            "  {dim}↳ ok{reset}  {dim}{summary}{reset}",
+            dim = theme.dim_open,
+            reset = theme.dim_close,
+            summary = summary,
+        );
+    } else {
+        let reset = if theme.colors_enabled { "\x1b[0m" } else { "" };
+        println!(
+            "  {warn}↳ error{reset}  {dim}{tool_name}: {summary}{dim_close}",
+            warn = theme.warn_open,
+            reset = reset,
+            dim = theme.dim_open,
+            dim_close = theme.dim_close,
+            tool_name = tool_name,
+            summary = summary,
+        );
+    }
+}
+
 /// Produce a one-line preview of tool arguments for inline rendering.
 ///
 /// For the common cases (`{ command: "..." }`, `{ path: "..." }`) this picks

@@ -27,7 +27,7 @@ use crate::conversation::{Conversation, StreamToken};
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::memory::persistence;
-use crate::messages::{LLMStreamToolCall, Message};
+use crate::messages::{LLMStreamToolCall, LLMStreamToolResult, Message};
 use crate::types::ConversationId;
 
 use self::style::Theme;
@@ -177,12 +177,32 @@ pub async fn run(
         Reply::ready()
     });
 
+    let theme_for_result = theme.clone();
+    let muted_for_result = muted.clone();
+    token_actor.mutate_on::<LLMStreamToolResult>(move |_actor, ctx| {
+        if muted_for_result.load(Ordering::Relaxed) {
+            return Reply::ready();
+        }
+        let msg = ctx.message();
+        tool_render::render_tool_result(
+            &msg.tool_name,
+            msg.success,
+            &msg.summary,
+            &theme_for_result,
+        );
+        Reply::ready()
+    });
+
     // Subscribe to broadcast events BEFORE starting. `StreamToken` is sent
     // point-to-point via the handle returned below, so it doesn't need a
     // broadcast subscription.
     token_actor
         .handle()
         .subscribe::<LLMStreamToolCall>()
+        .await;
+    token_actor
+        .handle()
+        .subscribe::<LLMStreamToolResult>()
         .await;
 
     let token_handle = token_actor.start().await;

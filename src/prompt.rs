@@ -876,6 +876,9 @@ impl PromptBuilder {
             };
 
             // Collect stream response — reuses the long-lived collector.
+            // Keep a clone so we can tag tool-result broadcasts with the
+            // round's correlation ID further down.
+            let round_correlation_id = correlation_id.clone();
             let (text, stop_reason, token_count, tool_calls) = match run_stream_round(
                 &collector_session,
                 &provider_handle,
@@ -909,6 +912,23 @@ impl PromptBuilder {
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
                         let result = execute_tool_with_callback(&mut tools, tool_call).await;
+
+                        // Broadcast a compact result event so observers
+                        // (the CLI chat REPL) can render success/failure
+                        // inline alongside the preceding tool-call line.
+                        let (success, summary) = match &result {
+                            Ok(value) => (true, summarize_tool_value(value, 200)),
+                            Err(e) => (false, summarize_error(&e.to_string(), 200)),
+                        };
+                        provider_handle
+                            .broadcast(crate::messages::LLMStreamToolResult {
+                                correlation_id: round_correlation_id.clone(),
+                                tool_call_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                                success,
+                                summary,
+                            })
+                            .await;
 
                         // Record the executed tool call
                         let executed = match &result {
@@ -1152,6 +1172,42 @@ async fn run_stream_round(
         result.token_count,
         result.tool_calls,
     ))
+}
+
+/// Render a successful tool result as a single-line preview for the
+/// [`LLMStreamToolResult`] broadcast. Picks a salient string field when the
+/// payload is a JSON object (`output`, `stdout`, `content`, `text`,
+/// `result`), otherwise falls back to a compact JSON rendering. Newlines
+/// are flattened so the preview stays on one line; oversized strings are
+/// truncated with an ellipsis.
+fn summarize_tool_value(value: &serde_json::Value, max: usize) -> String {
+    if let Some(obj) = value.as_object() {
+        for key in ["output", "stdout", "content", "text", "result"] {
+            if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
+                return flatten_and_truncate(v, max);
+            }
+        }
+    }
+    if let Some(s) = value.as_str() {
+        return flatten_and_truncate(s, max);
+    }
+    let rendered = serde_json::to_string(value).unwrap_or_else(|_| "<result>".to_string());
+    flatten_and_truncate(&rendered, max)
+}
+
+/// Render a tool error message as a compact single-line preview.
+fn summarize_error(msg: &str, max: usize) -> String {
+    flatten_and_truncate(msg, max)
+}
+
+fn flatten_and_truncate(s: &str, max: usize) -> String {
+    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let cut: String = flat.chars().take(max).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Executes a single tool call and invokes the result callback if present.

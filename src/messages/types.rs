@@ -486,6 +486,32 @@ pub struct LLMStreamEnd {
     pub stop_reason: StopReason,
 }
 
+/// Result of executing a tool call, broadcast after `PromptBuilder::collect`
+/// runs the tool. Consumers (e.g. the chat REPL) render this inline so the
+/// user can see tool success/failure in the same timeline as the
+/// preceding [`LLMStreamToolCall`].
+///
+/// This is a CLI-observability event — the tool result also lives in
+/// `ExecutedToolCall` returned from `CollectedResponse` and in the tool
+/// message appended to conversation history.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct LLMStreamToolResult {
+    /// Correlation ID for the stream this result belongs to
+    pub correlation_id: CorrelationId,
+    /// ID of the tool call that produced this result (matches
+    /// [`ToolCall::id`]).
+    pub tool_call_id: String,
+    /// Name of the tool that ran
+    pub tool_name: String,
+    /// True if the tool returned `Ok`, false if it returned `Err`
+    pub success: bool,
+    /// Short human-readable preview of the result or error, flattened to
+    /// one line and truncated to ~200 chars. Full payload is still
+    /// available via `CollectedResponse::tool_calls`.
+    pub summary: String,
+}
+
 // =============================================================================
 // Tool Messages
 // =============================================================================
