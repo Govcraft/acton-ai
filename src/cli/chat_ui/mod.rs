@@ -27,7 +27,7 @@ use crate::conversation::{Conversation, StreamToken};
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::memory::persistence;
-use crate::messages::{LLMStreamToolCall, LLMStreamToolResult, Message};
+use crate::messages::{LLMStreamStart, LLMStreamToolCall, LLMStreamToolResult, Message};
 use crate::types::ConversationId;
 
 use self::style::Theme;
@@ -193,9 +193,32 @@ pub async fn run(
         Reply::ready()
     });
 
+    // On each new round AFTER the first of a turn, emit a blank line so
+    // the model's follow-up response is visually separated from the
+    // preceding tool result. We key on `label_printed` — it flips true
+    // when the token handler emits the turn's "Assistant:" label, so a
+    // subsequent `LLMStreamStart` means we're already mid-turn and need
+    // a round separator.
+    let muted_for_start = muted.clone();
+    let label_for_start = label_printed.clone();
+    token_actor.mutate_on::<LLMStreamStart>(move |_actor, _ctx| {
+        if muted_for_start.load(Ordering::Relaxed) {
+            return Reply::ready();
+        }
+        if label_for_start.load(Ordering::Relaxed) {
+            println!();
+            std::io::stdout().flush().ok();
+        }
+        Reply::ready()
+    });
+
     // Subscribe to broadcast events BEFORE starting. `StreamToken` is sent
     // point-to-point via the handle returned below, so it doesn't need a
     // broadcast subscription.
+    token_actor
+        .handle()
+        .subscribe::<LLMStreamStart>()
+        .await;
     token_actor
         .handle()
         .subscribe::<LLMStreamToolCall>()
