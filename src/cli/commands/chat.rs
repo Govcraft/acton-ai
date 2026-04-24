@@ -18,22 +18,6 @@ use std::path::PathBuf;
 
 /// Options for the chat command.
 #[derive(Debug, clap::Args)]
-#[command(
-    about = "Send a message or start an interactive chat session.",
-    long_about = "Send a single message, pipe input, or open an interactive \
-                  REPL with persistent per-session history.\n\n\
-                  \x20 EXAMPLES\n\
-                  \x20   Single-shot:    acton-ai chat -m \"what is rust?\"\n\
-                  \x20   From file:      acton-ai chat < question.txt\n\
-                  \x20   From pipe:      git log | acton-ai chat -m \"summarize\"\n\
-                  \x20   Interactive:    acton-ai chat\n\
-                  \x20   Resume session: acton-ai chat --session work\n\n\
-                  \x20 JSON OUTPUT\n\
-                  \x20   With --json, single-shot responses are emitted as one line:\n\
-                  \x20     {\"schemaVersion\":1,\"session\":\"main\",\"role\":\"assistant\",\n\
-                  \x20      \"text\":\"...\",\"tokenCount\":42}\n\
-                  \x20   Schema is versioned — consumers should branch on schemaVersion."
-)]
 pub struct ChatArgs {
     /// Session name to use (default: "main").
     #[arg(long, env = "ACTON_SESSION")]
@@ -62,6 +46,13 @@ pub struct ChatArgs {
     /// `[skills] paths = [...]` entries in the config file.
     #[arg(long = "skill-dir", short = 's', value_name = "PATH")]
     pub skill_dirs: Vec<PathBuf>,
+
+    /// Render assistant responses as formatted markdown (bold, code blocks,
+    /// lists, headings). Disables token streaming — the full response is
+    /// buffered, then rendered at once. Falls back to plain text when stdout
+    /// is piped or NO_COLOR is set.
+    #[arg(long)]
+    pub render: bool,
 }
 
 /// Versioned JSON response envelope for `--json` mode. Bumping
@@ -233,8 +224,13 @@ pub async fn execute(
             };
 
             let started_at = std::time::Instant::now();
+            let run_options = crate::cli::chat_ui::RunOptions {
+                history_path,
+                persist: Some(persist),
+                render_markdown: args.render,
+            };
             let run_result =
-                crate::cli::chat_ui::run(&conv, &rt.ai, history_path, Some(persist)).await;
+                crate::cli::chat_ui::run(&conv, &rt.ai, run_options).await;
 
             // The REPL flushes every turn as it completes, so by the time we
             // land here the DB is already up to date. `touch_session` is

@@ -7,6 +7,7 @@
 //! [`Conversation::send_streaming`] API.
 
 pub mod banner;
+pub mod render;
 pub mod slash;
 pub mod spinner;
 pub mod style;
@@ -80,6 +81,17 @@ pub struct PersistCtx<'a> {
     pub session_name: &'a str,
 }
 
+/// Options bag for [`run`]. Passing a struct keeps the signature stable as
+/// new toggles land in follow-up PRs.
+pub struct RunOptions<'a> {
+    pub history_path: Option<PathBuf>,
+    pub persist: Option<PersistCtx<'a>>,
+    /// When true, buffer each turn's response and render it as markdown
+    /// once streaming completes. Token-by-token display is suppressed —
+    /// the spinner carries the "still working" signal instead.
+    pub render_markdown: bool,
+}
+
 /// Run the interactive chat REPL.
 ///
 /// Drives a reedline-based input loop, dispatches slash commands, and streams
@@ -93,9 +105,14 @@ pub struct PersistCtx<'a> {
 pub async fn run(
     conv: &Conversation,
     ai: &ActonAI,
-    history_path: Option<PathBuf>,
-    persist: Option<PersistCtx<'_>>,
+    options: RunOptions<'_>,
 ) -> Result<(), ActonAIError> {
+    let RunOptions {
+        history_path,
+        persist,
+        render_markdown,
+    } = options;
+
     let theme = Theme::resolve();
     let spinner_slot: SpinnerSlot = Arc::new(Mutex::new(None));
     // When the user cancels a turn with Ctrl+C we flip this to silence the
@@ -220,8 +237,16 @@ pub async fn run(
         match slash::parse(trimmed) {
             slash::SlashAction::NotSlash => {
                 last_user_message = Some(trimmed.to_string());
-                let outcome =
-                    send_turn(conv, &token_handle, trimmed, &theme, &spinner_slot, &muted).await?;
+                let outcome = send_turn(
+                    conv,
+                    &token_handle,
+                    trimmed,
+                    &theme,
+                    &spinner_slot,
+                    &muted,
+                    render_markdown,
+                )
+                .await?;
                 flush_new_messages(conv, &persist, &mut persist_cursor).await?;
                 if matches!(outcome, TurnOutcome::Canceled) {
                     // Stream aborted by Ctrl+C — loop back to the prompt.
@@ -254,6 +279,7 @@ pub async fn run(
                         &theme,
                         &spinner_slot,
                         &muted,
+                        render_markdown,
                     )
                     .await?;
                     flush_new_messages(conv, &persist, &mut persist_cursor).await?;
@@ -294,6 +320,10 @@ enum TurnOutcome {
 /// Print the assistant prefix, show a spinner until the first token arrives,
 /// stream the response (racing against `Ctrl+C`), and close with a newline.
 ///
+/// In `render_markdown` mode, tokens aren't displayed as they arrive — the
+/// spinner carries the waiting signal, and the full response is rendered
+/// through `termimad` when the stream ends.
+///
 /// Returns whether the turn completed normally or was canceled mid-stream.
 async fn send_turn(
     conv: &Conversation,
@@ -302,15 +332,19 @@ async fn send_turn(
     theme: &Theme,
     spinner_slot: &SpinnerSlot,
     muted: &Arc<AtomicBool>,
+    render_markdown: bool,
 ) -> Result<TurnOutcome, ActonAIError> {
     // Clear any residual mute from a previous cancel so this turn renders.
     muted.store(false, Ordering::Relaxed);
 
-    print!("{}", theme.assistant_label);
-    std::io::stdout().flush().ok();
+    if !render_markdown {
+        print!("{}", theme.assistant_label);
+        std::io::stdout().flush().ok();
+    }
 
-    // Park a spinner in the shared slot so the token handler can dismiss it
-    // the moment the first token lands.
+    // Park a spinner in the shared slot. In streaming mode the token handler
+    // dismisses it on first token; in render mode it stays up until we
+    // clear it ourselves post-stream.
     let pb = spinner::build("thinking…");
     if let Ok(mut slot) = spinner_slot.lock() {
         *slot = Some(pb.clone());
@@ -319,15 +353,25 @@ async fn send_turn(
     // Race the stream against a SIGINT. Reedline releases raw-mode at the
     // prompt, so Ctrl+C during streaming delivers a real SIGINT that
     // `tokio::signal::ctrl_c()` resolves on.
-    let outcome = tokio::select! {
-        res = conv.send_streaming(content, token_handle) => {
-            TurnSelectResult::Done(res)
+    //
+    // In render mode we use the non-streaming `send` path so tokens never
+    // reach the actor (nothing to display live). Tool-call events still
+    // broadcast and render inline via the existing subscriber.
+    let outcome = if render_markdown {
+        tokio::select! {
+            res = conv.send(content) => TurnSelectResult::Done(res),
+            _ = tokio::signal::ctrl_c() => {
+                muted.store(true, Ordering::Relaxed);
+                TurnSelectResult::Canceled
+            }
         }
-        _ = tokio::signal::ctrl_c() => {
-            // Silence any remaining tokens/tool-calls from the in-flight
-            // stream so they don't bleed past our cancel message.
-            muted.store(true, Ordering::Relaxed);
-            TurnSelectResult::Canceled
+    } else {
+        tokio::select! {
+            res = conv.send_streaming(content, token_handle) => TurnSelectResult::Done(res),
+            _ = tokio::signal::ctrl_c() => {
+                muted.store(true, Ordering::Relaxed);
+                TurnSelectResult::Canceled
+            }
         }
     };
 
@@ -339,8 +383,18 @@ async fn send_turn(
 
     match outcome {
         TurnSelectResult::Done(res) => {
-            res?;
-            println!();
+            let response = res?;
+            if render_markdown {
+                // Render header + markdown as one block. The header uses the
+                // same bold-magenta label as streaming mode to keep the UX
+                // recognisable.
+                print!("{}", theme.assistant_label);
+                std::io::stdout().flush().ok();
+                println!();
+                render::render_to_stdout(&response.text);
+            } else {
+                println!();
+            }
             Ok(TurnOutcome::Completed)
         }
         TurnSelectResult::Canceled => {
