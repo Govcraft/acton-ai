@@ -86,6 +86,14 @@ pub struct ActonAIConfig {
     /// file.
     #[serde(default)]
     pub skills: Option<SkillsFileConfig>,
+
+    /// Context-window settings applied to every [`Conversation`](crate::conversation::Conversation).
+    ///
+    /// Corresponds to `[context]` in TOML. Per-provider overrides via
+    /// `providers.<name>.context_window_tokens` take precedence over the
+    /// global `max_tokens` here.
+    #[serde(default)]
+    pub context: Option<ContextFileConfig>,
 }
 
 /// Skills configuration loaded from `[skills]` in TOML.
@@ -98,6 +106,47 @@ pub struct SkillsFileConfig {
     /// Paths to skill files or directories to load.
     #[serde(default)]
     pub paths: Vec<PathBuf>,
+}
+
+/// Context-window configuration loaded from `[context]` in TOML.
+///
+/// ```toml
+/// [context]
+/// max_tokens = 8192
+/// reserved_for_response = 1024
+/// strategy = "keep-recent"   # "keep-recent" | "keep-system-and-recent" | "keep-ends"
+/// ```
+///
+/// Per-provider `context_window_tokens` on `[providers.<name>]` overrides
+/// `max_tokens` here for runtimes whose default provider sets it.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ContextFileConfig {
+    /// Global default token budget. Overridden by per-provider
+    /// `context_window_tokens` when the active provider sets it.
+    #[serde(default)]
+    pub max_tokens: Option<usize>,
+    /// Tokens reserved for the model's response (subtracted from the budget
+    /// before fitting history).
+    #[serde(default)]
+    pub reserved_for_response: Option<usize>,
+    /// Truncation strategy. See [`parse_truncation_strategy`].
+    #[serde(default)]
+    pub strategy: Option<String>,
+}
+
+/// Parses a strategy string into a [`crate::memory::TruncationStrategy`].
+/// Accepts kebab-case, snake_case, and space-separated variants; returns
+/// `None` for unknown strings (caller should fall back to a default).
+#[must_use]
+pub fn parse_truncation_strategy(s: &str) -> Option<crate::memory::TruncationStrategy> {
+    use crate::memory::TruncationStrategy;
+    let normalized = s.trim().to_lowercase().replace([' ', '_'], "-");
+    match normalized.as_str() {
+        "keep-recent" => Some(TruncationStrategy::KeepRecent),
+        "keep-system-and-recent" => Some(TruncationStrategy::KeepSystemAndRecent),
+        "keep-ends" => Some(TruncationStrategy::KeepEnds),
+        _ => None,
+    }
 }
 
 impl ActonAIConfig {
@@ -225,6 +274,14 @@ pub struct NamedProviderConfig {
     /// Sequences that will cause the model to stop generating.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_sequences: Option<Vec<String>>,
+
+    /// Native context window size for this model, in tokens.
+    ///
+    /// Overrides the global `[context] max_tokens` when set. Use to reflect
+    /// per-model limits (qwen2.5:7b ~32k, claude-sonnet-4 ~200k, gpt-4o ~128k).
+    /// When `None`, the global default applies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_tokens: Option<usize>,
 }
 
 impl NamedProviderConfig {
@@ -247,6 +304,7 @@ impl NamedProviderConfig {
             presence_penalty: None,
             seed: None,
             stop_sequences: None,
+            context_window_tokens: None,
         }
     }
 
@@ -269,6 +327,7 @@ impl NamedProviderConfig {
             presence_penalty: None,
             seed: None,
             stop_sequences: None,
+            context_window_tokens: None,
         }
     }
 
@@ -294,6 +353,7 @@ impl NamedProviderConfig {
             presence_penalty: None,
             seed: None,
             stop_sequences: None,
+            context_window_tokens: None,
         }
     }
 
@@ -329,6 +389,16 @@ impl NamedProviderConfig {
     #[must_use]
     pub fn with_max_tokens(mut self, tokens: u32) -> Self {
         self.max_tokens = Some(tokens);
+        self
+    }
+
+    /// Sets the native context-window size for this model.
+    ///
+    /// Overrides any global `[context] max_tokens` when the runtime uses this
+    /// provider as its default.
+    #[must_use]
+    pub fn with_context_window_tokens(mut self, tokens: usize) -> Self {
+        self.context_window_tokens = Some(tokens);
         self
     }
 
@@ -1151,6 +1221,7 @@ max_execution_ms = 60000
             jobs: None,
             defaults: None,
             skills: None,
+            context: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1256,5 +1327,58 @@ max_tool_rounds = 25
 
         let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
         assert!(config.skills.is_none());
+    }
+
+    #[test]
+    fn context_section_roundtrips() {
+        let toml_str = r#"
+            [context]
+            max_tokens = 32768
+            reserved_for_response = 2048
+            strategy = "keep-ends"
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let ctx = config.context.expect("[context] block should parse");
+        assert_eq!(ctx.max_tokens, Some(32_768));
+        assert_eq!(ctx.reserved_for_response, Some(2048));
+        assert_eq!(ctx.strategy.as_deref(), Some("keep-ends"));
+    }
+
+    #[test]
+    fn provider_context_window_tokens_parses() {
+        let toml_str = r#"
+            [providers.ollama]
+            type = "ollama"
+            model = "qwen2.5:7b"
+            context_window_tokens = 32000
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let ollama = config.providers.get("ollama").unwrap();
+        assert_eq!(ollama.context_window_tokens, Some(32_000));
+    }
+
+    #[test]
+    fn parse_truncation_strategy_accepts_all_forms() {
+        use crate::memory::TruncationStrategy;
+
+        assert_eq!(
+            parse_truncation_strategy("keep-recent"),
+            Some(TruncationStrategy::KeepRecent)
+        );
+        assert_eq!(
+            parse_truncation_strategy("KEEP_RECENT"),
+            Some(TruncationStrategy::KeepRecent)
+        );
+        assert_eq!(
+            parse_truncation_strategy("keep system and recent"),
+            Some(TruncationStrategy::KeepSystemAndRecent)
+        );
+        assert_eq!(
+            parse_truncation_strategy("keep-ends"),
+            Some(TruncationStrategy::KeepEnds)
+        );
+        assert_eq!(parse_truncation_strategy("bogus"), None);
     }
 }

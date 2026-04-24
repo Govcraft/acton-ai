@@ -30,6 +30,7 @@
 
 use crate::memory::Memory;
 use crate::messages::{Message, MessageRole};
+use std::sync::Arc;
 
 // =============================================================================
 // Truncation Strategy
@@ -126,6 +127,135 @@ impl ContextWindowConfig {
 }
 
 // =============================================================================
+// Token Estimator
+// =============================================================================
+
+/// Role marker overhead in tokens — approximates the per-message framing tokens
+/// that chat models add (role tag + separator). OpenAI uses ~4; other models
+/// are close enough for budgeting.
+const ROLE_OVERHEAD_TOKENS: usize = 4;
+
+/// Pluggable token counter. Backends can be a cheap char-ratio heuristic
+/// ([`CharRatioEstimator`]) or a real BPE tokenizer ([`TiktokenEstimator`]).
+pub trait TokenEstimator: std::fmt::Debug + Send + Sync {
+    /// Estimates tokens for a single message, including role framing overhead.
+    fn estimate_message(&self, message: &Message) -> usize;
+    /// Estimates tokens for a bare string (no framing overhead).
+    fn estimate_string(&self, text: &str) -> usize;
+    /// Short identifier for logging and diagnostics (e.g., "char-ratio", "cl100k_base").
+    fn name(&self) -> &'static str;
+}
+
+/// Character-ratio token estimator. Approximates tokens as
+/// `content_chars * tokens_per_char + ROLE_OVERHEAD_TOKENS`. Cheap and
+/// dependency-free; ±30% of a real tokenizer on English prose.
+#[derive(Debug, Clone)]
+pub struct CharRatioEstimator {
+    tokens_per_char: f32,
+}
+
+impl CharRatioEstimator {
+    /// Creates an estimator with the given `tokens_per_char` ratio.
+    #[must_use]
+    pub fn new(tokens_per_char: f32) -> Self {
+        Self { tokens_per_char }
+    }
+}
+
+impl Default for CharRatioEstimator {
+    fn default() -> Self {
+        Self::new(0.25)
+    }
+}
+
+impl TokenEstimator for CharRatioEstimator {
+    fn estimate_message(&self, message: &Message) -> usize {
+        let content_tokens =
+            (message.content.len() as f32 * self.tokens_per_char).ceil() as usize;
+        content_tokens + ROLE_OVERHEAD_TOKENS
+    }
+
+    fn estimate_string(&self, text: &str) -> usize {
+        (text.len() as f32 * self.tokens_per_char).ceil() as usize
+    }
+
+    fn name(&self) -> &'static str {
+        "char-ratio"
+    }
+}
+
+/// BPE-based token estimator backed by `tiktoken-rs`. Exact for OpenAI models;
+/// ±10% approximation for Claude and most Ollama models when falling back to
+/// `cl100k_base`.
+#[derive(Clone)]
+pub struct TiktokenEstimator {
+    bpe: &'static tiktoken_rs::CoreBPE,
+    encoding_name: &'static str,
+}
+
+impl std::fmt::Debug for TiktokenEstimator {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TiktokenEstimator")
+            .field("encoding_name", &self.encoding_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl TiktokenEstimator {
+    /// Resolves the tokenizer for the given model. Unknown models fall back to
+    /// `cl100k_base`, which is a reasonable approximation for most chat models.
+    #[must_use]
+    pub fn for_model(model: &str) -> Self {
+        match tiktoken_rs::bpe_for_model(model) {
+            Ok(bpe) => Self {
+                bpe,
+                encoding_name: resolve_encoding_name(model),
+            },
+            Err(_) => Self {
+                bpe: tiktoken_rs::cl100k_base_singleton(),
+                encoding_name: "cl100k_base",
+            },
+        }
+    }
+
+    /// Returns the name of the selected encoding.
+    #[must_use]
+    pub fn encoding_name(&self) -> &'static str {
+        self.encoding_name
+    }
+}
+
+impl TokenEstimator for TiktokenEstimator {
+    fn estimate_message(&self, message: &Message) -> usize {
+        self.bpe.encode_ordinary(&message.content).len() + ROLE_OVERHEAD_TOKENS
+    }
+
+    fn estimate_string(&self, text: &str) -> usize {
+        self.bpe.encode_ordinary(text).len()
+    }
+
+    fn name(&self) -> &'static str {
+        self.encoding_name
+    }
+}
+
+/// Best-effort mapping from model name to encoding name. Only used for
+/// human-readable logging; the actual encoding is whatever
+/// `get_bpe_from_model` resolved.
+fn resolve_encoding_name(model: &str) -> &'static str {
+    let m = model.to_lowercase();
+    if m.starts_with("gpt-4o") || m.starts_with("o1") || m.starts_with("o3") {
+        "o200k_base"
+    } else if m.starts_with("gpt-4") || m.starts_with("gpt-3.5") {
+        "cl100k_base"
+    } else if m.starts_with("text-davinci") {
+        "p50k_base"
+    } else {
+        "cl100k_base"
+    }
+}
+
+// =============================================================================
 // Context Window
 // =============================================================================
 
@@ -134,19 +264,31 @@ impl ContextWindowConfig {
 /// The context window is the limited "memory" available to the LLM during
 /// a single request. This struct helps manage that constraint by:
 ///
-/// 1. Estimating token counts for messages
+/// 1. Estimating token counts for messages (via a pluggable [`TokenEstimator`])
 /// 2. Truncating conversations to fit within limits
 /// 3. Injecting relevant memories into context
 #[derive(Debug, Clone)]
 pub struct ContextWindow {
     config: ContextWindowConfig,
+    estimator: Arc<dyn TokenEstimator>,
 }
 
 impl ContextWindow {
-    /// Creates a new context window manager.
+    /// Creates a new context window manager with a char-ratio estimator
+    /// derived from `config.tokens_per_char`.
     #[must_use]
     pub fn new(config: ContextWindowConfig) -> Self {
-        Self { config }
+        let estimator: Arc<dyn TokenEstimator> =
+            Arc::new(CharRatioEstimator::new(config.tokens_per_char));
+        Self { config, estimator }
+    }
+
+    /// Replaces the token estimator. Use to swap in
+    /// [`TiktokenEstimator`] for model-accurate counts.
+    #[must_use]
+    pub fn with_estimator(mut self, estimator: Arc<dyn TokenEstimator>) -> Self {
+        self.estimator = estimator;
+        self
     }
 
     /// Returns a reference to the configuration.
@@ -155,34 +297,23 @@ impl ContextWindow {
         &self.config
     }
 
-    /// Estimates the token count for a message.
-    ///
-    /// Uses character count as approximation. For accurate counts,
-    /// use a tokenizer specific to the model (e.g., tiktoken for OpenAI).
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The message to estimate
-    ///
-    /// # Returns
-    ///
-    /// Estimated token count.
+    /// Returns the short name of the active token estimator
+    /// (e.g., `"char-ratio"`, `"cl100k_base"`).
     #[must_use]
-    pub fn estimate_tokens(&self, message: &Message) -> usize {
-        let char_count = message.content.len();
-
-        // Add overhead for role and formatting
-        let role_overhead = 4; // Approximate tokens for role marker
-
-        let content_tokens = (char_count as f32 * self.config.tokens_per_char).ceil() as usize;
-
-        content_tokens + role_overhead
+    pub fn estimator_name(&self) -> &'static str {
+        self.estimator.name()
     }
 
-    /// Estimates the token count for a string.
+    /// Estimates the token count for a message, including role framing.
+    #[must_use]
+    pub fn estimate_tokens(&self, message: &Message) -> usize {
+        self.estimator.estimate_message(message)
+    }
+
+    /// Estimates the token count for a bare string (no role framing).
     #[must_use]
     pub fn estimate_string_tokens(&self, text: &str) -> usize {
-        (text.len() as f32 * self.config.tokens_per_char).ceil() as usize
+        self.estimator.estimate_string(text)
     }
 
     /// Estimates total tokens for a list of messages.
@@ -760,5 +891,66 @@ mod tests {
     fn truncation_strategy_default() {
         let strategy = TruncationStrategy::default();
         assert_eq!(strategy, TruncationStrategy::KeepRecent);
+    }
+
+    // -------------------------------------------------------------------------
+    // Token Estimator Tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn char_ratio_estimator_matches_legacy_formula() {
+        // 100 chars * 0.25 = 25 content tokens + 4 role overhead = 29
+        let estimator = CharRatioEstimator::new(0.25);
+        let m = msg(MessageRole::User, &"a".repeat(100));
+        assert_eq!(estimator.estimate_message(&m), 29);
+        assert_eq!(estimator.estimate_string(&"a".repeat(100)), 25);
+    }
+
+    #[test]
+    fn tiktoken_estimator_for_openai_model() {
+        let est = TiktokenEstimator::for_model("gpt-4o");
+        assert_eq!(est.encoding_name(), "o200k_base");
+        // Non-zero token count for non-empty content.
+        let m = msg(MessageRole::User, "hello world");
+        assert!(est.estimate_message(&m) > ROLE_OVERHEAD_TOKENS);
+    }
+
+    #[test]
+    fn tiktoken_estimator_falls_back_for_unknown_model() {
+        // Ollama-style model names aren't registered with tiktoken; the
+        // estimator must fall through to cl100k_base instead of panicking.
+        let est = TiktokenEstimator::for_model("qwen2.5:7b");
+        assert_eq!(est.encoding_name(), "cl100k_base");
+        let m = msg(MessageRole::User, "hello");
+        assert!(est.estimate_message(&m) > ROLE_OVERHEAD_TOKENS);
+    }
+
+    #[test]
+    fn context_window_with_tiktoken_estimator_names_encoding() {
+        let cw = ContextWindow::default()
+            .with_estimator(Arc::new(TiktokenEstimator::for_model("gpt-4o")));
+        assert_eq!(cw.estimator_name(), "o200k_base");
+    }
+
+    #[test]
+    fn fit_messages_keeps_newest_with_keep_recent() {
+        // Budget sized to hold only the last message.
+        let cfg = ContextWindowConfig {
+            max_tokens: 50,
+            truncation_strategy: TruncationStrategy::KeepRecent,
+            reserved_for_response: 10,
+            tokens_per_char: 0.25,
+        };
+        let cw = ContextWindow::new(cfg);
+
+        let messages = vec![
+            msg(MessageRole::User, &"old".repeat(60)),    // ~49 tokens — too big
+            msg(MessageRole::Assistant, &"mid".repeat(60)),
+            msg(MessageRole::User, "new"),                 // tiny, should survive
+        ];
+
+        let fitted = cw.fit_messages(&messages);
+        assert!(!fitted.is_empty(), "at least the newest must survive");
+        assert_eq!(fitted.last().unwrap().content, "new");
     }
 }

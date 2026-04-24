@@ -289,6 +289,9 @@ struct HandlerState {
     exit_tool_enabled: Arc<AtomicBool>,
     system_prompt_rx: watch::Receiver<Option<String>>,
     system_prompt_tx: watch::Sender<Option<String>>,
+    /// Optional truncator applied to `history.clone()` before each LLM call.
+    /// `None` means unbounded history (explicit opt-out at build time).
+    context_window: Option<crate::memory::ContextWindow>,
 }
 
 /// Registers all message handlers on the `ConversationActor` builder.
@@ -302,6 +305,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         exit_tool_enabled,
         system_prompt_rx,
         system_prompt_tx,
+        context_window,
     } = state;
     // ----- ConvSend: push user msg, run LLM call, await it -----
     {
@@ -312,6 +316,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         let exit_requested = exit_requested.clone();
         let exit_tool_enabled = exit_tool_enabled.clone();
         let system_prompt_rx = system_prompt_rx.clone();
+        let context_window = context_window.clone();
 
         builder.mutate_on::<ConvSend>(move |actor, ctx| {
             let msg = ctx.message().clone();
@@ -325,6 +330,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
 
             // Clone everything for the async block
             let history = actor.model.history.clone();
+            let history = fit_history_for_request(&context_window, history);
             let system_prompt = system_prompt_rx.borrow().clone();
             let runtime = runtime.clone();
             let exit_requested = exit_requested.clone();
@@ -929,6 +935,10 @@ pub struct ConversationBuilder {
     history: Vec<Message>,
     /// Whether to enable the built-in exit tool
     exit_tool_enabled: bool,
+    /// Override for the per-turn context window. `Some(None)` = explicit
+    /// opt-out; `Some(Some(cw))` = explicit override; `None` = inherit
+    /// from the runtime at [`build`](Self::build).
+    context_window_override: Option<Option<crate::memory::ContextWindow>>,
 }
 
 impl ConversationBuilder {
@@ -939,6 +949,7 @@ impl ConversationBuilder {
             system_prompt: None,
             history: Vec::new(),
             exit_tool_enabled: false,
+            context_window_override: None,
         }
     }
 
@@ -981,6 +992,26 @@ impl ConversationBuilder {
     #[must_use]
     pub fn restore(mut self, messages: impl IntoIterator<Item = Message>) -> Self {
         self.history = messages.into_iter().collect();
+        self
+    }
+
+    /// Overrides the per-turn context window for this conversation.
+    ///
+    /// When unset, the conversation inherits
+    /// [`ActonAI::context_window`](crate::facade::ActonAI::context_window).
+    #[must_use]
+    pub fn context_window(mut self, window: crate::memory::ContextWindow) -> Self {
+        self.context_window_override = Some(Some(window));
+        self
+    }
+
+    /// Disables per-turn history truncation for this conversation.
+    ///
+    /// Overrides any runtime-wide context window; the full history is shipped
+    /// on every call.
+    #[must_use]
+    pub fn without_context_window(mut self) -> Self {
+        self.context_window_override = Some(None);
         self
     }
 
@@ -1056,6 +1087,13 @@ impl ConversationBuilder {
     pub async fn build(self) -> Conversation {
         let initial_history = self.history;
 
+        // Resolve the context window: explicit builder override wins, else
+        // inherit whatever the runtime was launched with.
+        let context_window = match self.context_window_override {
+            Some(override_value) => override_value,
+            None => self.runtime.context_window().cloned(),
+        };
+
         // Create watch channels with initial values
         let (history_tx, history_rx) = watch::channel(initial_history.clone());
         let (system_prompt_tx, system_prompt_rx) = watch::channel(self.system_prompt);
@@ -1085,6 +1123,7 @@ impl ConversationBuilder {
                 exit_tool_enabled: exit_tool_enabled.clone(),
                 system_prompt_rx: system_prompt_rx.clone(),
                 system_prompt_tx,
+                context_window,
             },
         );
 
@@ -1174,6 +1213,33 @@ impl std::fmt::Debug for ConversationBuilder {
     }
 }
 
+/// Applies the optional context-window truncator to `history` before the LLM
+/// call. Emits a `warn!` when messages are actually dropped so operators can
+/// see truncation happening in `-v` output. Returns the history to send.
+fn fit_history_for_request(
+    cw: &Option<crate::memory::ContextWindow>,
+    history: Vec<Message>,
+) -> Vec<Message> {
+    let Some(cw) = cw else {
+        return history;
+    };
+    let before_len = history.len();
+    let fitted = cw.fit_messages(&history);
+    if fitted.len() < before_len {
+        let before_tok = cw.estimate_total_tokens(&history);
+        let after_tok = cw.estimate_total_tokens(&fitted);
+        tracing::warn!(
+            dropped_messages = before_len - fitted.len(),
+            dropped_tokens = before_tok.saturating_sub(after_tok),
+            kept_messages = fitted.len(),
+            kept_tokens = after_tok,
+            max_tokens = cw.config().max_tokens,
+            "truncated conversation history to fit context window",
+        );
+    }
+    fitted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1261,5 +1327,44 @@ mod tests {
     fn default_system_prompt_is_sensible() {
         assert!(DEFAULT_SYSTEM_PROMPT.contains("helpful"));
         assert!(DEFAULT_SYSTEM_PROMPT.contains("exit_conversation"));
+    }
+
+    #[test]
+    fn fit_history_none_passes_through_unchanged() {
+        let history = vec![
+            Message::user("one"),
+            Message::assistant("two"),
+            Message::user("three"),
+        ];
+        let out = fit_history_for_request(&None, history.clone());
+        assert_eq!(out.len(), history.len());
+    }
+
+    #[test]
+    fn fit_history_truncates_when_over_budget() {
+        use crate::memory::{ContextWindow, ContextWindowConfig, TruncationStrategy};
+
+        let cfg = ContextWindowConfig {
+            max_tokens: 50,
+            truncation_strategy: TruncationStrategy::KeepRecent,
+            reserved_for_response: 10,
+            tokens_per_char: 0.25,
+        };
+        let cw = Some(ContextWindow::new(cfg));
+
+        // Three fat messages, total ~150+ tokens; budget 40.
+        let history = vec![
+            Message::user("a".repeat(120)),
+            Message::assistant("b".repeat(120)),
+            Message::user("new"),
+        ];
+
+        let out = fit_history_for_request(&cw, history);
+        assert!(out.len() < 3, "expected truncation");
+        assert_eq!(
+            out.last().unwrap().content,
+            "new",
+            "newest message must survive",
+        );
     }
 }

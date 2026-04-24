@@ -179,6 +179,94 @@ let response = conv.send("Tell me more about its memory model.").await?;
 
 ---
 
+## Context window management
+
+Every turn of a `Conversation` sends the **entire accumulated history** to the LLM. Without bounds, a long-lived session eventually exceeds the provider's context window and fails at the model boundary, and token cost per turn grows linearly with session length.
+
+By default, acton-ai truncates the history on each turn to fit a configurable token budget using the `KeepRecent` strategy — the newest user message is always kept; older turns are dropped until everything fits. The system prompt is carried out-of-band by the prompt builder and is never subject to truncation.
+
+### Default budget
+
+The runtime resolves the budget at `launch()` time with this precedence:
+
+1. Per-provider `context_window_tokens` for the default provider (if set).
+2. Global `[context] max_tokens` in `acton-ai.toml`.
+3. Built-in default of 8192 tokens (with 1024 reserved for the response).
+
+The default token estimator is `tiktoken-rs`: `o200k_base` for GPT-4o / o-series models, `cl100k_base` for GPT-4 / GPT-3.5, and `cl100k_base` as a fallback for Anthropic and Ollama models (accurate ±10% — sufficient for budgeting).
+
+### Configuring via TOML
+
+```toml
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+context_window_tokens = 32000    # native limit for this model
+
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+context_window_tokens = 200000   # Claude's native limit
+
+[context]
+max_tokens = 8192                # fallback when provider doesn't set it
+reserved_for_response = 1024
+strategy = "keep-recent"         # "keep-recent" | "keep-system-and-recent" | "keep-ends"
+```
+
+### Overriding or opting out in code
+
+```rust
+use acton_ai::prelude::*;
+use acton_ai::memory::{ContextWindow, ContextWindowConfig, TruncationStrategy};
+
+// Custom window for the whole runtime
+let cw = ContextWindow::new(
+    ContextWindowConfig {
+        max_tokens: 16_384,
+        truncation_strategy: TruncationStrategy::KeepEnds,
+        reserved_for_response: 2048,
+        tokens_per_char: 0.25,
+    }
+);
+
+let runtime = ActonAI::builder()
+    .app_name("my-app")
+    .ollama("qwen2.5:7b")
+    .context_window(cw)
+    .launch()
+    .await?;
+
+// Or opt out entirely (unbounded history per turn — the pre-wiring behavior)
+let runtime = ActonAI::builder()
+    .app_name("my-app")
+    .ollama("qwen2.5:7b")
+    .without_context_window()
+    .launch()
+    .await?;
+```
+
+Per-`Conversation` overrides work the same way:
+
+```rust
+let conv = runtime.conversation()
+    .system("You are brief.")
+    .without_context_window()    // this conversation ships full history
+    .build()
+    .await;
+```
+
+### Observing truncation
+
+When history is actually clipped, a `tracing::warn!` fires once per turn with the drop counts. With `-v` on the CLI:
+
+```text
+WARN acton_ai::conversation: truncated conversation history to fit context window
+    dropped_messages=12 dropped_tokens=4231 kept_messages=8 kept_tokens=7801 max_tokens=8192
+```
+
+---
+
 ## System prompt management
 
 ### Setting the system prompt at build time

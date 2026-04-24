@@ -154,6 +154,13 @@ pub(crate) struct ActonAIInner {
     /// Resolved at launch from the cascade:
     /// `DEFAULT_MAX_TOOL_ROUNDS → [defaults] TOML → builder override`.
     pub(crate) default_max_tool_rounds: usize,
+    /// Default context window applied to every [`Conversation`](crate::conversation::Conversation).
+    ///
+    /// Resolved at launch from the cascade:
+    /// per-provider `context_window_tokens` → `[context] max_tokens` → 8192.
+    /// `None` means unbounded history (explicit opt-out via
+    /// [`ActonAIBuilder::without_context_window`]).
+    pub(crate) context_window: Option<crate::memory::ContextWindow>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -347,6 +354,15 @@ impl ActonAI {
     #[must_use]
     pub fn skills(&self) -> Option<&Arc<crate::skills::SkillRegistry>> {
         self.inner.skills.as_ref()
+    }
+
+    /// Returns the default context window applied to every
+    /// [`Conversation`](crate::conversation::Conversation) built from this
+    /// runtime. `None` indicates the runtime was launched with
+    /// [`without_context_window`](ActonAIBuilder::without_context_window).
+    #[must_use]
+    pub fn context_window(&self) -> Option<&crate::memory::ContextWindow> {
+        self.inner.context_window.as_ref()
     }
 
     /// Returns the sandbox factory shared by sandboxed builtin tool calls.
@@ -564,6 +580,20 @@ pub struct ActonAIBuilder {
     /// in the TOML, else fall back to
     /// [`DEFAULT_MAX_TOOL_ROUNDS`](crate::prompt::DEFAULT_MAX_TOOL_ROUNDS)".
     default_max_tool_rounds: Option<usize>,
+    /// Context-window settings loaded from `[context]` in the TOML via
+    /// [`apply_config`](Self::apply_config).
+    context_config: Option<crate::config::ContextFileConfig>,
+    /// Explicit [`ContextWindow`](crate::memory::ContextWindow) override set
+    /// via [`context_window`](Self::context_window). Wins over config cascade
+    /// at launch.
+    context_window_override: Option<crate::memory::ContextWindow>,
+    /// Set by [`without_context_window`](Self::without_context_window) to
+    /// explicitly disable per-turn truncation for [`Conversation`].
+    context_window_disabled: bool,
+    /// Per-provider native context window, captured from `[providers.<name>].context_window_tokens`
+    /// during [`apply_config`](Self::apply_config). At launch the entry for the
+    /// resolved default provider wins over the global `[context] max_tokens`.
+    context_window_per_provider: HashMap<String, usize>,
 }
 
 impl ActonAIBuilder {
@@ -647,6 +677,31 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Installs an explicit [`ContextWindow`](crate::memory::ContextWindow).
+    ///
+    /// Wins over the per-provider and config-file cascade at
+    /// [`launch`](Self::launch). Useful when the caller has a pre-built
+    /// window with a custom [`TokenEstimator`](crate::memory::TokenEstimator).
+    #[must_use]
+    pub fn context_window(mut self, window: crate::memory::ContextWindow) -> Self {
+        self.context_window_override = Some(window);
+        self.context_window_disabled = false;
+        self
+    }
+
+    /// Disables automatic per-turn history truncation in
+    /// [`Conversation`](crate::conversation::Conversation).
+    ///
+    /// Every turn will ship the full accumulated history — the pre-wiring
+    /// behavior. Use for workloads where you've prepared the history yourself
+    /// or are running against a provider with unbounded context.
+    #[must_use]
+    pub fn without_context_window(mut self) -> Self {
+        self.context_window_disabled = true;
+        self.context_window_override = None;
+        self
+    }
+
     /// Loads provider configurations from a config file.
     ///
     /// This searches for configuration in the following order:
@@ -720,6 +775,9 @@ impl ActonAIBuilder {
     pub fn apply_config(mut self, config: ActonAIConfig) -> Result<Self, ActonAIError> {
         // Convert and add each provider
         for (name, provider_config) in config.providers {
+            if let Some(tokens) = provider_config.context_window_tokens {
+                self.context_window_per_provider.insert(name.clone(), tokens);
+            }
             let runtime_config = provider_config.to_provider_config();
             self.providers.insert(name, runtime_config);
         }
@@ -747,6 +805,12 @@ impl ActonAIBuilder {
         // above). Builder-stage paths come first; config-stage paths append.
         if let Some(skills_cfg) = config.skills {
             self.skill_paths.extend(skills_cfg.paths);
+        }
+
+        // Stash `[context]` settings — resolved at launch after the default
+        // provider is known so per-provider overrides can win.
+        if let Some(context_cfg) = config.context {
+            self.context_config = Some(context_cfg);
         }
 
         Ok(self)
@@ -1131,7 +1195,7 @@ impl ActonAIBuilder {
     ///     .launch()
     ///     .await?;
     /// ```
-    pub async fn launch(self) -> Result<ActonAI, ActonAIError> {
+    pub async fn launch(mut self) -> Result<ActonAI, ActonAIError> {
         // Validate we have at least one provider
         if self.providers.is_empty() {
             return Err(ActonAIError::new(ActonAIErrorKind::Configuration {
@@ -1140,8 +1204,15 @@ impl ActonAIBuilder {
             }));
         }
 
-        // Determine the default provider name
+        // Determine the default provider name + capture its model for later
+        // context-window resolution (the HashMap gets consumed in the spawn
+        // loop below).
         let default_provider_name = self.resolve_default_provider_name()?;
+        let default_provider_model = self
+            .providers
+            .get(&default_provider_name)
+            .map(|p| p.model.clone())
+            .unwrap_or_default();
 
         let app_name = self.app_name.unwrap_or_else(|| "acton-ai".to_string());
 
@@ -1221,6 +1292,14 @@ impl ActonAIBuilder {
             Some(Arc::new(registry))
         };
 
+        let context_window = resolve_context_window(
+            self.context_window_override.take(),
+            self.context_window_disabled,
+            self.context_config.as_ref(),
+            self.context_window_per_provider.get(&default_provider_name).copied(),
+            &default_provider_model,
+        );
+
         Ok(ActonAI {
             inner: Arc::new(ActonAIInner {
                 runtime,
@@ -1231,6 +1310,7 @@ impl ActonAIBuilder {
                 skills,
                 sandbox_factory,
                 default_max_tool_rounds,
+                context_window,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
@@ -1284,6 +1364,73 @@ impl ActonAIBuilder {
     pub fn is_auto_builtins(&self) -> bool {
         self.auto_builtins
     }
+}
+
+/// Resolves the runtime [`ContextWindow`] at [`ActonAIBuilder::launch`] time.
+///
+/// Precedence (highest to lowest):
+/// 1. `builder.context_window_override` (explicit API call).
+/// 2. `builder.context_window_disabled` (explicit opt-out) → `None`.
+/// 3. Per-provider `context_window_tokens` for the default provider.
+/// 4. `[context] max_tokens` from TOML.
+/// 5. [`ContextWindowConfig::default`] (8192).
+///
+/// The estimator is selected from the default provider's model name via
+/// [`TiktokenEstimator::for_model`], which falls back to `cl100k_base` for
+/// unknown models.
+fn resolve_context_window(
+    override_window: Option<crate::memory::ContextWindow>,
+    disabled: bool,
+    context_config: Option<&crate::config::ContextFileConfig>,
+    per_provider_tokens: Option<usize>,
+    default_provider_model: &str,
+) -> Option<crate::memory::ContextWindow> {
+    use crate::memory::{
+        ContextWindow, ContextWindowConfig, TiktokenEstimator, TokenEstimator,
+        TruncationStrategy,
+    };
+
+    if let Some(window) = override_window {
+        return Some(window);
+    }
+    if disabled {
+        return None;
+    }
+
+    let default_cfg = ContextWindowConfig::default();
+
+    let max_tokens = per_provider_tokens
+        .or_else(|| context_config.and_then(|c| c.max_tokens))
+        .unwrap_or(default_cfg.max_tokens);
+
+    let reserved_for_response = context_config
+        .and_then(|c| c.reserved_for_response)
+        .unwrap_or(default_cfg.reserved_for_response);
+
+    let strategy = context_config
+        .and_then(|c| c.strategy.as_deref())
+        .and_then(crate::config::parse_truncation_strategy)
+        .unwrap_or(TruncationStrategy::KeepRecent);
+
+    let config = ContextWindowConfig {
+        max_tokens,
+        truncation_strategy: strategy,
+        reserved_for_response,
+        tokens_per_char: default_cfg.tokens_per_char,
+    };
+
+    let estimator: Arc<dyn TokenEstimator> =
+        Arc::new(TiktokenEstimator::for_model(default_provider_model));
+
+    let window = ContextWindow::new(config).with_estimator(estimator);
+    tracing::info!(
+        max_tokens = window.config().max_tokens,
+        reserved_for_response = window.config().reserved_for_response,
+        strategy = ?window.config().truncation_strategy,
+        estimator = window.estimator_name(),
+        "context window resolved",
+    );
+    Some(window)
 }
 
 #[cfg(test)]

@@ -57,7 +57,10 @@ pub mod persistence;
 mod store;
 
 // Re-export context window types
-pub use context::{ContextStats, ContextWindow, ContextWindowConfig, TruncationStrategy};
+pub use context::{
+    CharRatioEstimator, ContextStats, ContextWindow, ContextWindowConfig, TiktokenEstimator,
+    TokenEstimator, TruncationStrategy,
+};
 
 // Re-export embedding types
 pub use embeddings::{

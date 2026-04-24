@@ -120,6 +120,16 @@ impl CliRuntime {
 
         let ai = builder.launch().await?;
         let db_path = resolve_db_path(config_path);
+        tracing::info!(
+            default_provider = %ai.default_provider_name(),
+            provider_count = ai.provider_count(),
+            max_tool_rounds = ai.default_max_tool_rounds(),
+            skills_loaded = ai.skills().map(|r| r.len()).unwrap_or(0),
+            context_max_tokens = ai.context_window().map(|c| c.config().max_tokens).unwrap_or(0),
+            context_estimator = ai.context_window().map(|c| c.estimator_name()).unwrap_or("disabled"),
+            db_path = %db_path,
+            "runtime launched",
+        );
 
         Ok(Self { ai, db_path })
     }

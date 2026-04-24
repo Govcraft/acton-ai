@@ -215,6 +215,24 @@ presence_penalty = 0.3
 Parameters not supported by a provider are silently ignored. For example, setting `top_k` on an OpenAI provider has no effect. This lets you share a `SamplingParams` across providers without errors.
 {% /callout %}
 
+## Context window size
+
+Models have very different native context limits: qwen2.5:7b is ~32k, gpt-4o is 128k, claude-sonnet-4 is 200k. Each provider section accepts a `context_window_tokens` field that sets the per-turn history budget applied by `Conversation`:
+
+```toml
+[providers.ollama]
+type = "ollama"
+model = "qwen2.5:7b"
+context_window_tokens = 32000
+
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+context_window_tokens = 200000
+```
+
+When set, this value wins over the global `[context] max_tokens` fallback. Leave it off to let the global setting apply. See [Conversation management → Context window management](/docs/conversation-management#context-window-management) for full details on truncation strategy, token estimation, and opt-out.
+
 ## Rate limiting configuration
 
 Each provider has its own rate limiter. The default settings match Anthropic's Tier 1 limits:
