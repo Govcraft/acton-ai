@@ -94,9 +94,9 @@ pub mod prelude {
     };
     pub use crate::error::{AgentError, KernelError, MultiAgentError, MultiAgentErrorKind};
     pub use crate::kernel::{
-        get_log_dir, init_and_store_logging, init_file_logging, CapabilityRegistry, InitKernel,
-        Kernel, KernelConfig, KernelMetrics, LogLevel, LoggingConfig, LoggingError,
-        LoggingErrorKind, LoggingGuard,
+        init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,
+        CapabilityRegistry, InitKernel, Kernel, KernelConfig, KernelMetrics, LogLevel,
+        LoggingConfig, LoggingError, LoggingErrorKind,
     };
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,

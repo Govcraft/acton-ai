@@ -69,6 +69,8 @@ pub enum Commands {
 ///
 /// Returns the process exit code.
 pub async fn run(cli: Cli) -> i32 {
+    runtime::init_tracing(cli.verbose, cli.quiet);
+
     let mode = if cli.json {
         OutputMode::Json
     } else {

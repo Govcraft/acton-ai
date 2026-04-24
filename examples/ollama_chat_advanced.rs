@@ -54,15 +54,12 @@ async fn main() -> anyhow::Result<()> {
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
 
-    // Spawn the kernel with custom app name for logs
+    // Spawn the kernel with custom app name for journald identification
     let kernel_config = KernelConfig::default().with_app_name("ollama-chat-advanced");
     let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
 
-    // Get and display the log directory
-    let log_config = LoggingConfig::default().with_app_name("ollama-chat-advanced");
-    if let Ok(log_dir) = get_log_dir(&log_config) {
-        eprintln!("Logs being written to: {}", log_dir.display());
-    }
+    eprintln!("Logs sent to systemd-journald under SYSLOG_IDENTIFIER=ollama-chat-advanced");
+    eprintln!("Tail with: journalctl -t ollama-chat-advanced -f");
 
     tracing::info!("Starting advanced Ollama chat example...");
 

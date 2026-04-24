@@ -84,15 +84,15 @@ pub async fn execute(
     let conn = rt.connection().await?;
     let session = persistence::resolve_session(&conn, &session_name).await?;
 
-    let (conversation_id, system_prompt) = if let Some(info) = session {
-        (info.conversation_id, info.system_prompt)
+    let (conversation_id, system_prompt, session_origin) = if let Some(info) = session {
+        (info.conversation_id, info.system_prompt, "resumed")
     } else if args.create || session_name == "main" {
         // Auto-create for "main" or when --create is specified
         let agent_id = AgentId::new();
         let system = args.system.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let conv_id =
             persistence::create_session(&conn, &session_name, &agent_id, Some(system)).await?;
-        (conv_id, Some(system.to_string()))
+        (conv_id, Some(system.to_string()), "created")
     } else {
         return Err(CliError::session_not_found(&session_name));
     };
@@ -102,11 +102,27 @@ pub async fn execute(
 
     // Determine system prompt — CLI flag wins, then whatever was persisted
     // on the session, then the library-canonical default.
-    let system = args
-        .system
-        .clone()
-        .or(system_prompt)
-        .unwrap_or_else(|| DEFAULT_SYSTEM_PROMPT.to_string());
+    let (system, system_source) = if let Some(s) = args.system.clone() {
+        (s, "cli-flag")
+    } else if let Some(s) = system_prompt {
+        (s, "session-persisted")
+    } else {
+        (DEFAULT_SYSTEM_PROMPT.to_string(), "default")
+    };
+
+    tracing::info!(
+        session = %session_name,
+        origin = %session_origin,
+        conversation_id = %conversation_id,
+        history_len = history.len(),
+        "chat session resolved",
+    );
+    tracing::info!(
+        source = %system_source,
+        len = system.len(),
+        prompt = %system,
+        "system prompt",
+    );
 
     // Build the Conversation
     let conv = rt
@@ -122,6 +138,12 @@ pub async fn execute(
 
     match message {
         Some(msg) => {
+            tracing::info!(
+                mode = "single-shot",
+                len = msg.len(),
+                preview = %preview(&msg, 120),
+                "sending message",
+            );
             // Single-shot mode: send one message and output response
             let response = conv.send(&msg).await?;
 
@@ -153,6 +175,7 @@ pub async fn execute(
                 return Err(CliError::no_input());
             }
 
+            tracing::info!(mode = "interactive", "entering chat loop");
             // Run interactive chat loop
             // The Conversation::run_chat_with already handles stdin/stdout
             let chat_config = crate::conversation::ChatConfig::new()
@@ -172,6 +195,17 @@ pub async fn execute(
 
     rt.shutdown().await?;
     Ok(())
+}
+
+/// Truncate `s` to `max` chars for log previews, appending `…` when cut.
+fn preview(s: &str, max: usize) -> String {
+    let compact = s.replace('\n', " ");
+    if compact.chars().count() <= max {
+        compact
+    } else {
+        let cut: String = compact.chars().take(max).collect();
+        format!("{cut}…")
+    }
 }
 
 /// Resolve the user's message from --message flag or stdin.

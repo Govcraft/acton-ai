@@ -13,6 +13,6 @@ pub use actor::{InitKernel, Kernel, KernelMetrics};
 pub use config::KernelConfig;
 pub use discovery::CapabilityRegistry;
 pub use logging::{
-    get_log_dir, init_and_store_logging, init_file_logging, LogLevel, LoggingConfig, LoggingError,
-    LoggingErrorKind, LoggingGuard,
+    init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,
+    LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
 };

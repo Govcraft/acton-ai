@@ -37,17 +37,68 @@ impl CliRuntime {
         provider_override: Option<&str>,
         skill_paths: &[PathBuf],
     ) -> Result<Self, CliError> {
-        // Load config — try explicit path first, then default search paths
-        let loaded_config = if let Some(path) = config_path {
-            Some(config::from_path(path).map_err(|e| {
+        // Load config — try explicit path first, then default search paths.
+        // Track the source path so we can log it at info level for operators
+        // trying to understand which file wins.
+        let (loaded_config, resolved_config_path) = if let Some(path) = config_path {
+            let cfg = config::from_path(path).map_err(|e| {
                 CliError::configuration(format!(
                     "failed to load config from {}: {e}",
                     path.display()
                 ))
-            })?)
+            })?;
+            (Some(cfg), Some(path.clone()))
         } else {
-            config::load().ok()
+            let found = config::search_paths().into_iter().find(|p| p.exists());
+            match &found {
+                Some(p) => (Some(config::from_path(p).map_err(|e| {
+                    CliError::configuration(format!("failed to load config from {}: {e}", p.display()))
+                })?), found.clone()),
+                None => (None, None),
+            }
         };
+
+        match &resolved_config_path {
+            Some(p) => tracing::info!(path = %p.display(), "loaded config"),
+            None => tracing::info!("no config file found; using defaults"),
+        }
+
+        if let Some(cfg) = &loaded_config {
+            for (name, p) in &cfg.providers {
+                tracing::info!(
+                    provider = %name,
+                    provider_type = %p.provider_type,
+                    model = %p.model,
+                    base_url = %p.base_url.as_deref().unwrap_or(""),
+                    "provider configured",
+                );
+            }
+            if let Some(default) = &cfg.default_provider {
+                let model = cfg
+                    .providers
+                    .get(default)
+                    .map(|p| p.model.as_str())
+                    .unwrap_or("?");
+                tracing::info!(
+                    default_provider = %default,
+                    model = %model,
+                    "config default provider",
+                );
+            }
+        }
+
+        if let Some(provider) = provider_override {
+            tracing::info!(provider = %provider, "provider override from CLI");
+        }
+        if !skill_paths.is_empty() {
+            tracing::info!(
+                count = skill_paths.len(),
+                "skill paths from CLI",
+            );
+            for p in skill_paths {
+                tracing::debug!(path = %p.display(), "skill path");
+            }
+        }
 
         let mut builder = ActonAI::builder().app_name("acton-ai");
 
@@ -115,7 +166,14 @@ pub(crate) fn resolve_db_path(config_path: Option<&PathBuf>) -> String {
     "acton-ai.db".to_string()
 }
 
-/// Initialize tracing to stderr with the given verbosity.
+/// Initialize tracing with the given verbosity.
+///
+/// Composes two layers into a single subscriber:
+/// - stderr (human-readable, colorized when attached to a TTY)
+/// - journald (on Linux hosts with a running systemd-journald socket)
+///
+/// After installation, marks the kernel's logging sentinel so
+/// `Kernel::spawn_with_config` does not race to install its own subscriber.
 ///
 /// - quiet: suppress all output
 /// - verbosity 0: warn only
@@ -133,15 +191,23 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
 
     let use_ansi = std::io::stderr().is_terminal() && OutputWriter::use_colors();
 
-    // Use try_init to avoid panic if a subscriber is already set
-    let _ = tracing_subscriber::registry()
-        .with(
-            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
-        )
-        .with(
-            tracing_subscriber::fmt::layer()
-                .with_writer(std::io::stderr)
-                .with_ansi(use_ansi),
-        )
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| filter.into());
+
+    let stderr_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_ansi(use_ansi);
+
+    let journald_cfg = crate::kernel::LoggingConfig::default();
+    let journald = crate::kernel::journald_layer(&journald_cfg);
+
+    let result = tracing_subscriber::registry()
+        .with(env_filter)
+        .with(stderr_layer)
+        .with(journald)
         .try_init();
+
+    if result.is_ok() {
+        crate::kernel::mark_subscriber_installed();
+    }
 }

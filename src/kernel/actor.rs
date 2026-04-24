@@ -86,25 +86,23 @@ impl Kernel {
         runtime: &mut ActorRuntime,
         config: KernelConfig,
     ) -> ActorHandle {
-        // Initialize file logging before any tracing calls
+        // Install journald logging if no other subscriber has claimed the
+        // global slot yet. Non-Linux hosts and environments without a
+        // journald socket silently fall through — the caller is expected to
+        // install their own subscriber (e.g. the CLI's stderr layer).
         if let Some(ref logging_config) = config.logging {
             match init_and_store_logging(logging_config) {
                 Ok(true) => {
-                    // Logging initialized successfully - log to the file
-                    if let Ok(log_dir) = crate::kernel::logging::get_log_dir(logging_config) {
-                        tracing::info!(
-                            log_dir = %log_dir.display(),
-                            app_name = %logging_config.app_name,
-                            "File logging initialized"
-                        );
-                    }
+                    tracing::info!(
+                        app_name = %logging_config.app_name,
+                        "Journald logging initialized"
+                    );
                 }
                 Ok(false) => {
-                    // Logging disabled or already initialized - nothing to do
+                    // Disabled, already installed, or journald unavailable — nothing to do.
                 }
                 Err(e) => {
-                    // Log to stderr since file logging failed
-                    eprintln!("Warning: file logging initialization failed: {e}");
+                    eprintln!("Warning: journald logging initialization failed: {e}");
                 }
             }
         }
