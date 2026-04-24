@@ -10,6 +10,7 @@ pub mod banner;
 pub mod slash;
 pub mod spinner;
 pub mod style;
+pub mod tool_render;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +23,7 @@ use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline,
 use crate::conversation::{Conversation, StreamToken};
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
-use crate::messages::Message;
+use crate::messages::{LLMStreamToolCall, Message};
 
 use self::style::Theme;
 
@@ -84,11 +85,17 @@ pub async fn run(
     let theme = Theme::resolve();
     let spinner_slot: SpinnerSlot = Arc::new(Mutex::new(None));
 
-    // Token-rendering actor. Same pattern as the previous inline printer in
-    // `Conversation::run_chat_with`, lifted here so the spinner can be
-    // dismissed the moment the first token arrives.
+    // Chat-UI actor.
+    //
+    // Receives three kinds of events:
+    //   * `StreamToken` (sent directly by the conversation's send_streaming
+    //     path) — writes the token to stdout and dismisses any active
+    //     spinner on first arrival.
+    //   * `LLMStreamToolCall` (broadcast by the LLM provider) — renders a
+    //     dim bracketed line so the user sees which tools ran.
     let mut actor_runtime = ai.runtime().clone();
     let mut token_actor = actor_runtime.new_actor::<ChatUiActor>();
+
     let slot_for_actor = spinner_slot.clone();
     token_actor.mutate_on::<StreamToken>(move |_actor, ctx| {
         // Mutex contention is limited to the first token per turn — on
@@ -101,6 +108,28 @@ pub async fn run(
         std::io::stdout().flush().ok();
         Reply::ready()
     });
+
+    let theme_for_tool = theme.clone();
+    let slot_for_tool = spinner_slot.clone();
+    token_actor.mutate_on::<LLMStreamToolCall>(move |_actor, ctx| {
+        // Stop the spinner (tools fire after initial tokens may have streamed
+        // or, for tools-first turns, before any tokens) so the inline line
+        // isn't overlapped by the spinner animation.
+        if let Some(pb) = take_spinner(&slot_for_tool) {
+            pb.finish_and_clear();
+        }
+        tool_render::render_tool_call(&ctx.message().tool_call, &theme_for_tool);
+        Reply::ready()
+    });
+
+    // Subscribe to broadcast events BEFORE starting. `StreamToken` is sent
+    // point-to-point via the handle returned below, so it doesn't need a
+    // broadcast subscription.
+    token_actor
+        .handle()
+        .subscribe::<LLMStreamToolCall>()
+        .await;
+
     let token_handle = token_actor.start().await;
 
     let mut editor = build_editor(history_path.as_deref());
