@@ -77,6 +77,16 @@ pub enum Commands {
 
     /// Manage persistent sessions (list, show, delete).
     Session(commands::session::SessionArgs),
+
+    /// Show the resolved configuration file and effective values.
+    #[command(long_about = "Display which configuration file the CLI loaded (or \
+                            was overridden to load via --config), the full search \
+                            order with a marker on the matching path, the database \
+                            path, and every effective value after merging config \
+                            and CLI overrides. API keys set directly in the TOML \
+                            are redacted; keys sourced from environment variables \
+                            show only the variable name and whether it's set.")]
+    Config(commands::config::ConfigArgs),
 }
 
 /// Run the CLI with the parsed arguments.
@@ -106,6 +116,7 @@ pub async fn run(cli: Cli) -> i32 {
         Commands::Session(args) => {
             commands::session::execute(args, &output, config_path, provider).await
         }
+        Commands::Config(args) => commands::config::execute(args, &output, config_path, provider),
     };
 
     match result {
