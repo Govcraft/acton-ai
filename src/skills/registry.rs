@@ -85,13 +85,42 @@ impl SkillRegistry {
 
         // Convert to our LoadedSkill type
         let loaded = convert_skill(skill, path);
+        tracing::debug!(
+            name = %loaded.info.name,
+            description = %loaded.info.description,
+            path = %path.display(),
+            "skill loaded",
+        );
         self.skills.insert(loaded.info.name.clone(), loaded);
 
         Ok(())
     }
 
     /// Recursively loads skills from a directory.
+    ///
+    /// Honors the `agent-skills` package convention: a directory containing a
+    /// `SKILL.md` file IS a single skill package, with sibling `references/`,
+    /// `scripts/`, and `assets/` directories treated as supporting material
+    /// rather than additional skills. In that case only `SKILL.md` is loaded
+    /// and recursion stops.
+    ///
+    /// For directories without a `SKILL.md` (e.g. a directory-of-skills layout
+    /// like `~/.claude/skills/` or a flat collection of `.md` files), the
+    /// scanner loads top-level `.md` files as bare skills and recurses into
+    /// non-hidden subdirectories.
     async fn load_skill_directory(&mut self, dir: &Path) -> Result<(), SkillsError> {
+        // Skill package: <dir>/SKILL.md present → load just that, don't recurse.
+        let skill_md = dir.join("SKILL.md");
+        if tokio::fs::metadata(&skill_md)
+            .await
+            .is_ok_and(|m| m.is_file())
+        {
+            if let Err(e) = self.load_skill_file(&skill_md).await {
+                tracing::warn!(path = %skill_md.display(), error = %e, "Failed to load skill");
+            }
+            return Ok(());
+        }
+
         let mut entries = tokio::fs::read_dir(dir)
             .await
             .map_err(|e| SkillsError::LoadFailed {
@@ -331,6 +360,59 @@ Content
         let found = registry.find_by_trigger("please activate me now");
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].name(), "triggered-skill");
+    }
+
+    #[tokio::test]
+    async fn skill_package_directory_ignores_references() {
+        // Layout:
+        //   pkg/
+        //     SKILL.md
+        //     references/
+        //       notes.md              ← must NOT be parsed as a skill
+        //     scripts/
+        //       helper.md             ← must NOT be parsed as a skill
+        let dir = TempDir::new().unwrap();
+        let pkg = dir.path().join("email");
+        std::fs::create_dir_all(pkg.join("references")).unwrap();
+        std::fs::create_dir_all(pkg.join("scripts")).unwrap();
+
+        let skill = r#"---
+name: email
+description: Email skill
+---
+Email body content
+"#;
+        std::fs::write(pkg.join("SKILL.md"), skill).unwrap();
+        std::fs::write(pkg.join("references/notes.md"), "# Just a reference").unwrap();
+        std::fs::write(pkg.join("scripts/helper.md"), "# Just a script doc").unwrap();
+
+        let registry = SkillRegistry::from_paths(&[pkg.as_path()]).await.unwrap();
+
+        assert_eq!(registry.len(), 1, "should load exactly one skill");
+        assert!(registry.get("email").is_some());
+    }
+
+    #[tokio::test]
+    async fn directory_of_skill_packages_loads_each() {
+        // Layout:
+        //   root/
+        //     email/SKILL.md
+        //     bash/SKILL.md
+        let dir = TempDir::new().unwrap();
+        for name in ["email", "bash"] {
+            let pkg = dir.path().join(name);
+            std::fs::create_dir_all(&pkg).unwrap();
+            let skill = format!(
+                "---\nname: {name}\ndescription: {name} skill\n---\n{name} body\n",
+            );
+            std::fs::write(pkg.join("SKILL.md"), skill).unwrap();
+        }
+
+        let registry = SkillRegistry::from_paths(&[dir.path()]).await.unwrap();
+
+        assert_eq!(registry.len(), 2);
+        assert!(registry.get("email").is_some());
+        assert!(registry.get("bash").is_some());
     }
 
     #[tokio::test]
