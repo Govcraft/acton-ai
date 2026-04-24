@@ -35,6 +35,7 @@
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::messages::{Message, ToolDefinition};
+use crate::prompt::{build_stream_collector, StreamCollectorSession};
 use crate::stream::CollectedResponse;
 use acton_reactive::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -49,13 +50,25 @@ type InputMapperFn = Box<dyn FnMut(&str) -> String + Send>;
 /// This prompt provides sensible defaults for a general-purpose chat assistant with
 /// tool access and exit detection.
 pub const DEFAULT_SYSTEM_PROMPT: &str = "\
-You are a helpful assistant with access to various tools. \
-At the start of the conversation, call list_skills to discover which agent \
-skills are available so you can recognize tasks they cover. When a user \
-request matches one of those skills, call activate_skill to load its \
-instructions before proceeding. Use other tools when appropriate to help \
-the user. When the user wants to end the conversation (says goodbye, bye, \
-quit, exit, etc.), use the exit_conversation tool.";
+You are a helpful assistant in a terminal. You have tools. Use them correctly.
+
+RULES:
+1. Call `list_skills` exactly once, at the very first turn of the conversation. If the conversation history already contains a `list_skills` result, do NOT call it again.
+2. If the user's request matches one of the skills returned by `list_skills`, call `activate_skill` with that skill's name first, then follow the instructions it returns.
+3. Use a tool when the answer depends on information you cannot know from general knowledge: file contents, directory listings, current web pages, shell output, or exact arithmetic. In those cases, call the tool — do not guess.
+4. For general-knowledge questions (definitions, concepts, common facts), answer directly. Do not call a tool just to call one.
+5. Call one tool per turn. Wait for its result before deciding the next action.
+6. Use the exact argument names the tool expects. Use file paths the user gave you or that a previous tool returned. Do not invent field names or paths.
+7. If a tool returns an error, say in one short sentence what failed and stop. Do not retry the same call with the same arguments.
+8. Before writing files, editing files, or running shell commands that change state, state in one short sentence what you are about to do, then call the tool.
+
+RESPONSE STYLE:
+- Be concise. One or two short paragraphs is usually enough.
+- When you are not sure, say so plainly. Do not invent file contents, command output, or facts.
+- After a tool returns a result, answer the user's original question using that result. Do not re-run a tool whose result is already in the conversation.
+
+ENDING:
+Call `exit_conversation` with a short friendly farewell when the user clearly wants to leave. Triggers include: bye, goodbye, quit, exit, stop, done, that's all, thanks that's it, see ya, later, no more questions, I'm good.";
 
 // =========================================================================
 // ChatConfig (unchanged from original)
@@ -292,6 +305,10 @@ struct HandlerState {
     /// Optional truncator applied to `history.clone()` before each LLM call.
     /// `None` means unbounded history (explicit opt-out at build time).
     context_window: Option<crate::memory::ContextWindow>,
+    /// Long-lived stream collector. Subscribes once at Conversation build
+    /// time and is reused by every turn so we don't stack dead broker
+    /// subscribers (acton-reactive's `UnsubscribeBroker` is a no-op).
+    stream_session: StreamCollectorSession,
 }
 
 /// Registers all message handlers on the `ConversationActor` builder.
@@ -306,6 +323,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         system_prompt_rx,
         system_prompt_tx,
         context_window,
+        stream_session,
     } = state;
     // ----- ConvSend: push user msg, run LLM call, await it -----
     {
@@ -317,6 +335,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         let exit_tool_enabled = exit_tool_enabled.clone();
         let system_prompt_rx = system_prompt_rx.clone();
         let context_window = context_window.clone();
+        let stream_session = stream_session.clone();
 
         builder.mutate_on::<ConvSend>(move |actor, ctx| {
             let msg = ctx.message().clone();
@@ -338,6 +357,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
             let result_tx = msg.result_tx;
             let token_target = msg.token_target;
             let self_handle = self_handle.clone();
+            let stream_session = stream_session.clone();
 
             // The LLM call runs in a spawned task because PromptBuilder
             // contains non-Sync callbacks (FnMut). The spawned task only
@@ -373,8 +393,11 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
                         builder = builder.token_target(target);
                     }
 
-                    // Collect response
-                    builder.collect().await
+                    // Reuse the Conversation's long-lived stream collector
+                    // so every turn shares one broker subscription — avoids
+                    // stacking `Recipient channel is closed` spam as turns
+                    // accumulate.
+                    builder.collect_with_session(&stream_session).await
                 })
                 .await;
 
@@ -488,6 +511,11 @@ pub struct Conversation {
     history_len: Arc<AtomicUsize>,
     /// Broadcast receiver for system prompt changes.
     system_prompt_rx: watch::Receiver<Option<String>>,
+    /// Long-lived stream collector shared with the ConversationActor's
+    /// ConvSend handler. Held here (and cloned through `Clone`) so the
+    /// session outlives the actor and is cleanly stopped when the last
+    /// `Conversation` clone drops.
+    stream_session: StreamCollectorSession,
 }
 
 // Compile-time assertion: Conversation is Clone + Send + 'static.
@@ -510,6 +538,7 @@ impl Clone for Conversation {
             history_rx: self.history_rx.clone(),
             history_len: self.history_len.clone(),
             system_prompt_rx: self.system_prompt_rx.clone(),
+            stream_session: self.stream_session.clone(),
         }
     }
 }
@@ -1102,6 +1131,11 @@ impl ConversationBuilder {
         let exit_requested = Arc::new(AtomicBool::new(false));
         let exit_tool_enabled = Arc::new(AtomicBool::new(self.exit_tool_enabled));
 
+        // One long-lived stream collector per Conversation. Subscribes
+        // once and is reused by every turn, so the broker never
+        // accumulates dead subscribers across turns.
+        let stream_session = build_stream_collector(&self.runtime).await;
+
         // Create the actor
         let mut actor_runtime = self.runtime.runtime().clone();
         let mut actor_builder = actor_runtime.new_actor::<ConversationActor>();
@@ -1124,6 +1158,7 @@ impl ConversationBuilder {
                 system_prompt_rx: system_prompt_rx.clone(),
                 system_prompt_tx,
                 context_window,
+                stream_session: stream_session.clone(),
             },
         );
 
@@ -1138,6 +1173,7 @@ impl ConversationBuilder {
             history_rx,
             history_len,
             system_prompt_rx,
+            stream_session,
         }
     }
 

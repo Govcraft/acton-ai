@@ -770,6 +770,35 @@ impl PromptBuilder {
             return Err(ActonAIError::runtime_shutdown());
         }
 
+        // Build a session scoped to this one-off `collect()` call. Callers
+        // that issue many `collect()`s in sequence (like Conversation)
+        // should use `collect_with_session` instead so the subscription
+        // lives across all calls — that avoids stacking dead subscribers
+        // in the acton-reactive broker.
+        let session = build_stream_collector(&self.runtime).await;
+        let result = self.collect_inner(&session).await;
+        session.shutdown().await;
+        result
+    }
+
+    /// Run `collect()`'s core tool/streaming loop against a caller-owned
+    /// [`StreamCollectorSession`]. Used by long-lived callers such as
+    /// [`crate::conversation::Conversation`] that want one persistent
+    /// subscriber for every turn instead of a fresh one per call.
+    pub(crate) async fn collect_with_session(
+        self,
+        session: &StreamCollectorSession,
+    ) -> Result<CollectedResponse, ActonAIError> {
+        if self.runtime.is_shutdown() {
+            return Err(ActonAIError::runtime_shutdown());
+        }
+        self.collect_inner(session).await
+    }
+
+    async fn collect_inner(
+        self,
+        session: &StreamCollectorSession,
+    ) -> Result<CollectedResponse, ActonAIError> {
         // Destructure self to take ownership of all fields
         let PromptBuilder {
             runtime,
@@ -833,26 +862,9 @@ impl PromptBuilder {
             on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
         let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
-        // Build one long-lived StreamCollector for this entire `collect()`
-        // call. Spawning a fresh collector per round leaks broker
-        // subscriptions — `UnsubscribeBroker` ships unimplemented in
-        // acton-reactive, so the only reliable way to avoid dead-channel
-        // spam is to reuse a single subscriber across rounds.
-        let collector_session = build_stream_collector(
-            &runtime,
-            &StreamRoundCallbacks {
-                on_start: on_start.clone(),
-                on_token: on_token.clone(),
-                on_end: on_end.clone(),
-                token_target: token_target.clone(),
-            },
-        )
-        .await;
-
         loop {
             rounds += 1;
             if rounds > max_tool_rounds {
-                collector_session.shutdown().await;
                 return Err(ActonAIError::prompt_failed(format!(
                     "exceeded maximum tool rounds ({max_tool_rounds})",
                 )));
@@ -875,24 +887,24 @@ impl PromptBuilder {
                 sampling: sampling.clone(),
             };
 
-            // Collect stream response — reuses the long-lived collector.
+            // Collect stream response — reuses the caller-owned collector.
             // Keep a clone so we can tag tool-result broadcasts with the
             // round's correlation ID further down.
             let round_correlation_id = correlation_id.clone();
-            let (text, stop_reason, token_count, tool_calls) = match run_stream_round(
-                &collector_session,
+            let round_callbacks = StreamRoundCallbacks {
+                on_start: on_start.clone(),
+                on_token: on_token.clone(),
+                on_end: on_end.clone(),
+                token_target: token_target.clone(),
+            };
+            let (text, stop_reason, token_count, tool_calls) = run_stream_round(
+                session,
                 &provider_handle,
                 &request,
                 correlation_id,
+                round_callbacks,
             )
-            .await
-            {
-                Ok(data) => data,
-                Err(e) => {
-                    collector_session.shutdown().await;
-                    return Err(e);
-                }
-            };
+            .await?;
 
             final_text = text.clone();
             total_token_count += token_count;
@@ -964,10 +976,6 @@ impl PromptBuilder {
             }
         }
 
-        // One shutdown for the long-lived collector — no broker
-        // subscriptions leaked across rounds.
-        collector_session.shutdown().await;
-
         Ok(CollectedResponse::with_tool_calls(
             final_text,
             StopReason::EndTurn,
@@ -977,38 +985,103 @@ impl PromptBuilder {
     }
 }
 
-/// Callbacks and token target shared across every round of a single
-/// `collect()` call.
-struct StreamRoundCallbacks {
-    on_start: Option<WrappedStartCallback>,
-    on_token: Option<WrappedTokenCallback>,
-    on_end: Option<WrappedEndCallback>,
-    token_target: Option<ActorHandle>,
+/// Callbacks and token target that apply to a single stream round.
+///
+/// Sent into the long-lived [`StreamCollectorSession`] via
+/// [`ResetStreamRound`] before each round so the collector's event handlers
+/// dispatch to the correct caller-supplied hooks without needing to rebuild
+/// broker subscriptions.
+///
+/// Implements `Debug` manually because the boxed `FnMut` callbacks inside
+/// the wrapped slots don't themselves implement `Debug`, and
+/// `#[acton_actor]` auto-derives `Debug` on any actor model that holds
+/// this type.
+#[derive(Clone, Default)]
+pub(crate) struct StreamRoundCallbacks {
+    pub(crate) on_start: Option<WrappedStartCallback>,
+    pub(crate) on_token: Option<WrappedTokenCallback>,
+    pub(crate) on_end: Option<WrappedEndCallback>,
+    pub(crate) token_target: Option<ActorHandle>,
 }
 
-/// Long-lived stream collector. Owns broker subscriptions for the entire
-/// `collect()` call; each tool round sends a [`ResetStreamRound`] to reset
-/// state and swap the correlation-ID filter before firing the next request.
-struct StreamCollectorSession {
-    handle: ActorHandle,
+impl std::fmt::Debug for StreamRoundCallbacks {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StreamRoundCallbacks")
+            .field("on_start", &self.on_start.is_some())
+            .field("on_token", &self.on_token.is_some())
+            .field("on_end", &self.on_end.is_some())
+            .field("token_target", &self.token_target.is_some())
+            .finish()
+    }
+}
+
+/// Long-lived stream collector. Owns broker subscriptions for a whole
+/// [`crate::conversation::Conversation`] (or a single `collect()` call when
+/// used ad-hoc); each tool round sends a [`ResetStreamRound`] to swap the
+/// correlation-ID filter and the round's callbacks before firing the next
+/// request.
+///
+/// Reusing one session across all turns avoids stacking dead broker
+/// subscribers — `acton-reactive`'s `UnsubscribeBroker` ships as a no-op,
+/// so every new subscriber that later stops leaves a closed channel in the
+/// broker's table, producing `Recipient channel is closed` errors on every
+/// subsequent broadcast.
+///
+/// The session is cheap to clone (it's an [`Arc`] under the hood) so it can
+/// be shared between the owner and transient handler closures. The inner
+/// actor handle is stopped exactly once when the last clone drops.
+#[derive(Clone)]
+pub(crate) struct StreamCollectorSession {
+    inner: Arc<StreamCollectorSessionInner>,
+}
+
+struct StreamCollectorSessionInner {
+    /// `None` after [`StreamCollectorSession::shutdown`] runs. `Drop`
+    /// treats that as a no-op so we never double-stop the actor.
+    handle: std::sync::Mutex<Option<ActorHandle>>,
     completion: Arc<Notify>,
     result_container: Arc<std::sync::Mutex<Option<CollectorResultData>>>,
 }
 
 impl StreamCollectorSession {
-    /// Stop the underlying actor. Call once after all rounds complete.
-    async fn shutdown(self) {
-        let _ = self.handle.stop().await;
+    /// Stop the underlying actor explicitly.
+    ///
+    /// Callers that want deterministic shutdown (like one-off `collect()`)
+    /// should call this; long-lived owners (like Conversation) can just
+    /// drop the last clone and rely on the best-effort cleanup in `Drop`.
+    pub(crate) async fn shutdown(self) {
+        let handle = self.inner.handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = handle {
+            let _ = h.stop().await;
+        }
+    }
+
+    fn handle(&self) -> Option<ActorHandle> {
+        self.inner.handle.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+impl Drop for StreamCollectorSessionInner {
+    // Best-effort async stop. If we're inside a tokio runtime, spawn a
+    // task to stop the actor so the broker prunes its subscription slot;
+    // otherwise the runtime-level shutdown will reap it.
+    fn drop(&mut self) {
+        let handle = self.handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(h) = handle {
+            if let Ok(rt) = tokio::runtime::Handle::try_current() {
+                rt.spawn(async move {
+                    let _ = h.stop().await;
+                });
+            }
+        }
     }
 }
 
 /// Build and start a long-lived `StreamCollector` actor subscribed to all
 /// four streaming event types. The caller drives individual rounds via
-/// [`run_stream_round`], which reuses this handle for every round.
-async fn build_stream_collector(
-    runtime: &ActonAI,
-    callbacks: &StreamRoundCallbacks,
-) -> StreamCollectorSession {
+/// [`run_stream_round`], which reuses this handle — and its subscriptions —
+/// for every round of every turn.
+pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollectorSession {
     let completion = Arc::new(Notify::new());
     let completion_signal = completion.clone();
 
@@ -1019,15 +1092,14 @@ async fn build_stream_collector(
     let mut actor_runtime = runtime.runtime().clone();
     let mut collector = actor_runtime.new_actor::<StreamCollector>();
 
-    // Stream start — fire the caller's on_start callback for our round.
-    let on_start_clone = callbacks.on_start.clone();
+    // Stream start — fire the caller's on_start callback for the current round.
     collector.mutate_on::<LLMStreamStart>(move |actor, envelope| {
         if actor.model.expected_correlation_id.as_ref()
             != Some(&envelope.message().correlation_id)
         {
             return Reply::ready();
         }
-        if let Some(ref callback) = on_start_clone {
+        if let Some(ref callback) = actor.model.round.on_start {
             if let Ok(mut f) = callback.lock() {
                 f();
             }
@@ -1036,8 +1108,6 @@ async fn build_stream_collector(
     });
 
     // Stream token — accumulate, fire caller's callback, forward to target.
-    let on_token_clone = callbacks.on_token.clone();
-    let token_target_clone = callbacks.token_target.clone();
     collector.mutate_on::<LLMStreamToken>(move |actor, envelope| {
         if actor.model.expected_correlation_id.as_ref()
             != Some(&envelope.message().correlation_id)
@@ -1048,13 +1118,13 @@ async fn build_stream_collector(
         actor.model.buffer.push_str(&token);
         actor.model.token_count += 1;
 
-        if let Some(ref callback) = on_token_clone {
+        if let Some(ref callback) = actor.model.round.on_token {
             if let Ok(mut f) = callback.lock() {
                 f(&token);
             }
         }
 
-        if let Some(ref target) = token_target_clone {
+        if let Some(ref target) = actor.model.round.token_target {
             let target = target.clone();
             return Reply::pending(async move {
                 target.send(StreamToken { text: token }).await;
@@ -1079,7 +1149,6 @@ async fn build_stream_collector(
 
     // Stream end — take the accumulated state into the shared result slot
     // and signal completion so the caller can pick up the round result.
-    let on_end_clone = callbacks.on_end.clone();
     collector.mutate_on::<LLMStreamEnd>(move |actor, envelope| {
         if actor.model.expected_correlation_id.as_ref()
             != Some(&envelope.message().correlation_id)
@@ -1087,7 +1156,7 @@ async fn build_stream_collector(
             return Reply::ready();
         }
         actor.model.stop_reason = Some(envelope.message().stop_reason);
-        if let Some(ref callback) = on_end_clone {
+        if let Some(ref callback) = actor.model.round.on_end {
             if let Ok(mut f) = callback.lock() {
                 f(envelope.message().stop_reason);
             }
@@ -1101,9 +1170,11 @@ async fn build_stream_collector(
                 tool_calls: std::mem::take(&mut actor.model.tool_calls),
             });
         }
-        // Clear the correlation-ID filter so stray late events from the
-        // just-finished round don't land in the next round's state.
+        // Clear the correlation-ID filter and drop callbacks + target so
+        // late stray events from the just-finished round don't land in
+        // the next round's state.
         actor.model.expected_correlation_id = None;
+        actor.model.round = StreamRoundCallbacks::default();
 
         completion_signal.notify_one();
         Reply::ready()
@@ -1111,7 +1182,9 @@ async fn build_stream_collector(
 
     // Reset per-round state — reliably delivered BEFORE any event for the
     // new correlation_id because the provider is only told to send the
-    // request after this message has been acknowledged.
+    // request after this message has been acknowledged. Installs the new
+    // round's callbacks and token target so event handlers dispatch to
+    // the right place.
     collector.mutate_on::<ResetStreamRound>(move |actor, envelope| {
         let msg = envelope.message();
         actor.model.buffer.clear();
@@ -1119,6 +1192,7 @@ async fn build_stream_collector(
         actor.model.stop_reason = None;
         actor.model.tool_calls.clear();
         actor.model.expected_correlation_id = Some(msg.expected_id.clone());
+        actor.model.round = msg.callbacks.clone();
         Reply::ready()
     });
 
@@ -1130,24 +1204,38 @@ async fn build_stream_collector(
 
     let handle = collector.start().await;
     StreamCollectorSession {
-        handle,
-        completion,
-        result_container,
+        inner: Arc::new(StreamCollectorSessionInner {
+            handle: std::sync::Mutex::new(Some(handle)),
+            completion,
+            result_container,
+        }),
     }
 }
 
 /// Run a single stream round on the supplied long-lived collector.
-async fn run_stream_round(
+///
+/// Installs `callbacks` for this round before firing the request so the
+/// collector's event handlers dispatch to the right hooks, then waits on
+/// the completion notify for the round's final result.
+pub(crate) async fn run_stream_round(
     session: &StreamCollectorSession,
     provider_handle: &ActorHandle,
     request: &LLMRequest,
     correlation_id: CorrelationId,
+    callbacks: StreamRoundCallbacks,
 ) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
-    // Ack: reset state and install the new round's correlation ID.
-    session
-        .handle
+    // Resolve the collector's live actor handle. Returns an error if the
+    // session was already shut down — defensive, but shouldn't happen on
+    // any normal path.
+    let handle = session.handle().ok_or_else(|| {
+        ActonAIError::prompt_failed("stream collector session is shut down".to_string())
+    })?;
+
+    // Ack: reset state and install the new round's correlation ID + callbacks.
+    handle
         .send(ResetStreamRound {
             expected_id: correlation_id,
+            callbacks,
         })
         .await;
 
@@ -1155,9 +1243,10 @@ async fn run_stream_round(
     provider_handle.send(request.clone()).await;
 
     // Wait for the stream-end handler to fill the result slot.
-    session.completion.notified().await;
+    session.inner.completion.notified().await;
 
     let result = session
+        .inner
         .result_container
         .lock()
         .ok()
@@ -1240,16 +1329,19 @@ async fn execute_tool_with_callback(
 
 /// Internal actor for collecting stream tokens.
 ///
-/// This actor owns all state for collecting streaming responses, eliminating
-/// the need for external Mutex-protected shared state. All mutable state
-/// (buffer, token_count, stop_reason, tool_calls) is owned by the actor
-/// and accessed directly in handlers via `actor.model`.
+/// This actor owns all state for collecting streaming responses plus the
+/// caller-supplied per-round callbacks. Handlers read callbacks from
+/// `actor.model`; the caller updates them per round via
+/// [`ResetStreamRound`]. No external Mutex-protected shared state is
+/// needed.
 ///
-/// The collector is **long-lived across all tool rounds of a single
-/// `collect()` call** — subscribing once at the top and resetting per-round
-/// state via [`ResetStreamRound`]. Spawning a fresh collector per round
-/// leaks broker subscriptions (acton-reactive's `UnsubscribeBroker` ships
-/// as an unimplemented stub: see `common/src/message/unsubscribe_broker.rs`).
+/// The collector is **long-lived across every round of every turn it
+/// serves** — subscribing once at construction and swapping per-round
+/// callbacks + correlation filter through [`ResetStreamRound`]. Spawning
+/// a fresh collector per round leaks broker subscriptions because
+/// `acton-reactive`'s `UnsubscribeBroker` ships as a no-op (see
+/// `common/src/message/unsubscribe_broker.rs`), so every stopped
+/// subscriber leaves a dead channel that the broker still broadcasts to.
 #[acton_actor]
 struct StreamCollector {
     /// Accumulated response buffer for the current round
@@ -1265,14 +1357,19 @@ struct StreamCollector {
     /// collector from stray events emitted by other concurrent streams
     /// that the provider may broadcast to the same broker channel.
     expected_correlation_id: Option<CorrelationId>,
+    /// Caller-supplied callbacks + token target for the current round.
+    /// Swapped in at the start of each round by [`ResetStreamRound`].
+    round: StreamRoundCallbacks,
 }
 
 /// Per-round reset message. Sent to the collector before starting each
-/// round's LLM request so state is fresh and the correlation-ID filter
-/// accepts the new round's events.
+/// round's LLM request: clears accumulated state, installs the new
+/// correlation-ID filter, and swaps in the new round's callbacks +
+/// token target so the event handlers dispatch to the correct caller.
 #[derive(Clone, Debug)]
 struct ResetStreamRound {
     expected_id: CorrelationId,
+    callbacks: StreamRoundCallbacks,
 }
 
 /// Collected stream data returned from the actor.
