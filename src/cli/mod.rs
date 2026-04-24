@@ -55,9 +55,6 @@ pub enum Commands {
     Heartbeat(commands::heartbeat::HeartbeatArgs),
 
     /// Send a message or start an interactive chat session.
-    ///
-    /// Only available when built with the `agent-skills` feature.
-    #[cfg(feature = "agent-skills")]
     Chat(commands::chat::ChatArgs),
 
     /// Execute a named job from the configuration file.
@@ -86,7 +83,6 @@ pub async fn run(cli: Cli) -> i32 {
         Commands::Heartbeat(args) => {
             commands::heartbeat::execute(args, &output, config_path, provider).await
         }
-        #[cfg(feature = "agent-skills")]
         Commands::Chat(args) => commands::chat::execute(args, &output, config_path, provider).await,
         Commands::RunJob(args) => {
             commands::run_job::execute(args, &output, config_path, provider).await

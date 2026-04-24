@@ -1,7 +1,6 @@
 //! List skills built-in tool.
 //!
 //! Lists available agent skills with metadata (progressive disclosure).
-//! Only available when the `agent-skills` feature is enabled.
 
 use crate::messages::ToolDefinition;
 use crate::skills::{SkillInfo, SkillRegistry};

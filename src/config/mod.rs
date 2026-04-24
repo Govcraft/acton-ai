@@ -73,6 +73,5 @@ pub use file::{from_path, from_str, load, search_paths, xdg_config_dir};
 pub use types::{
     ActonAIConfig, ActonAIDefaults, CliFileConfig, JobConfig, NamedProviderConfig,
     PersistenceFileConfig, RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig,
+    SkillsFileConfig,
 };
-#[cfg(feature = "agent-skills")]
-pub use types::SkillsFileConfig;

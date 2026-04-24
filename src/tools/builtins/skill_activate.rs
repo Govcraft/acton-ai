@@ -1,7 +1,6 @@
 //! Activate skill built-in tool.
 //!
 //! Activates a skill and returns its full instructions.
-//! Only available when the `agent-skills` feature is enabled.
 
 use crate::messages::ToolDefinition;
 use crate::skills::SkillRegistry;

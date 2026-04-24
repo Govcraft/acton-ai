@@ -4,7 +4,6 @@
 
 use crate::types::AgentId;
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "agent-skills")]
 use std::path::PathBuf;
 
 /// Configuration for creating a new agent.
@@ -28,8 +27,6 @@ pub struct AgentConfig {
     pub tools: Vec<String>,
     /// Paths to skill files or directories to load for this agent.
     ///
-    /// Only available when the `agent-skills` feature is enabled.
-    ///
     /// **Note:** This field records a per-agent preference but is not
     /// auto-loaded by any runtime today. For runtime-wide skills shared
     /// across every prompt, use
@@ -37,7 +34,6 @@ pub struct AgentConfig {
     /// path loads a shared registry at launch and auto-registers the
     /// `list_skills` / `activate_skill` tools on every prompt the facade
     /// hands out.
-    #[cfg(feature = "agent-skills")]
     #[serde(default)]
     pub skill_paths: Vec<PathBuf>,
 }
@@ -66,7 +62,6 @@ impl AgentConfig {
             max_conversation_length: 100,
             enable_streaming: true,
             tools: Vec::new(),
-            #[cfg(feature = "agent-skills")]
             skill_paths: Vec::new(),
         }
     }
@@ -165,8 +160,6 @@ impl AgentConfig {
 
     /// Sets the skill paths to load for this agent.
     ///
-    /// Only available when the `agent-skills` feature is enabled.
-    ///
     /// # Arguments
     ///
     /// * `paths` - Paths to skill files or directories
@@ -180,7 +173,6 @@ impl AgentConfig {
     /// let config = AgentConfig::new("You are helpful.")
     ///     .with_skill_paths(&[PathBuf::from("./skills")]);
     /// ```
-    #[cfg(feature = "agent-skills")]
     #[must_use]
     pub fn with_skill_paths(mut self, paths: &[PathBuf]) -> Self {
         self.skill_paths = paths.to_vec();
@@ -188,8 +180,6 @@ impl AgentConfig {
     }
 
     /// Adds a single skill path to the list of paths to load.
-    ///
-    /// Only available when the `agent-skills` feature is enabled.
     ///
     /// # Arguments
     ///
@@ -205,7 +195,6 @@ impl AgentConfig {
     ///     .with_skill_path(PathBuf::from("./skills/coding.md"))
     ///     .with_skill_path(PathBuf::from("./skills/debugging"));
     /// ```
-    #[cfg(feature = "agent-skills")]
     #[must_use]
     pub fn with_skill_path(mut self, path: impl Into<PathBuf>) -> Self {
         self.skill_paths.push(path.into());
@@ -344,7 +333,6 @@ mod tests {
         assert_eq!(deserialized.tools, vec!["read_file", "bash"]);
     }
 
-    #[cfg(feature = "agent-skills")]
     mod skills_tests {
         use super::*;
 

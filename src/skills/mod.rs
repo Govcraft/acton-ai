@@ -3,8 +3,6 @@
 //! This module provides integration with the `agent-skills` crate for loading
 //! and managing reusable agent behaviors defined via YAML frontmatter + markdown.
 //!
-//! Skills are feature-gated behind the `agent-skills` feature flag.
-//!
 //! ## Usage
 //!
 //! ```rust,ignore

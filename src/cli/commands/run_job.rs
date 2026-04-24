@@ -130,13 +130,7 @@ pub async fn execute(
     let effective_provider = job.provider.as_deref().or(provider_override);
 
     // Step 6: Bootstrap runtime
-    let rt = CliRuntime::new(
-        config_path,
-        effective_provider,
-        #[cfg(feature = "agent-skills")]
-        &[],
-    )
-    .await?;
+    let rt = CliRuntime::new(config_path, effective_provider, &[]).await?;
 
     // Step 7: Build and execute the prompt
     let mut prompt = rt.ai.prompt(&message).system(&job.system_prompt);

@@ -71,9 +71,7 @@ mod read_file;
 mod web_fetch;
 mod write_file;
 
-#[cfg(feature = "agent-skills")]
 mod skill_activate;
-#[cfg(feature = "agent-skills")]
 mod skill_list;
 
 // Re-export tool implementations
@@ -87,9 +85,7 @@ pub use read_file::{ReadFileTool, ReadFileToolActor};
 pub use web_fetch::{WebFetchTool, WebFetchToolActor};
 pub use write_file::{WriteFileTool, WriteFileToolActor};
 
-#[cfg(feature = "agent-skills")]
 pub use skill_activate::{ActivateSkillTool, ActivateSkillToolActor};
-#[cfg(feature = "agent-skills")]
 pub use skill_list::{ListSkillsTool, ListSkillsToolActor};
 
 use crate::messages::ToolDefinition;
@@ -356,8 +352,7 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
 
 /// Spawns all skill-related tool actors.
 ///
-/// This spawns the `list_skills` and `activate_skill` tool actors, which are
-/// only available when the `agent-skills` feature is enabled.
+/// This spawns the `list_skills` and `activate_skill` tool actors.
 ///
 /// # Arguments
 ///
@@ -378,7 +373,6 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
 /// let registry = Arc::new(SkillRegistry::new());
 /// let skill_tools = spawn_skill_tool_actors(&mut runtime, registry).await;
 /// ```
-#[cfg(feature = "agent-skills")]
 pub async fn spawn_skill_tool_actors(
     runtime: &mut ActorRuntime,
     registry: std::sync::Arc<crate::skills::SkillRegistry>,
@@ -399,9 +393,6 @@ pub async fn spawn_skill_tool_actors(
 }
 
 /// Returns the names of all skill-related tools.
-///
-/// Only available when the `agent-skills` feature is enabled.
-#[cfg(feature = "agent-skills")]
 #[must_use]
 pub fn skill_tool_names() -> Vec<&'static str> {
     vec!["list_skills", "activate_skill"]

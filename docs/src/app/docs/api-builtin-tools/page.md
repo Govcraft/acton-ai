@@ -502,9 +502,9 @@ Fetches content from a URL. Supports GET and POST methods with custom headers.
 
 ---
 
-## Feature-gated tools
+## Agent skill tools
 
-The following tools are only available when the `agent-skills` feature is enabled.
+These tools are auto-registered on every prompt when skills are loaded via [`ActonAIBuilder::with_skill_paths`](#) or a `[skills]` TOML section (or the `--skill-dir` CLI flag). If no skill paths are supplied, the tools are absent.
 
 ### list_skills
 

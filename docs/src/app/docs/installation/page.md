@@ -45,13 +45,13 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 | Feature | Default | Description |
 | --- | --- | --- |
-| `agent-skills` | off | Enables the agent skills system for loading and activating dynamic skill plugins. Adds `SkillRegistry`, `LoadedSkill`, `ActivateSkillTool`, and `ListSkillsTool` to the prelude. |
+| `sandbox-hardening` | on | Enables Linux-specific OS hardening (landlock + seccomp) for the process sandbox child. A no-op on non-Linux platforms; safe to disable if you're not running the sandbox. |
 
-Enable a feature in `Cargo.toml`:
+Skills (`SkillRegistry`, `LoadedSkill`, `ActivateSkillTool`, `ListSkillsTool`) are always included — no feature flag required. To disable the sandbox hardening feature:
 
 ```toml
 [dependencies]
-acton-ai = { version = "0.25", features = ["agent-skills"] }
+acton-ai = { version = "0.25", default-features = false }
 ```
 
 ---

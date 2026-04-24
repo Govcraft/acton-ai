@@ -89,7 +89,7 @@ cargo build
 cargo build --all-features
 ```
 
-The `agent-skills` feature is the only optional feature flag. It enables the agent skills system for loading dynamic skill plugins. See the [Installation](/docs/installation) page for details on feature flags.
+The only optional feature flag is `sandbox-hardening` (on by default), which enables Linux landlock + seccomp filters for the process sandbox. See the [Installation](/docs/installation) page for details.
 
 ### Build the documentation
 
@@ -149,18 +149,13 @@ The `examples/` directory contains runnable examples demonstrating various featu
 | `multi_agent` | Multi-agent collaboration |
 | `per_agent_tools` | Per-agent tool configuration |
 | `process_sandbox` | Process-sandboxed bash execution |
-| `agent_skills` | Agent skills system (requires `agent-skills` feature) |
+| `agent_skills` | Agent skills system — loading and activating `.md` skills |
 
 Run an example:
 
 ```bash
 cargo run --example ollama_chat
-```
-
-For examples that require the `agent-skills` feature:
-
-```bash
-cargo run --example agent_skills --features agent-skills
+cargo run --example agent_skills
 ```
 
 {% callout type="note" title="LLM provider required" %}

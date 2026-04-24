@@ -32,10 +32,9 @@
 //! ## Usage
 //!
 //! ```bash
-//! cargo run --example agent_skills --features agent-skills
+//! cargo run --example agent_skills
 //! ```
 
-#[cfg(feature = "agent-skills")]
 mod skills_example {
     use acton_ai::prelude::*;
     use acton_ai::tools::builtins::{ActivateSkillTool, ListSkillsTool};
@@ -305,15 +304,7 @@ mod skills_example {
     }
 }
 
-#[cfg(feature = "agent-skills")]
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     skills_example::run().await
-}
-
-#[cfg(not(feature = "agent-skills"))]
-fn main() {
-    eprintln!("This example requires the 'agent-skills' feature.");
-    eprintln!("Run with: cargo run --example agent_skills --features agent-skills");
-    std::process::exit(1);
 }

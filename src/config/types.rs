@@ -7,7 +7,6 @@ use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
 use crate::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-#[cfg(feature = "agent-skills")]
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -84,8 +83,7 @@ pub struct ActonAIConfig {
     ///
     /// Corresponds to `[skills]\npaths = [...]` in TOML. Each entry may be a
     /// directory (scanned recursively for `.md` files) or a single skill
-    /// file. Only available when the `agent-skills` feature is enabled.
-    #[cfg(feature = "agent-skills")]
+    /// file.
     #[serde(default)]
     pub skills: Option<SkillsFileConfig>,
 }
@@ -95,7 +93,6 @@ pub struct ActonAIConfig {
 /// Currently carries only a list of paths; additional knobs (default-enabled
 /// filters, namespacing) can be added here without reshuffling the rest of
 /// the config schema.
-#[cfg(feature = "agent-skills")]
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SkillsFileConfig {
     /// Paths to skill files or directories to load.
@@ -1153,7 +1150,6 @@ max_execution_ms = 60000
             cli: None,
             jobs: None,
             defaults: None,
-            #[cfg(feature = "agent-skills")]
             skills: None,
         };
 
@@ -1234,7 +1230,6 @@ max_tool_rounds = 25
         assert_eq!(config.max_execution_ms, cloned.max_execution_ms);
     }
 
-    #[cfg(feature = "agent-skills")]
     #[test]
     fn skills_section_parses_paths() {
         let toml_str = r#"
@@ -1253,7 +1248,6 @@ max_tool_rounds = 25
         );
     }
 
-    #[cfg(feature = "agent-skills")]
     #[test]
     fn skills_section_absent_yields_none() {
         let toml_str = r#"

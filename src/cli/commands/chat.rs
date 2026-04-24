@@ -1,12 +1,9 @@
 //! The `chat` command — send messages and manage conversations.
 //!
 //! Supports single-shot messages (`--message`), stdin piping, and
-//! interactive terminal chat with session persistence.
-//!
-//! The entire module is gated behind the `agent-skills` feature at its
-//! declaration in `src/cli/commands/mod.rs`: building without the feature
-//! drops the subcommand from the CLI entirely and clap reports `chat` as
-//! an unrecognized subcommand.
+//! interactive terminal chat with session persistence. Accepts a repeatable
+//! `--skill-dir` flag that loads agent skills into the runtime; the model
+//! can then discover them via `list_skills` / `activate_skill`.
 
 use crate::cli::error::CliError;
 use crate::cli::output::{OutputMode, OutputWriter};
