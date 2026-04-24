@@ -20,19 +20,38 @@ pub enum OutputMode {
 /// - All diagnostics and progress go to stderr.
 pub struct OutputWriter {
     mode: OutputMode,
+    quiet: bool,
 }
 
 impl OutputWriter {
-    /// Creates a new output writer with the given mode.
+    /// Creates a new output writer with the given mode. Non-quiet by default.
     #[must_use]
     pub fn new(mode: OutputMode) -> Self {
-        Self { mode }
+        Self {
+            mode,
+            quiet: false,
+        }
     }
 
     /// Returns the output mode.
     #[must_use]
     pub fn mode(&self) -> OutputMode {
         self.mode
+    }
+
+    /// Mark this writer as quiet — commands should suppress banners,
+    /// spinners, and other chrome on stderr. The `error()` channel still
+    /// surfaces (failures are never silent).
+    #[must_use]
+    pub fn with_quiet(mut self, quiet: bool) -> Self {
+        self.quiet = quiet;
+        self
+    }
+
+    /// Whether quiet mode is in effect.
+    #[must_use]
+    pub fn is_quiet(&self) -> bool {
+        self.quiet
     }
 
     /// Returns true if stdout is a terminal.

@@ -180,16 +180,41 @@ pub async fn execute(
 
             tracing::info!(mode = "interactive", "entering chat loop");
             // Drive the richer CLI REPL: reedline line editor, persistent
-            // per-session history, and slash commands.
+            // per-session history, slash commands, styled labels + spinner.
             let history_path = crate::cli::chat_ui::history_path_for_session(&session_name);
-            crate::cli::chat_ui::run(&conv, &rt.ai, history_path).await?;
+            let theme = crate::cli::chat_ui::style::Theme::resolve();
+            let provider_name = rt.ai.default_provider_name().to_string();
+            let provider_count = rt.ai.provider_names().count();
+            let banner_info = crate::cli::chat_ui::banner::BannerInfo {
+                session: &session_name,
+                origin: session_origin,
+                provider: &provider_name,
+                history_len: conv.len(),
+                provider_count,
+            };
+            crate::cli::chat_ui::banner::print_startup(&banner_info, output, &theme);
 
-            // After interactive chat, persist any new messages
+            let started_at = std::time::Instant::now();
+            let run_result = crate::cli::chat_ui::run(&conv, &rt.ai, history_path).await;
+
+            // Persist any new messages regardless of how the loop exited, so
+            // a streaming error or panic cannot orphan a partial session.
             let current_history = conv.history();
+            let history_len = current_history.len();
             for msg in current_history {
                 persistence::save_message(&conn, &conversation_id, &msg).await?;
             }
             persistence::touch_session(&conn, &session_name).await?;
+
+            if run_result.is_ok() {
+                crate::cli::chat_ui::banner::print_exit_summary(
+                    &session_name,
+                    history_len,
+                    started_at.elapsed(),
+                    output,
+                );
+            }
+            run_result?;
         }
     }
 

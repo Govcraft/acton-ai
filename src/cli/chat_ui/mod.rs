@@ -1,17 +1,22 @@
 //! Interactive terminal UX for `acton-ai chat`.
 //!
 //! Owns the REPL: line editing + persistent history (via `reedline`), slash
-//! commands, and streaming display. The library-level
-//! [`Conversation::run_chat_with`] remains a thin stdin/stdout loop for
-//! programmatic use; the CLI drives this richer path via the public
+//! commands, streaming display, spinner, and (styled) speaker labels. The
+//! library-level [`Conversation::run_chat_with`] remains a thin stdin/stdout
+//! loop for programmatic use; the CLI drives this richer path via the public
 //! [`Conversation::send_streaming`] API.
 
+pub mod banner;
 pub mod slash;
+pub mod spinner;
+pub mod style;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use acton_reactive::prelude::*;
+use indicatif::ProgressBar;
 use reedline::{DefaultPrompt, DefaultPromptSegment, FileBackedHistory, Reedline, Signal};
 
 use crate::conversation::{Conversation, StreamToken};
@@ -19,8 +24,16 @@ use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::messages::Message;
 
+use self::style::Theme;
+
 /// Number of lines kept in the persistent reedline history file.
 const HISTORY_SIZE: usize = 1000;
+
+/// Shared handle used to hand a live spinner to the token actor for the
+/// current turn. The actor takes the spinner out on the first streamed token
+/// and clears it; the run loop takes it out on stream completion (covering
+/// tools-only / empty-response turns).
+type SpinnerSlot = Arc<Mutex<Option<ProgressBar>>>;
 
 /// Resolve the on-disk reedline history file for the given session, creating
 /// parent directories if necessary. Returns `None` when the platform has no
@@ -48,9 +61,8 @@ fn sanitize_session_for_path(session: &str) -> String {
         .collect()
 }
 
-/// Token-rendering actor used by the CLI chat loop. Currently just writes each
-/// token to stdout; follow-up PRs extend it with spinner signalling, tool-call
-/// visibility, and markdown rendering.
+/// Token-rendering actor state. Holds the slot the spinner is parked in so
+/// the token handler can dismiss it on the first streamed token.
 #[derive(Default, Debug)]
 struct ChatUiActor;
 
@@ -69,13 +81,22 @@ pub async fn run(
     ai: &ActonAI,
     history_path: Option<PathBuf>,
 ) -> Result<(), ActonAIError> {
+    let theme = Theme::resolve();
+    let spinner_slot: SpinnerSlot = Arc::new(Mutex::new(None));
+
     // Token-rendering actor. Same pattern as the previous inline printer in
-    // `Conversation::run_chat_with`, lifted here so follow-up PRs can hang
-    // spinner / tool-render hooks off the same actor without touching
-    // library code.
+    // `Conversation::run_chat_with`, lifted here so the spinner can be
+    // dismissed the moment the first token arrives.
     let mut actor_runtime = ai.runtime().clone();
     let mut token_actor = actor_runtime.new_actor::<ChatUiActor>();
-    token_actor.mutate_on::<StreamToken>(|_actor, ctx| {
+    let slot_for_actor = spinner_slot.clone();
+    token_actor.mutate_on::<StreamToken>(move |_actor, ctx| {
+        // Mutex contention is limited to the first token per turn — on
+        // subsequent tokens `.take()` returns None and the lock is released
+        // immediately.
+        if let Some(pb) = take_spinner(&slot_for_actor) {
+            pb.finish_and_clear();
+        }
         print!("{}", ctx.message().text);
         std::io::stdout().flush().ok();
         Reply::ready()
@@ -84,7 +105,7 @@ pub async fn run(
 
     let mut editor = build_editor(history_path.as_deref());
     let left_prompt = DefaultPrompt::new(
-        DefaultPromptSegment::Basic("You".to_string()),
+        DefaultPromptSegment::Basic(theme.user_prompt_label.clone()),
         DefaultPromptSegment::Empty,
     );
 
@@ -115,7 +136,10 @@ pub async fn run(
             Ok(Signal::Success(buffer)) => buffer,
             Ok(Signal::CtrlC) => {
                 // At the prompt, Ctrl+C is not "exit" — hint and continue.
-                eprintln!("(type /exit or press Ctrl+D to quit)");
+                eprintln!(
+                    "{}(type /exit or press Ctrl+D to quit){}",
+                    theme.dim_open, theme.dim_close
+                );
                 continue;
             }
             Ok(Signal::CtrlD) => break Ok(()),
@@ -139,7 +163,7 @@ pub async fn run(
         match slash::parse(trimmed) {
             slash::SlashAction::NotSlash => {
                 last_user_message = Some(trimmed.to_string());
-                send_turn(conv, &token_handle, trimmed).await?;
+                send_turn(conv, &token_handle, trimmed, &theme, &spinner_slot).await?;
                 if conv.should_exit() {
                     break Ok(());
                 }
@@ -148,21 +172,31 @@ pub async fn run(
             slash::SlashAction::Clear => {
                 conv.clear();
                 last_user_message = None;
-                println!("(history cleared)");
+                println!(
+                    "{}(history cleared){}",
+                    theme.dim_open, theme.dim_close
+                );
             }
-            slash::SlashAction::History => print_history(&conv.history()),
+            slash::SlashAction::History => print_history(&conv.history(), &theme),
             slash::SlashAction::Exit => break Ok(()),
             slash::SlashAction::Retry => match last_user_message.clone() {
                 Some(prev) => {
-                    send_turn(conv, &token_handle, &prev).await?;
+                    send_turn(conv, &token_handle, &prev, &theme, &spinner_slot).await?;
                     if conv.should_exit() {
                         break Ok(());
                     }
                 }
-                None => println!("(no previous message to retry)"),
+                None => println!(
+                    "{}(no previous message to retry){}",
+                    theme.dim_open, theme.dim_close
+                ),
             },
             slash::SlashAction::Unknown(name) => {
-                println!("unknown command: {name}. Type /help for a list.");
+                println!(
+                    "{warn}unknown command: {name}{reset}. Type /help for a list.",
+                    warn = theme.warn_open,
+                    reset = if theme.colors_enabled { "\x1b[0m" } else { "" },
+                );
             }
         }
     };
@@ -171,17 +205,45 @@ pub async fn run(
     result
 }
 
-/// Print the assistant prefix, run one streaming turn, close with a newline.
+/// Print the assistant prefix, show a spinner until the first token arrives,
+/// stream the response, and close with a newline.
 async fn send_turn(
     conv: &Conversation,
     token_handle: &ActorHandle,
     content: &str,
+    theme: &Theme,
+    spinner_slot: &SpinnerSlot,
 ) -> Result<(), ActonAIError> {
-    print!("Assistant: ");
+    print!("{}", theme.assistant_label);
     std::io::stdout().flush().ok();
-    conv.send_streaming(content, token_handle).await?;
+
+    // Park a spinner in the shared slot so the token handler can dismiss it
+    // the moment the first token lands.
+    let pb = spinner::build("thinking…");
+    if let Ok(mut slot) = spinner_slot.lock() {
+        *slot = Some(pb.clone());
+    }
+
+    let result = conv.send_streaming(content, token_handle).await;
+
+    // Empty responses (errors, tools-only turns) never emit a `StreamToken`
+    // so the slot can still be occupied. Clear any leftover spinner here.
+    if let Some(pb) = take_spinner(spinner_slot) {
+        pb.finish_and_clear();
+    }
+
+    result?;
     println!();
     Ok(())
+}
+
+fn take_spinner(slot: &SpinnerSlot) -> Option<ProgressBar> {
+    // Recover from a poisoned lock rather than panicking — the data it
+    // protects is an `Option<ProgressBar>` and no invariants can be broken.
+    match slot.lock() {
+        Ok(mut guard) => guard.take(),
+        Err(poisoned) => poisoned.into_inner().take(),
+    }
 }
 
 fn build_editor(history_path: Option<&Path>) -> Reedline {
@@ -202,13 +264,22 @@ fn build_editor(history_path: Option<&Path>) -> Reedline {
     }
 }
 
-fn print_history(messages: &[Message]) {
+fn print_history(messages: &[Message], theme: &Theme) {
     if messages.is_empty() {
-        println!("(no messages yet)");
+        println!(
+            "{}(no messages yet){}",
+            theme.dim_open, theme.dim_close
+        );
         return;
     }
     for (i, msg) in messages.iter().enumerate() {
-        println!("  [{i}] {}: {}", msg.role, preview(&msg.content, 400));
+        println!(
+            "  {dim}[{i}] {role}:{reset} {text}",
+            dim = theme.dim_open,
+            reset = theme.dim_close,
+            role = msg.role,
+            text = preview(&msg.content, 400),
+        );
     }
 }
 

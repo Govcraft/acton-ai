@@ -77,7 +77,7 @@ pub async fn run(cli: Cli) -> i32 {
     } else {
         OutputMode::Plain
     };
-    let output = OutputWriter::new(mode);
+    let output = OutputWriter::new(mode).with_quiet(cli.quiet);
 
     let config_path = cli.config.as_ref();
     let provider = cli.provider.as_deref();
