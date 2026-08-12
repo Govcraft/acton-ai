@@ -540,7 +540,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, Agent>) {
         })
     });
 
-    // Handle status requests from kernel
+    // Handle status requests
     builder.act_on::<GetAgentStatus>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let agent_id = actor.model.id.clone().unwrap_or_else(AgentId::new);

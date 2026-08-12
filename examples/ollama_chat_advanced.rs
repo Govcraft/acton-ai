@@ -54,9 +54,9 @@ async fn main() -> anyhow::Result<()> {
     // Launch the actor runtime
     let mut runtime = ActonApp::launch_async().await;
 
-    // Spawn the kernel with custom app name for journald identification
-    let kernel_config = KernelConfig::default().with_app_name("ollama-chat-advanced");
-    let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
+    // Install journald logging with a custom app name for identification
+    let logging_config = LoggingConfig::default().with_app_name("ollama-chat-advanced");
+    let _ = init_and_store_logging(&logging_config);
 
     eprintln!("Logs sent to systemd-journald under SYSLOG_IDENTIFIER=ollama-chat-advanced");
     eprintln!("Tail with: journalctl -t ollama-chat-advanced -f");

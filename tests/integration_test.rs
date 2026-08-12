@@ -1,59 +1,10 @@
 //! Integration tests for the Acton-AI framework.
 //!
 //! These tests verify that the core components work together correctly:
-//! - Kernel spawning
-//! - Agent spawning via Kernel
 //! - Message passing between actors
 
 use acton_ai::prelude::*;
 use std::time::Duration;
-
-/// Test that we can spawn the kernel actor.
-#[tokio::test]
-async fn test_spawn_kernel() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn the kernel
-    let kernel_handle = Kernel::spawn(&mut runtime).await;
-
-    // The kernel should have a valid handle - check that root is "kernel"
-    let id_str = kernel_handle.id().root().to_string();
-    assert!(
-        id_str.contains("kernel"),
-        "Expected kernel in id: {}",
-        id_str
-    );
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test spawning an agent via the kernel.
-#[tokio::test]
-async fn test_spawn_agent_via_kernel() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn the kernel
-    let kernel_handle = Kernel::spawn(&mut runtime).await;
-
-    // Create agent configuration
-    let agent_config = AgentConfig::new("You are a helpful test assistant.")
-        .with_name("TestAgent")
-        .with_max_conversation_length(10);
-
-    // Send spawn request to kernel
-    kernel_handle
-        .send(SpawnAgent {
-            config: agent_config,
-        })
-        .await;
-
-    // Give some time for message processing
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
 
 /// Test creating an agent directly and sending a user prompt.
 #[tokio::test]
@@ -126,22 +77,6 @@ fn test_agent_config_builder() {
     assert!(!config.enable_streaming);
 }
 
-/// Test kernel configuration builder.
-#[test]
-fn test_kernel_config_builder() {
-    let config = KernelConfig::new()
-        .with_max_agents(25)
-        .with_metrics(false)
-        .with_default_system_prompt("Default prompt");
-
-    assert_eq!(config.max_agents, 25);
-    assert!(!config.enable_metrics);
-    assert_eq!(
-        config.default_system_prompt,
-        Some("Default prompt".to_string())
-    );
-}
-
 /// Test message creation helpers.
 #[test]
 fn test_message_creation() {
@@ -184,17 +119,6 @@ fn test_agent_state_transitions() {
     assert!(!AgentState::Idle.is_active());
     assert!(!AgentState::Completed.is_active());
     assert!(!AgentState::Stopping.is_active());
-}
-
-/// Test error types.
-#[test]
-fn test_kernel_error_display() {
-    let agent_id = AgentId::new();
-    let error = KernelError::agent_not_found(agent_id.clone());
-
-    let msg = error.to_string();
-    assert!(msg.contains(&agent_id.to_string()));
-    assert!(msg.contains("not found"));
 }
 
 /// Test error types for agent.
@@ -1096,8 +1020,6 @@ fn test_build_context_with_memories() {
 // =============================================================================
 
 use acton_ai::agent::{DelegatedTask, DelegatedTaskState, DelegationTracker};
-use acton_ai::error::MultiAgentError;
-use acton_ai::kernel::CapabilityRegistry;
 use acton_ai::types::{InvalidTaskId, TaskId};
 
 /// Test TaskId type.
@@ -1147,43 +1069,6 @@ fn test_task_id_serialization() {
     assert_eq!(id, deserialized);
 }
 
-/// Test capability registry.
-#[test]
-fn test_capability_registry() {
-    let mut registry = CapabilityRegistry::new();
-
-    let agent1 = AgentId::new();
-    let agent2 = AgentId::new();
-
-    // Register capabilities
-    registry.register(
-        agent1.clone(),
-        vec!["code_review".to_string(), "summarize".to_string()],
-    );
-    registry.register(
-        agent2.clone(),
-        vec!["translate".to_string(), "summarize".to_string()],
-    );
-
-    // Find by capability
-    let reviewer = registry.find_capable_agent("code_review");
-    assert_eq!(reviewer, Some(agent1.clone()));
-
-    // Find multiple agents with same capability
-    let summarizers = registry.find_all_capable_agents("summarize");
-    assert_eq!(summarizers.len(), 2);
-    assert!(summarizers.contains(&agent1));
-    assert!(summarizers.contains(&agent2));
-
-    // Check specific capability
-    assert!(registry.has_capability(&agent1, "code_review"));
-    assert!(!registry.has_capability(&agent2, "code_review"));
-
-    // Unregister
-    registry.unregister(&agent1);
-    assert_eq!(registry.find_capable_agent("code_review"), None);
-}
-
 /// Test delegation tracker.
 #[test]
 fn test_delegation_tracker() {
@@ -1214,313 +1099,30 @@ fn test_delegation_tracker() {
     assert!(task.is_terminal());
 }
 
-/// Test agent message creation.
+/// Test IncomingTask construction.
 #[test]
-fn test_agent_message_creation() {
+fn test_incoming_task_creation() {
     let from = AgentId::new();
-    let to = AgentId::new();
 
-    let msg = AgentMessage::new(from.clone(), to.clone(), "Hello fellow agent!")
-        .with_metadata(serde_json::json!({"priority": "high"}));
-
-    assert_eq!(msg.from, from);
-    assert_eq!(msg.to, to);
-    assert_eq!(msg.content, "Hello fellow agent!");
-    assert!(msg.metadata.is_some());
-}
-
-/// Test delegate task creation.
-#[test]
-fn test_delegate_task_creation() {
-    let from = AgentId::new();
-    let to = AgentId::new();
-
-    let task = DelegateTask::new(
-        from.clone(),
-        to.clone(),
-        "code_review",
-        serde_json::json!({"code": "fn main() {}"}),
-    )
-    .with_deadline(std::time::Duration::from_secs(60));
-
-    assert_eq!(task.from, from);
-    assert_eq!(task.to, to);
-    assert_eq!(task.task_type, "code_review");
-    assert!(task.deadline.is_some());
-    assert!(task.task_id.to_string().starts_with("task_"));
-}
-
-/// Test multi-agent error types.
-#[test]
-fn test_multi_agent_error_types() {
-    let agent_id = AgentId::new();
-    let task_id = TaskId::new();
-
-    let error = MultiAgentError::agent_not_found(agent_id.clone());
-    assert!(error.is_agent_not_found());
-    assert!(error.to_string().contains(&agent_id.to_string()));
-
-    let error = MultiAgentError::no_capable_agent("translation");
-    assert!(error.is_no_capable_agent());
-    assert!(error.to_string().contains("translation"));
-
-    let error = MultiAgentError::task_not_found(task_id);
-    assert!(error.to_string().contains("task"));
-}
-
-/// Test two agents can exchange direct messages.
-#[tokio::test]
-async fn test_agent_message_routing() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn kernel
-    let kernel = Kernel::spawn(&mut runtime).await;
-
-    // Create two agents
-    let agent_a_builder = Agent::create(&mut runtime);
-    let agent_a_handle = agent_a_builder.start().await;
-    let agent_a_id = AgentId::new();
-    agent_a_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Agent A").with_id(agent_a_id.clone()),
-        })
-        .await;
-
-    let agent_b_builder = Agent::create(&mut runtime);
-    let agent_b_handle = agent_b_builder.start().await;
-    let agent_b_id = AgentId::new();
-    agent_b_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Agent B").with_id(agent_b_id.clone()),
-        })
-        .await;
-
-    // Give time for initialization
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Send message from A to B via kernel
-    // Note: The kernel doesn't know about these agents yet since they weren't spawned via SpawnAgent
-    // In a real scenario, agents would be registered with the kernel
-    kernel
-        .send(AgentMessage::new(
-            agent_a_id.clone(),
-            agent_b_id.clone(),
-            "Hello Agent B!",
-        ))
-        .await;
-
-    // Give time for message routing
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test task delegation flow.
-#[tokio::test]
-async fn test_task_delegation_flow() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn kernel
-    let kernel = Kernel::spawn(&mut runtime).await;
-
-    // Create two agents
-    let supervisor_id = AgentId::new();
-    let worker_id = AgentId::new();
-
-    let supervisor_builder = Agent::create(&mut runtime);
-    let supervisor_handle = supervisor_builder.start().await;
-    supervisor_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Supervisor").with_id(supervisor_id.clone()),
-        })
-        .await;
-
-    let worker_builder = Agent::create(&mut runtime);
-    let worker_handle = worker_builder.start().await;
-    worker_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Worker").with_id(worker_id.clone()),
-        })
-        .await;
-
-    // Give time for initialization
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Delegate task from supervisor to worker
-    let task = DelegateTask::new(
-        supervisor_id.clone(),
-        worker_id.clone(),
-        "process_data",
-        serde_json::json!({"data": [1, 2, 3]}),
-    );
-    kernel.send(task).await;
-
-    // Give time for task processing
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test agent discovery by capability.
-#[tokio::test]
-async fn test_agent_discovery() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn kernel
-    let kernel = Kernel::spawn(&mut runtime).await;
-
-    // Create an agent with capabilities
-    let agent_id = AgentId::new();
-    let agent_builder = Agent::create(&mut runtime);
-    let agent_handle = agent_builder.start().await;
-    agent_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Specialist").with_id(agent_id.clone()),
-        })
-        .await;
-
-    // Give time for initialization
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Announce capabilities
-    kernel
-        .send(AnnounceCapabilities::new(
-            agent_id.clone(),
-            vec!["code_review".to_string(), "testing".to_string()],
-        ))
-        .await;
-
-    // Give time for registration
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Search for capability
-    kernel.send(FindCapableAgent::new("code_review")).await;
-
-    // Give time for search
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test multi-agent collaboration workflow.
-#[tokio::test]
-async fn test_multi_agent_collaboration() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn kernel
-    let kernel = Kernel::spawn(&mut runtime).await;
-
-    // Create coordinator agent
-    let coordinator_id = AgentId::new();
-    let coordinator_builder = Agent::create(&mut runtime);
-    let coordinator_handle = coordinator_builder.start().await;
-    coordinator_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Coordinator").with_id(coordinator_id.clone()),
-        })
-        .await;
-
-    // Create specialist agents
-    let reviewer_id = AgentId::new();
-    let reviewer_builder = Agent::create(&mut runtime);
-    let reviewer_handle = reviewer_builder.start().await;
-    reviewer_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Reviewer").with_id(reviewer_id.clone()),
-        })
-        .await;
-
-    let tester_id = AgentId::new();
-    let tester_builder = Agent::create(&mut runtime);
-    let tester_handle = tester_builder.start().await;
-    tester_handle
-        .send(InitAgent {
-            config: AgentConfig::new("Tester").with_id(tester_id.clone()),
-        })
-        .await;
-
-    // Give time for initialization
-    tokio::time::sleep(Duration::from_millis(100)).await;
-
-    // Announce capabilities
-    kernel
-        .send(AnnounceCapabilities::new(
-            reviewer_id.clone(),
-            vec!["code_review".to_string()],
-        ))
-        .await;
-    kernel
-        .send(AnnounceCapabilities::new(
-            tester_id.clone(),
-            vec!["testing".to_string()],
-        ))
-        .await;
-
-    // Give time for registration
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Coordinator delegates review task
-    kernel
-        .send(DelegateTask::new(
-            coordinator_id.clone(),
-            reviewer_id.clone(),
-            "code_review",
-            serde_json::json!({"file": "main.rs", "changes": "Add new feature"}),
-        ))
-        .await;
-
-    // Coordinator delegates test task
-    kernel
-        .send(DelegateTask::new(
-            coordinator_id.clone(),
-            tester_id.clone(),
-            "testing",
-            serde_json::json!({"module": "feature", "coverage_target": 80}),
-        ))
-        .await;
-
-    // Give time for task processing
-    tokio::time::sleep(Duration::from_millis(200)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test IncomingTask from_delegate.
-#[test]
-fn test_incoming_task_from_delegate() {
-    let from = AgentId::new();
-    let to = AgentId::new();
-
-    let delegate = DelegateTask::new(
-        from.clone(),
-        to,
-        "test_task",
-        serde_json::json!({"data": "test"}),
-    )
-    .with_deadline(Duration::from_secs(30));
-
-    let incoming = IncomingTask::from_delegate(&delegate);
+    let incoming = IncomingTask::new(from.clone(), "test_task", serde_json::json!({"data": "test"}))
+        .with_deadline(Duration::from_secs(30));
 
     assert_eq!(incoming.from, from);
-    assert_eq!(incoming.task_id, delegate.task_id);
     assert_eq!(incoming.task_type, "test_task");
     assert_eq!(incoming.deadline, Some(Duration::from_secs(30)));
+
+    // Each task gets a unique ID.
+    let other = IncomingTask::new(incoming.from.clone(), "test_task", serde_json::json!({}));
+    assert_ne!(incoming.task_id, other.task_id);
 }
 
-/// Test IncomingAgentMessage from AgentMessage.
+/// Test IncomingAgentMessage construction.
 #[test]
-fn test_incoming_agent_message_from() {
+fn test_incoming_agent_message_creation() {
     let from = AgentId::new();
-    let to = AgentId::new();
 
-    let msg = AgentMessage::new(from.clone(), to, "Hello!")
+    let incoming = IncomingAgentMessage::new(from.clone(), "Hello!")
         .with_metadata(serde_json::json!({"key": "value"}));
-
-    let incoming = IncomingAgentMessage::from(msg.clone());
 
     assert_eq!(incoming.from, from);
     assert_eq!(incoming.content, "Hello!");
@@ -1566,26 +1168,3 @@ fn test_delegated_task_failure() {
     assert_eq!(task.error, Some("Something went wrong".to_string()));
 }
 
-/// Test AnnounceCapabilities creation.
-#[test]
-fn test_announce_capabilities_creation() {
-    let agent_id = AgentId::new();
-    let caps = AnnounceCapabilities::new(
-        agent_id.clone(),
-        vec!["cap1".to_string(), "cap2".to_string()],
-    );
-
-    assert_eq!(caps.agent_id, agent_id);
-    assert_eq!(caps.capabilities.len(), 2);
-    assert!(caps.capabilities.contains(&"cap1".to_string()));
-    assert!(caps.capabilities.contains(&"cap2".to_string()));
-}
-
-/// Test FindCapableAgent creation.
-#[test]
-fn test_find_capable_agent_creation() {
-    let query = FindCapableAgent::new("code_review");
-
-    assert_eq!(query.capability, "code_review");
-    assert!(query.correlation_id.to_string().starts_with("corr_"));
-}

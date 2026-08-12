@@ -344,8 +344,6 @@ ActonAI (Facade)
     │
     ├── ActorRuntime (acton-reactive)
     │       │
-    │       ├── Kernel ─────────── Central supervisor, agent lifecycle
-    │       │
     │       ├── LLMProvider(s) ─── API calls, streaming, rate limiting
     │       │
     │       ├── Agent(s) ───────── Individual AI agents with reasoning

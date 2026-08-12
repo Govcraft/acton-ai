@@ -8,133 +8,6 @@
 use crate::types::AgentId;
 use std::fmt;
 
-/// Errors that can occur in the Kernel actor.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct KernelError {
-    /// The specific error that occurred
-    pub kind: KernelErrorKind,
-}
-
-/// Specific kernel error types.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum KernelErrorKind {
-    /// Agent with the given ID was not found
-    AgentNotFound {
-        /// The ID of the agent that was not found
-        agent_id: AgentId,
-    },
-    /// Agent spawn failed
-    SpawnFailed {
-        /// Reason for the failure
-        reason: String,
-    },
-    /// Agent is already running
-    AgentAlreadyExists {
-        /// The ID of the existing agent
-        agent_id: AgentId,
-    },
-    /// Kernel is shutting down and cannot accept new requests
-    ShuttingDown,
-    /// Configuration error
-    InvalidConfig {
-        /// Description of what was invalid
-        field: String,
-        /// Why it was invalid
-        reason: String,
-    },
-}
-
-impl KernelError {
-    /// Creates a new KernelError with the given kind.
-    #[must_use]
-    pub fn new(kind: KernelErrorKind) -> Self {
-        Self { kind }
-    }
-
-    /// Creates an agent not found error.
-    #[must_use]
-    pub fn agent_not_found(agent_id: AgentId) -> Self {
-        Self::new(KernelErrorKind::AgentNotFound { agent_id })
-    }
-
-    /// Creates a spawn failed error.
-    #[must_use]
-    pub fn spawn_failed(reason: impl Into<String>) -> Self {
-        Self::new(KernelErrorKind::SpawnFailed {
-            reason: reason.into(),
-        })
-    }
-
-    /// Creates an agent already exists error.
-    #[must_use]
-    pub fn agent_already_exists(agent_id: AgentId) -> Self {
-        Self::new(KernelErrorKind::AgentAlreadyExists { agent_id })
-    }
-
-    /// Creates a shutting down error.
-    #[must_use]
-    pub fn shutting_down() -> Self {
-        Self::new(KernelErrorKind::ShuttingDown)
-    }
-
-    /// Creates an invalid config error.
-    #[must_use]
-    pub fn invalid_config(field: impl Into<String>, reason: impl Into<String>) -> Self {
-        Self::new(KernelErrorKind::InvalidConfig {
-            field: field.into(),
-            reason: reason.into(),
-        })
-    }
-
-    /// Returns true if this error indicates the agent was not found.
-    #[must_use]
-    pub fn is_not_found(&self) -> bool {
-        matches!(self.kind, KernelErrorKind::AgentNotFound { .. })
-    }
-
-    /// Returns true if this error indicates the kernel is shutting down.
-    #[must_use]
-    pub fn is_shutting_down(&self) -> bool {
-        matches!(self.kind, KernelErrorKind::ShuttingDown)
-    }
-}
-
-impl fmt::Display for KernelError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            KernelErrorKind::AgentNotFound { agent_id } => {
-                write!(
-                    f,
-                    "agent '{}' not found; verify the agent ID is correct and the agent is running",
-                    agent_id
-                )
-            }
-            KernelErrorKind::SpawnFailed { reason } => {
-                write!(
-                    f,
-                    "failed to spawn agent: {}; check agent configuration",
-                    reason
-                )
-            }
-            KernelErrorKind::AgentAlreadyExists { agent_id } => {
-                write!(
-                    f,
-                    "agent '{}' already exists; use a different ID or stop the existing agent first",
-                    agent_id
-                )
-            }
-            KernelErrorKind::ShuttingDown => {
-                write!(f, "kernel is shutting down; cannot accept new requests")
-            }
-            KernelErrorKind::InvalidConfig { field, reason } => {
-                write!(f, "invalid configuration for '{}': {}", field, reason)
-            }
-        }
-    }
-}
-
-impl std::error::Error for KernelError {}
-
 /// Errors that can occur in an Agent actor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AgentError {
@@ -305,159 +178,6 @@ impl fmt::Display for AgentError {
 
 impl std::error::Error for AgentError {}
 
-/// Errors that can occur in multi-agent operations.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MultiAgentError {
-    /// The specific error that occurred
-    pub kind: MultiAgentErrorKind,
-}
-
-/// Specific multi-agent error types.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum MultiAgentErrorKind {
-    /// Target agent not found for message routing
-    AgentNotFound {
-        /// The ID of the agent that was not found
-        agent_id: crate::types::AgentId,
-    },
-    /// Task with the given ID not found
-    TaskNotFound {
-        /// The ID of the task that was not found
-        task_id: crate::types::TaskId,
-    },
-    /// Task was already accepted
-    TaskAlreadyAccepted {
-        /// The ID of the task
-        task_id: crate::types::TaskId,
-    },
-    /// No agent found with the required capability
-    NoCapableAgent {
-        /// The capability that was searched for
-        capability: String,
-    },
-    /// Task delegation failed
-    DelegationFailed {
-        /// The task ID
-        task_id: crate::types::TaskId,
-        /// The reason for failure
-        reason: String,
-    },
-    /// Message routing failed
-    RoutingFailed {
-        /// The target agent
-        to: crate::types::AgentId,
-        /// The reason for failure
-        reason: String,
-    },
-}
-
-impl MultiAgentError {
-    /// Creates a new MultiAgentError with the given kind.
-    #[must_use]
-    pub fn new(kind: MultiAgentErrorKind) -> Self {
-        Self { kind }
-    }
-
-    /// Creates an agent not found error.
-    #[must_use]
-    pub fn agent_not_found(agent_id: crate::types::AgentId) -> Self {
-        Self::new(MultiAgentErrorKind::AgentNotFound { agent_id })
-    }
-
-    /// Creates a task not found error.
-    #[must_use]
-    pub fn task_not_found(task_id: crate::types::TaskId) -> Self {
-        Self::new(MultiAgentErrorKind::TaskNotFound { task_id })
-    }
-
-    /// Creates a task already accepted error.
-    #[must_use]
-    pub fn task_already_accepted(task_id: crate::types::TaskId) -> Self {
-        Self::new(MultiAgentErrorKind::TaskAlreadyAccepted { task_id })
-    }
-
-    /// Creates a no capable agent error.
-    #[must_use]
-    pub fn no_capable_agent(capability: impl Into<String>) -> Self {
-        Self::new(MultiAgentErrorKind::NoCapableAgent {
-            capability: capability.into(),
-        })
-    }
-
-    /// Creates a delegation failed error.
-    #[must_use]
-    pub fn delegation_failed(task_id: crate::types::TaskId, reason: impl Into<String>) -> Self {
-        Self::new(MultiAgentErrorKind::DelegationFailed {
-            task_id,
-            reason: reason.into(),
-        })
-    }
-
-    /// Creates a routing failed error.
-    #[must_use]
-    pub fn routing_failed(to: crate::types::AgentId, reason: impl Into<String>) -> Self {
-        Self::new(MultiAgentErrorKind::RoutingFailed {
-            to,
-            reason: reason.into(),
-        })
-    }
-
-    /// Returns true if this error indicates an agent was not found.
-    #[must_use]
-    pub fn is_agent_not_found(&self) -> bool {
-        matches!(self.kind, MultiAgentErrorKind::AgentNotFound { .. })
-    }
-
-    /// Returns true if this error indicates no capable agent was found.
-    #[must_use]
-    pub fn is_no_capable_agent(&self) -> bool {
-        matches!(self.kind, MultiAgentErrorKind::NoCapableAgent { .. })
-    }
-}
-
-impl fmt::Display for MultiAgentError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match &self.kind {
-            MultiAgentErrorKind::AgentNotFound { agent_id } => {
-                write!(
-                    f,
-                    "agent '{}' not found; verify the agent is running and registered",
-                    agent_id
-                )
-            }
-            MultiAgentErrorKind::TaskNotFound { task_id } => {
-                write!(
-                    f,
-                    "task '{}' not found; verify the task ID is correct",
-                    task_id
-                )
-            }
-            MultiAgentErrorKind::TaskAlreadyAccepted { task_id } => {
-                write!(
-                    f,
-                    "task '{}' was already accepted; cannot accept twice",
-                    task_id
-                )
-            }
-            MultiAgentErrorKind::NoCapableAgent { capability } => {
-                write!(
-                    f,
-                    "no agent found with capability '{}'; start an agent with this capability",
-                    capability
-                )
-            }
-            MultiAgentErrorKind::DelegationFailed { task_id, reason } => {
-                write!(f, "delegation of task '{}' failed: {}", task_id, reason)
-            }
-            MultiAgentErrorKind::RoutingFailed { to, reason } => {
-                write!(f, "message routing to agent '{}' failed: {}", to, reason)
-            }
-        }
-    }
-}
-
-impl std::error::Error for MultiAgentError {}
-
 // =============================================================================
 // ActonAI High-Level API Error
 // =============================================================================
@@ -605,44 +325,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn kernel_error_agent_not_found_display() {
-        let agent_id = AgentId::new();
-        let error = KernelError::agent_not_found(agent_id.clone());
-
-        let message = error.to_string();
-        assert!(message.contains(&agent_id.to_string()));
-        assert!(message.contains("not found"));
-    }
-
-    #[test]
-    fn kernel_error_spawn_failed_display() {
-        let error = KernelError::spawn_failed("timeout waiting for initialization");
-
-        let message = error.to_string();
-        assert!(message.contains("failed to spawn"));
-        assert!(message.contains("timeout"));
-    }
-
-    #[test]
-    fn kernel_error_is_not_found() {
-        let agent_id = AgentId::new();
-        let error = KernelError::agent_not_found(agent_id);
-        assert!(error.is_not_found());
-
-        let other = KernelError::shutting_down();
-        assert!(!other.is_not_found());
-    }
-
-    #[test]
-    fn kernel_error_is_shutting_down() {
-        let error = KernelError::shutting_down();
-        assert!(error.is_shutting_down());
-
-        let other = KernelError::spawn_failed("test");
-        assert!(!other.is_shutting_down());
-    }
-
-    #[test]
     fn agent_error_with_agent_id_display() {
         let agent_id = AgentId::new();
         let error =
@@ -682,32 +364,6 @@ mod tests {
         assert!(message.contains("connection timeout"));
     }
 
-    #[test]
-    fn kernel_error_invalid_config() {
-        let error = KernelError::invalid_config("max_agents", "must be greater than 0");
-
-        let message = error.to_string();
-        assert!(message.contains("max_agents"));
-        assert!(message.contains("must be greater than 0"));
-    }
-
-    #[test]
-    fn errors_are_clone() {
-        let error1 = KernelError::shutting_down();
-        let error2 = error1.clone();
-        assert_eq!(error1, error2);
-    }
-
-    #[test]
-    fn errors_are_eq() {
-        let error1 = KernelError::shutting_down();
-        let error2 = KernelError::shutting_down();
-        assert_eq!(error1, error2);
-
-        let error3 = KernelError::spawn_failed("different");
-        assert_ne!(error1, error3);
-    }
-
     // ActonAIError tests
     #[test]
     fn acton_ai_error_configuration_display() {
@@ -720,11 +376,11 @@ mod tests {
 
     #[test]
     fn acton_ai_error_launch_failed_display() {
-        let error = ActonAIError::launch_failed("failed to spawn kernel");
+        let error = ActonAIError::launch_failed("failed to spawn provider");
 
         let message = error.to_string();
         assert!(message.contains("failed to launch"));
-        assert!(message.contains("kernel"));
+        assert!(message.contains("provider"));
     }
 
     #[test]

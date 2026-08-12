@@ -1,6 +1,6 @@
-//! Journald-based logging for the Acton-AI kernel.
+//! Journald-based logging for Acton-AI.
 //!
-//! When running on Linux with systemd-journald available, kernel logs are
+//! When running on Linux with systemd-journald available, logs are
 //! written to the journal tagged with the configured `app_name` as
 //! `SYSLOG_IDENTIFIER`. On non-Linux hosts, or on Linux without a running
 //! journald socket, initialization becomes a silent no-op — callers can still
@@ -12,7 +12,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-/// Configuration for kernel logging.
+/// Configuration for journald logging.
 ///
 /// Logs are sent to systemd-journald under the configured `app_name` as
 /// `SYSLOG_IDENTIFIER`. `level` filters which events are forwarded.
@@ -20,7 +20,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// # Example
 ///
 /// ```rust
-/// use acton_ai::kernel::LoggingConfig;
+/// use acton_ai::logging::LoggingConfig;
 ///
 /// // Use defaults (journald under SYSLOG_IDENTIFIER=acton-ai)
 /// let config = LoggingConfig::default();
@@ -28,7 +28,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 /// // Customize for your application
 /// let config = LoggingConfig::new()
 ///     .with_app_name("my-agent")
-///     .with_level(acton_ai::kernel::LogLevel::Debug);
+///     .with_level(acton_ai::logging::LogLevel::Debug);
 /// ```
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoggingConfig {
@@ -81,7 +81,7 @@ impl Default for LoggingConfig {
     }
 }
 
-/// Log level filter for kernel logging.
+/// Log level filter for journald logging.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum LogLevel {
     /// Trace level - most verbose.
@@ -215,7 +215,7 @@ impl std::error::Error for LoggingError {}
 /// Creates a subscriber that forwards tracing events to systemd-journald.
 /// Callers that need additional layers (e.g. stderr) should compose their
 /// own subscriber using [`journald_layer`] and call [`mark_subscriber_installed`]
-/// so the kernel's auto-init silently no-ops.
+/// so the runtime's auto-init silently no-ops.
 ///
 /// # Returns
 ///
@@ -244,7 +244,7 @@ pub fn init_journald_logging(config: &LoggingConfig) -> Result<bool, LoggingErro
 /// Initializes journald logging unless another caller has already installed
 /// a tracing subscriber via this module's helpers.
 ///
-/// This is the entry point `Kernel::spawn_with_config` uses.
+/// This is the entry point the facade's launch path uses.
 ///
 /// # Returns
 ///

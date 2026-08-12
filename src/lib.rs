@@ -5,7 +5,6 @@
 //!
 //! ## Architecture
 //!
-//! - **Kernel**: Central supervisor managing all agents
 //! - **Agent**: Individual AI agents with reasoning loops
 //! - **LLM Provider**: Manages streaming LLM API calls with rate limiting
 //! - **Tool Registry**: Registers and executes tools via supervised child actors
@@ -48,10 +47,12 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let mut app = ActonApp::launch_async().await;
-//!     let kernel = Kernel::spawn(&mut app).await;
 //!
-//!     let agent_id = kernel.spawn_agent(AgentConfig::default()).await;
-//!     kernel.send_prompt(agent_id, "Hello, agent!").await;
+//!     let provider = LLMProvider::spawn(&mut app, ProviderConfig::ollama("qwen2.5:7b")).await;
+//!
+//!     let mut agent = Agent::create(&mut app);
+//!     let agent_handle = agent.start().await;
+//!     agent_handle.send(InitAgent::default()).await;
 //!
 //!     app.shutdown_all().await.unwrap();
 //! }
@@ -63,8 +64,8 @@ pub mod config;
 pub mod conversation;
 pub mod error;
 pub mod facade;
-pub mod kernel;
 pub mod llm;
+pub mod logging;
 pub mod memory;
 pub mod messages;
 pub mod prompt;
@@ -92,11 +93,10 @@ pub mod prelude {
         Agent, AgentConfig, AgentState, DelegatedTask, DelegatedTaskState, DelegationTracker,
         IncomingTaskInfo, InitAgent,
     };
-    pub use crate::error::{AgentError, KernelError, MultiAgentError, MultiAgentErrorKind};
-    pub use crate::kernel::{
+    pub use crate::error::AgentError;
+    pub use crate::logging::{
         init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,
-        CapabilityRegistry, InitKernel, Kernel, KernelConfig, KernelMetrics, LogLevel,
-        LoggingConfig, LoggingError, LoggingErrorKind,
+        LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
     };
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,

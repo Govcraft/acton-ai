@@ -1,7 +1,7 @@
 //! High-level facade for ActonAI.
 //!
 //! This module provides a simplified API for common use cases, hiding the
-//! complexity of actor setup, kernel spawning, and provider configuration.
+//! complexity of actor setup, logging, and provider configuration.
 //!
 //! # Single Provider Example
 //!
@@ -74,7 +74,7 @@
 use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
-use crate::kernel::{Kernel, KernelConfig};
+use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::llm::{LLMProvider, ProviderConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
@@ -91,7 +91,7 @@ pub const DEFAULT_PROVIDER_NAME: &str = "default";
 
 /// High-level facade for interacting with ActonAI.
 ///
-/// `ActonAI` encapsulates the runtime, kernel, and LLM providers, providing
+/// `ActonAI` encapsulates the runtime and LLM providers, providing
 /// a simplified API for common operations. It handles all the actor setup
 /// and subscription management automatically.
 ///
@@ -1176,7 +1176,7 @@ impl ActonAIBuilder {
 
     /// Launches the ActonAI runtime with the configured settings.
     ///
-    /// This spawns the actor runtime, kernel, and LLM providers.
+    /// This spawns the actor runtime and LLM providers.
     ///
     /// # Errors
     ///
@@ -1219,9 +1219,22 @@ impl ActonAIBuilder {
         // Launch the actor runtime
         let mut runtime = ActonApp::launch_async().await;
 
-        // Spawn the kernel with the app name for logging
-        let kernel_config = KernelConfig::default().with_app_name(&app_name);
-        let _kernel = Kernel::spawn_with_config(&mut runtime, kernel_config).await;
+        // Install journald logging if no other subscriber has claimed the
+        // global slot yet. Non-Linux hosts and environments without a
+        // journald socket silently fall through — the caller is expected to
+        // install their own subscriber (e.g. the CLI's stderr layer).
+        let logging_config = LoggingConfig::default().with_app_name(&app_name);
+        match init_and_store_logging(&logging_config) {
+            Ok(true) => {
+                tracing::info!(app_name = %logging_config.app_name, "Journald logging initialized");
+            }
+            Ok(false) => {
+                // Disabled, already installed, or journald unavailable — nothing to do.
+            }
+            Err(e) => {
+                eprintln!("Warning: journald logging initialization failed: {e}");
+            }
+        }
 
         // Spawn all LLM providers
         let mut providers = HashMap::new();

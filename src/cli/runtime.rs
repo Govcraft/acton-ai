@@ -182,8 +182,8 @@ pub(crate) fn resolve_db_path(config_path: Option<&PathBuf>) -> String {
 /// - stderr (human-readable, colorized when attached to a TTY)
 /// - journald (on Linux hosts with a running systemd-journald socket)
 ///
-/// After installation, marks the kernel's logging sentinel so
-/// `Kernel::spawn_with_config` does not race to install its own subscriber.
+/// After installation, marks the logging sentinel so the facade's launch-time
+/// auto-init does not race to install its own subscriber.
 ///
 /// - quiet: suppress all output
 /// - verbosity 0: warn only
@@ -208,8 +208,8 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
         .with_writer(std::io::stderr)
         .with_ansi(use_ansi);
 
-    let journald_cfg = crate::kernel::LoggingConfig::default();
-    let journald = crate::kernel::journald_layer(&journald_cfg);
+    let journald_cfg = crate::logging::LoggingConfig::default();
+    let journald = crate::logging::journald_layer(&journald_cfg);
 
     let result = tracing_subscriber::registry()
         .with(env_filter)
@@ -218,6 +218,6 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
         .try_init();
 
     if result.is_ok() {
-        crate::kernel::mark_subscriber_installed();
+        crate::logging::mark_subscriber_installed();
     }
 }
