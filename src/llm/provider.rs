@@ -429,45 +429,62 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         actor.model.metrics.rate_limits_hit += 1;
         actor.model.rate_limiter.record_rate_limit(msg.retry_after);
 
-        let Some(config) = actor.model.config.clone() else {
+        let drop_reason = match actor.model.config.clone() {
+            None => Some("provider not configured"),
+            Some(config) if attempts >= config.retry.max_retries => Some("max retries exceeded"),
+            Some(config)
+                if !queue_has_room(actor.model.queue.len(), config.rate_limit.max_queue_size) =>
+            {
+                Some("request queue full")
+            }
+            Some(config) => {
+                // Ahead of newer work: this request was accepted first.
+                actor.model.queue.push_front(PendingRequest {
+                    request: request.clone(),
+                    attempts: attempts + 1,
+                    queued_at: Instant::now(),
+                });
+
+                match actor
+                    .model
+                    .rate_limiter
+                    .next_available_at(&config, Instant::now())
+                {
+                    Some(available_at) => arm_drain_timer(actor, available_at),
+                    None => drain_queue(actor),
+                }
+
+                None
+            }
+        };
+
+        let Some(reason) = drop_reason else {
             return Reply::ready();
         };
 
-        if attempts >= config.retry.max_retries {
-            tracing::warn!(
-                correlation_id = %request.correlation_id,
-                attempts,
-                "Max retries exceeded; dropping request"
-            );
-            return Reply::ready();
-        }
+        tracing::warn!(
+            correlation_id = %request.correlation_id,
+            attempts,
+            queue_size = actor.model.queue.len(),
+            reason,
+            "Dropping rate-limited request"
+        );
 
-        if !queue_has_room(actor.model.queue.len(), config.rate_limit.max_queue_size) {
-            tracing::warn!(
-                correlation_id = %request.correlation_id,
-                queue_size = actor.model.queue.len(),
-                "Request queue full; dropping rate-limited request"
-            );
-            return Reply::ready();
-        }
-
-        // Ahead of newer work: this request was accepted first.
-        actor.model.queue.push_front(PendingRequest {
-            request,
-            attempts: attempts + 1,
-            queued_at: Instant::now(),
-        });
-
-        match actor
-            .model
-            .rate_limiter
-            .next_available_at(&config, Instant::now())
-        {
-            Some(available_at) => arm_drain_timer(actor, available_at),
-            None => drain_queue(actor),
-        }
-
-        Reply::ready()
+        // The dropped request's caller is still waiting on its stream. The
+        // dispatch path suppressed the terminal event because a retry was
+        // expected, so this handler owns closing the round; without it the
+        // caller waits forever. `StopReason` has no error variant, so
+        // `EndTurn` is the only terminal signal available.
+        let broker = actor.broker().clone();
+        let correlation_id = request.correlation_id;
+        Reply::pending(async move {
+            broker
+                .broadcast(LLMStreamEnd {
+                    correlation_id,
+                    stop_reason: StopReason::EndTurn,
+                })
+                .await;
+        })
     });
 
     // Handle request outcome reports from the processing helpers
@@ -775,15 +792,23 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                 "Failed to start streaming request"
             );
 
+            let will_retry = e.retry_after().is_some();
             report_failure(ctx, request, &e).await;
 
-            // Send stream end with error
-            broker
-                .broadcast(LLMStreamEnd {
-                    correlation_id: correlation_id.clone(),
-                    stop_reason: StopReason::EndTurn,
-                })
-                .await;
+            // A retryable failure keeps the round open: the retry runs under
+            // the same correlation ID, so ending the round here would both
+            // complete the caller's turn early and orphan the retry as a
+            // duplicate request nobody is collecting. If the provider drops
+            // the request instead of retrying, the `RateLimitReported`
+            // handler closes the round.
+            if !will_retry {
+                broker
+                    .broadcast(LLMStreamEnd {
+                        correlation_id: correlation_id.clone(),
+                        stop_reason: StopReason::EndTurn,
+                    })
+                    .await;
+            }
         }
     }
 }
@@ -1036,5 +1061,67 @@ mod tests {
             ProviderConfig::new("test-key").with_rate_limit(RateLimitConfig::default().without_queueing());
 
         assert!(config.streaming);
+    }
+
+    /// Observes `LLMStreamEnd` broadcasts so tests can assert a round closed.
+    #[acton_actor]
+    struct EndProbe;
+
+    #[tokio::test]
+    async fn dropped_rate_limited_request_closes_its_stream() {
+        use crate::llm::config::RetryConfig;
+        use crate::messages::Message;
+        use crate::types::{AgentId, CorrelationId};
+
+        let mut runtime = ActonApp::launch_async().await;
+
+        let (end_tx, mut end_rx) = tokio::sync::mpsc::channel::<CorrelationId>(1);
+        let mut probe = runtime.new_actor::<EndProbe>();
+        probe.act_on::<LLMStreamEnd>(move |_actor, ctx| {
+            let tx = end_tx.clone();
+            let correlation_id = ctx.message().correlation_id.clone();
+            Reply::pending(async move {
+                let _ = tx.send(correlation_id).await;
+            })
+        });
+        probe.handle().subscribe::<LLMStreamEnd>().await;
+        let _probe = probe.start().await;
+
+        let provider = LLMProvider::spawn(
+            &mut runtime,
+            ProviderConfig::new("test-key").with_retry(RetryConfig::no_retries()),
+        )
+        .await;
+
+        let request = LLMRequest {
+            correlation_id: CorrelationId::new(),
+            agent_id: AgentId::new(),
+            messages: vec![Message::user("hello")],
+            tools: None,
+            sampling: None,
+        };
+        let correlation_id = request.correlation_id.clone();
+
+        // With retries disabled the provider must drop this request — and a
+        // dropped request's caller is waiting on the stream, so the drop must
+        // broadcast the round's terminal event.
+        provider
+            .send(RateLimitReported {
+                retry_after: Duration::from_secs(60),
+                request,
+                attempts: 0,
+            })
+            .await;
+
+        let ended = tokio::time::timeout(Duration::from_secs(5), end_rx.recv())
+            .await
+            .expect("dropping a rate-limited request must close its stream")
+            .expect("probe channel closed before delivering the stream end");
+        assert_eq!(ended, correlation_id);
+
+        runtime
+            .shutdown_all()
+            .await
+            .expect("runtime should shut down cleanly");
     }
 }
