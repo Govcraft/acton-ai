@@ -37,7 +37,7 @@ pub const DEFAULT_FSIZE_LIMIT: u64 = 128 * 1024 * 1024;
 pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR"];
 
 /// OS-hardening policy applied to the child process.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum HardeningMode {
     /// Do not apply landlock/seccomp restrictions. Useful for local
@@ -45,15 +45,10 @@ pub enum HardeningMode {
     Off,
     /// Apply hardening, but tolerate failures (e.g. kernels without
     /// landlock support) by logging a warning and continuing.
+    #[default]
     BestEffort,
     /// Apply hardening, and abort child startup if any step fails.
     Enforce,
-}
-
-impl Default for HardeningMode {
-    fn default() -> Self {
-        Self::BestEffort
-    }
 }
 
 /// Configuration for a [`ProcessSandbox`](super) instance.

@@ -7,21 +7,16 @@ use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// The type of LLM provider to use.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ProviderType {
     /// Anthropic Claude API
+    #[default]
     Anthropic,
     /// OpenAI-compatible API (including Ollama, vLLM, LocalAI, etc.)
     OpenAI {
         /// Base URL for the API (e.g., "http://localhost:11434/v1" for Ollama)
         base_url: String,
     },
-}
-
-impl Default for ProviderType {
-    fn default() -> Self {
-        Self::Anthropic
-    }
 }
 
 impl ProviderType {
