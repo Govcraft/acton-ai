@@ -150,9 +150,22 @@ Reset the conversation to start fresh while keeping the system prompt:
 
 ```rust
 conv.send("Topic A discussion...").await?;
-conv.clear();  // Fire-and-forget, processed after in-flight sends
+conv.clear().await;  // Enqueued before anything you send next
 conv.send("Topic B discussion...").await?;
 // The LLM only sees Topic B, not Topic A
+```
+
+Awaiting the clear is what makes the ordering above a guarantee: mailboxes are
+FIFO per sender, so the clear is in the actor's mailbox before the call returns
+and cannot be overtaken by the `send()` that follows it.
+
+If you need to *read* the cleared history rather than just order against it,
+follow up with `sync()`:
+
+```rust
+conv.clear().await;
+conv.sync().await?;
+assert!(conv.is_empty());
 ```
 
 ### Restoring history
@@ -286,15 +299,15 @@ if let Some(prompt) = conv.system_prompt() {
     println!("Current: {}", prompt);
 }
 
-// Change it (takes effect on the next send)
-conv.set_system_prompt("You are now a creative writing assistant.");
+// Change it (takes effect on every subsequently enqueued send)
+conv.set_system_prompt("You are now a creative writing assistant.").await;
 
 // Clear it entirely
-conv.clear_system_prompt();
+conv.clear_system_prompt().await;
 ```
 
-{% callout type="note" title="Fire-and-forget updates" %}
-`set_system_prompt()` and `clear_system_prompt()` are fire-and-forget operations. They send a message to the actor and return immediately. The change takes effect on the next `send()` call.
+{% callout type="note" title="Enqueued, not yet applied" %}
+`set_system_prompt()` and `clear_system_prompt()` return once the change is in the actor's mailbox. That is enough to guarantee it applies to every `send()` you issue afterwards, but the actor may not have processed it yet — so `system_prompt()` can still report the old value immediately after. Call `sync()` first if you need to read it back.
 {% /callout %}
 
 ---

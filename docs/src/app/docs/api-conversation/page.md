@@ -103,14 +103,16 @@ for message in conv.history() {
 #### `clear()`
 
 ```rust
-pub fn clear(&self)
+pub async fn clear(&self)
 ```
 
-Clears the conversation history while keeping the system prompt. The clear is sent as a fire-and-forget message and will be processed after any in-flight sends complete.
+Clears the conversation history while keeping the system prompt.
+
+Awaiting the call enqueues the clear. Mailboxes are FIFO per sender, so the clear is guaranteed to be applied before anything you send afterwards, and after any send already in flight. Use [`sync()`](#sync) if you need to *observe* the cleared history rather than just order against it.
 
 ```rust
 conv.send("Topic A discussion...").await?;
-conv.clear();  // Start fresh
+conv.clear().await;  // Start fresh
 conv.send("Topic B discussion...").await?;
 ```
 
@@ -143,18 +145,36 @@ Returns the current system prompt, if set.
 #### `set_system_prompt()`
 
 ```rust
-pub fn set_system_prompt(&self, prompt: impl Into<String>)
+pub async fn set_system_prompt(&self, prompt: impl Into<String>)
 ```
 
-Sets or updates the system prompt. The change is fire-and-forget and takes effect on the next `send()` call.
+Sets or updates the system prompt. Awaiting the call enqueues the change, which then takes effect on every subsequently enqueued `send()`.
 
 #### `clear_system_prompt()`
 
 ```rust
-pub fn clear_system_prompt(&self)
+pub async fn clear_system_prompt(&self)
 ```
 
-Clears the system prompt.
+Clears the system prompt. Ordering behaves as for `set_system_prompt()`.
+
+#### `sync()`
+
+```rust
+pub async fn sync(&self) -> Result<(), ActonAIError>
+```
+
+Waits until every operation issued before this call has been applied.
+
+`clear()` and `set_system_prompt()` return once their message is enqueued, which orders them correctly against later calls but does not mean the actor has processed them yet. Call `sync()` when you need to observe the result — for example before reading `history()` or `system_prompt()`.
+
+```rust
+conv.clear().await;
+conv.sync().await?;
+assert!(conv.is_empty());
+```
+
+Returns an error if the conversation actor is gone, or if the acknowledgement does not arrive in time. A turn in flight is awaited, so calling `sync()` during a long generation can time out.
 
 ### Exit detection
 

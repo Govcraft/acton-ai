@@ -257,14 +257,26 @@ pub struct StreamToken {
     pub text: String,
 }
 
-/// Wrapper → ConversationActor: clear history (fire-and-forget).
+/// Wrapper → ConversationActor: clear history.
 #[derive(Clone, Debug)]
 struct ConvClear;
 
-/// Wrapper → ConversationActor: update system prompt (fire-and-forget).
+/// Wrapper → ConversationActor: update system prompt.
 #[derive(Clone, Debug)]
 struct ConvSetSystemPrompt {
     prompt: Option<String>,
+}
+
+/// Wrapper → ConversationActor: acknowledge once earlier messages are applied.
+#[derive(Clone, Debug)]
+struct ConvSync;
+
+/// ConversationActor → wrapper: acknowledgement for [`ConvSync`].
+#[derive(Clone, Debug)]
+struct ConvSynced;
+
+impl Request for ConvSync {
+    type Response = ConvSynced;
 }
 
 // =========================================================================
@@ -461,6 +473,19 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
 
         Reply::ready()
     });
+
+    // ----- ConvSync: acknowledge, proving earlier messages were applied -----
+    //
+    // Read-only, so it never blocks the mailbox. The mailbox is FIFO, so this
+    // message is taken only after every message enqueued before it has been
+    // handled — which is exactly the barrier `Conversation::sync` promises.
+    builder.act_on::<ConvSync>(|_actor, ctx| {
+        let reply = ctx.reply_envelope();
+
+        Reply::pending(async move {
+            reply.send(ConvSynced).await;
+        })
+    });
 }
 
 // =========================================================================
@@ -652,21 +677,21 @@ impl Conversation {
     /// This resets the conversation to a fresh state while keeping the system
     /// prompt. Use this to start a new topic without creating a new `Conversation`.
     ///
-    /// The clear is sent as a fire-and-forget message to the actor and will be
-    /// processed after any in-flight sends complete.
+    /// Awaiting this call enqueues the clear. Mailboxes are FIFO per sender, so
+    /// the clear is guaranteed to be applied before anything you send
+    /// afterwards, and after any send already in flight. Use
+    /// [`sync`](Self::sync) if you need to observe the cleared history rather
+    /// than just order against it.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// conv.send("Topic A discussion...").await?;
-    /// conv.clear();  // Start fresh
+    /// conv.clear().await;  // Start fresh
     /// conv.send("Topic B discussion...").await?;
     /// ```
-    pub fn clear(&self) {
-        let handle = self.handle.clone();
-        tokio::spawn(async move {
-            handle.send(ConvClear).await;
-        });
+    pub async fn clear(&self) {
+        self.handle.send(ConvClear).await;
     }
 
     /// Returns the number of messages in the conversation history.
@@ -690,26 +715,51 @@ impl Conversation {
     /// Sets or updates the system prompt.
     ///
     /// This can be used to change the assistant's behavior mid-conversation.
-    /// The change is sent as a fire-and-forget message and will take effect
-    /// on the next [`send`](Self::send) call.
-    pub fn set_system_prompt(&self, prompt: impl Into<String>) {
-        let handle = self.handle.clone();
-        let prompt = prompt.into();
-        tokio::spawn(async move {
-            handle
-                .send(ConvSetSystemPrompt {
-                    prompt: Some(prompt),
-                })
-                .await;
-        });
+    /// Awaiting this call enqueues the change, which then takes effect on every
+    /// subsequently enqueued [`send`](Self::send).
+    pub async fn set_system_prompt(&self, prompt: impl Into<String>) {
+        self.handle
+            .send(ConvSetSystemPrompt {
+                prompt: Some(prompt.into()),
+            })
+            .await;
     }
 
     /// Clears the system prompt.
-    pub fn clear_system_prompt(&self) {
-        let handle = self.handle.clone();
-        tokio::spawn(async move {
-            handle.send(ConvSetSystemPrompt { prompt: None }).await;
-        });
+    ///
+    /// Ordering behaves as described on
+    /// [`set_system_prompt`](Self::set_system_prompt).
+    pub async fn clear_system_prompt(&self) {
+        self.handle.send(ConvSetSystemPrompt { prompt: None }).await;
+    }
+
+    /// Waits until every operation issued before this call has been applied.
+    ///
+    /// [`clear`](Self::clear) and [`set_system_prompt`](Self::set_system_prompt)
+    /// return once their message is enqueued, which orders them correctly
+    /// against later calls but does not mean the actor has processed them yet.
+    /// Call `sync` when you need to *observe* the result — for example before
+    /// reading [`history`](Self::history) or [`system_prompt`](Self::system_prompt).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the conversation actor is gone, or if the
+    /// acknowledgement does not arrive in time. A turn in flight is awaited, so
+    /// calling `sync` during a long generation can time out.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// conv.clear().await;
+    /// conv.sync().await?;
+    /// assert!(conv.is_empty());
+    /// ```
+    pub async fn sync(&self) -> Result<(), ActonAIError> {
+        self.handle
+            .ask(ConvSync)
+            .await
+            .map(|ConvSynced| ())
+            .map_err(|e| ActonAIError::prompt_failed(format!("conversation sync failed: {e}")))
     }
 
     /// Returns `true` if the exit tool has been called.

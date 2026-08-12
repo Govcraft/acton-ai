@@ -314,7 +314,7 @@ pub async fn run(
             }
             slash::SlashAction::Help => println!("{}", slash::HELP_TEXT),
             slash::SlashAction::Clear => {
-                conv.clear();
+                conv.clear().await;
                 last_user_message = None;
                 // The DB still has historical rows; truncating would be a
                 // destructive surprise. New messages simply start fresh.
