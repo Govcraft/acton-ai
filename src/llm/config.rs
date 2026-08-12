@@ -190,7 +190,14 @@ impl SamplingParams {
 }
 
 /// Configuration for the LLM Provider actor.
+///
+/// Construct via [`ProviderConfig::new`], [`anthropic`](Self::anthropic),
+/// [`openai`](Self::openai), [`ollama`](Self::ollama), or
+/// [`openai_compatible`](Self::openai_compatible), then customize with the
+/// `with_*` builder methods. The struct is `#[non_exhaustive]` so new
+/// settings can be added without a breaking change.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct ProviderConfig {
     /// The type of LLM provider
     pub provider_type: ProviderType,
