@@ -213,6 +213,17 @@ pub struct ProviderConfig {
     /// Default sampling parameters for this provider
     #[serde(default, skip_serializing_if = "SamplingParams::is_empty")]
     pub sampling: SamplingParams,
+    /// Whether to stream responses token by token.
+    ///
+    /// Defaults to `true`. Set to `false` for providers or workloads where a
+    /// single complete response is preferable to incremental tokens.
+    #[serde(default = "default_streaming")]
+    pub streaming: bool,
+}
+
+/// Serde default for [`ProviderConfig::streaming`].
+const fn default_streaming() -> bool {
+    true
 }
 
 impl ProviderConfig {
@@ -265,6 +276,7 @@ impl ProviderConfig {
             rate_limit: RateLimitConfig::default(),
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
+            streaming: default_streaming(),
         }
     }
 
@@ -297,6 +309,7 @@ impl ProviderConfig {
             rate_limit: RateLimitConfig::new(1000, 1_000_000), // High limits for local
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
+            streaming: default_streaming(),
         }
     }
 
@@ -327,6 +340,7 @@ impl ProviderConfig {
             rate_limit: RateLimitConfig::default(),
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
+            streaming: default_streaming(),
         }
     }
 
@@ -359,6 +373,7 @@ impl ProviderConfig {
             rate_limit: RateLimitConfig::new(1000, 1_000_000),
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
+            streaming: default_streaming(),
         }
     }
 
@@ -408,6 +423,16 @@ impl ProviderConfig {
     #[must_use]
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Disables token-by-token streaming for this provider.
+    ///
+    /// Responses are delivered as a single `LLMResponse` once generation
+    /// completes. Streaming is enabled by default.
+    #[must_use]
+    pub fn without_streaming(mut self) -> Self {
+        self.streaming = false;
         self
     }
 

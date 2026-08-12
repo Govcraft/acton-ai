@@ -144,6 +144,7 @@ Available builder methods:
 | `.with_api_key(key)` | Set/override API key | From constructor |
 | `.with_base_url(url)` | Override the API base URL | Provider-dependent |
 | `.with_rate_limit(config)` | Rate limiting settings | 50 req/min, 40k tokens/min |
+| `.without_streaming()` | Deliver one complete response instead of tokens | Streaming on |
 | `.with_retry(config)` | Retry settings | 3 retries, exponential backoff |
 | `.with_sampling(params)` | Set all sampling parameters at once | None |
 | `.with_temperature(f64)` | Set sampling temperature | Provider default |
