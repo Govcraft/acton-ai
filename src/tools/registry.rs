@@ -9,6 +9,7 @@ use crate::tools::error::{ToolError, ToolErrorKind};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Message to initialize the Tool Registry.
 #[acton_message]
@@ -41,6 +42,10 @@ pub struct ToolListResponse {
     pub tools: Vec<ToolDefinition>,
 }
 
+impl Request for ListTools {
+    type Response = ToolListResponse;
+}
+
 /// The Tool Registry actor state.
 ///
 /// Manages tool registration, validation, and execution dispatch.
@@ -63,9 +68,31 @@ pub struct RegisteredTool {
     pub executor: Arc<BoxedToolExecutor>,
 }
 
-/// Metrics for the Tool Registry.
+/// Counters behind [`RegistryMetrics`].
+///
+/// Held behind an `Arc` so that the execution handler, which runs read-only and
+/// hands its work to a `'static` future, can still record the outcome.
+#[derive(Debug, Default)]
+struct RegistryCounters {
+    tools_registered: AtomicU64,
+    tools_unregistered: AtomicU64,
+    executions_requested: AtomicU64,
+    executions_succeeded: AtomicU64,
+    executions_failed: AtomicU64,
+}
+
+/// A handle to the Tool Registry's counters.
+///
+/// Cloning shares the same counters rather than copying their values; use
+/// [`snapshot`](Self::snapshot) for a point-in-time copy.
 #[derive(Debug, Clone, Default)]
 pub struct RegistryMetrics {
+    counters: Arc<RegistryCounters>,
+}
+
+/// A point-in-time copy of [`RegistryMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RegistryMetricsSnapshot {
     /// Total tools registered
     pub tools_registered: u64,
     /// Total tools unregistered
@@ -76,6 +103,50 @@ pub struct RegistryMetrics {
     pub executions_succeeded: u64,
     /// Total executions failed
     pub executions_failed: u64,
+}
+
+impl RegistryMetrics {
+    /// Total tools registered.
+    #[must_use]
+    pub fn tools_registered(&self) -> u64 {
+        self.counters.tools_registered.load(Ordering::Relaxed)
+    }
+
+    /// Total tools unregistered.
+    #[must_use]
+    pub fn tools_unregistered(&self) -> u64 {
+        self.counters.tools_unregistered.load(Ordering::Relaxed)
+    }
+
+    /// Total executions requested.
+    #[must_use]
+    pub fn executions_requested(&self) -> u64 {
+        self.counters.executions_requested.load(Ordering::Relaxed)
+    }
+
+    /// Total executions that completed successfully.
+    #[must_use]
+    pub fn executions_succeeded(&self) -> u64 {
+        self.counters.executions_succeeded.load(Ordering::Relaxed)
+    }
+
+    /// Total executions that failed.
+    #[must_use]
+    pub fn executions_failed(&self) -> u64 {
+        self.counters.executions_failed.load(Ordering::Relaxed)
+    }
+
+    /// Takes a point-in-time copy of every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> RegistryMetricsSnapshot {
+        RegistryMetricsSnapshot {
+            tools_registered: self.tools_registered(),
+            tools_unregistered: self.tools_unregistered(),
+            executions_requested: self.executions_requested(),
+            executions_succeeded: self.executions_succeeded(),
+            executions_failed: self.executions_failed(),
+        }
+    }
 }
 
 impl ToolRegistry {
@@ -105,9 +176,12 @@ impl ToolRegistry {
                 Reply::ready()
             })
             .before_stop(|actor| {
+                let metrics = actor.model.metrics.snapshot();
                 tracing::info!(
-                    tools_registered = actor.model.metrics.tools_registered,
-                    executions_requested = actor.model.metrics.executions_requested,
+                    tools_registered = metrics.tools_registered,
+                    executions_requested = metrics.executions_requested,
+                    executions_succeeded = metrics.executions_succeeded,
+                    executions_failed = metrics.executions_failed,
                     "Tool Registry shutting down"
                 );
                 Reply::ready()
@@ -163,7 +237,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
                     executor: msg.executor.clone(),
                 },
             );
-            actor.model.metrics.tools_registered += 1;
+            actor
+                .model
+                .metrics
+                .counters
+                .tools_registered
+                .fetch_add(1, Ordering::Relaxed);
 
             tracing::info!(
                 tool_name = %tool_name,
@@ -193,7 +272,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
             let tool_name = &envelope.message().tool_name;
 
             if actor.model.tools.remove(tool_name).is_some() {
-                actor.model.metrics.tools_unregistered += 1;
+                actor
+                    .model
+                    .metrics
+                    .counters
+                    .tools_unregistered
+                    .fetch_add(1, Ordering::Relaxed);
                 tracing::info!(tool_name = %tool_name, "Tool unregistered");
                 Reply::try_ok(())
             } else {
@@ -210,9 +294,15 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
             Box::pin(async {})
         });
 
-    // Handle tool execution with fallible handler
+    // Handle tool execution.
+    //
+    // Read-only: it looks a tool up and dispatches it, never touching the
+    // registry's own state. Under `try_mutate_on` the entire tool execution was
+    // awaited inline on the message loop, so the registry could run exactly one
+    // tool at a time and no other message — not even `ListTools` — could be
+    // served meanwhile.
     builder
-        .try_mutate_on::<ExecuteTool, (), ToolError>(|actor, envelope| {
+        .try_act_on::<ExecuteTool, (), ToolError>(|actor, envelope| {
             if actor.model.shutting_down {
                 return Reply::try_err(ToolError::shutting_down());
             }
@@ -222,8 +312,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
             let tool_name = msg.tool_call.name.clone();
             let args = msg.tool_call.arguments.clone();
             let tool_call_id = msg.tool_call.id.clone();
+            let metrics = actor.model.metrics.clone();
 
-            actor.model.metrics.executions_requested += 1;
+            metrics
+                .counters
+                .executions_requested
+                .fetch_add(1, Ordering::Relaxed);
 
             // Look up the tool
             let Some(registered) = actor.model.tools.get(&tool_name) else {
@@ -268,6 +362,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
                                 result: Ok(result_str),
                             })
                             .await;
+                        metrics
+                            .counters
+                            .executions_succeeded
+                            .fetch_add(1, Ordering::Relaxed);
                         Ok(())
                     }
                     Err(e) => {
@@ -297,7 +395,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ToolRegistry>) {
                 error = %error,
                 "Tool execution failed"
             );
-            actor.model.metrics.executions_failed += 1;
+            actor
+                .model
+                .metrics
+                .counters
+                .executions_failed
+                .fetch_add(1, Ordering::Relaxed);
             Box::pin(async {})
         });
 
@@ -323,14 +426,50 @@ mod tests {
     use super::*;
 
     #[test]
-    fn registry_metrics_default() {
+    fn registry_metrics_start_at_zero() {
         let metrics = RegistryMetrics::default();
 
-        assert_eq!(metrics.tools_registered, 0);
-        assert_eq!(metrics.tools_unregistered, 0);
-        assert_eq!(metrics.executions_requested, 0);
-        assert_eq!(metrics.executions_succeeded, 0);
-        assert_eq!(metrics.executions_failed, 0);
+        assert_eq!(metrics.snapshot(), RegistryMetricsSnapshot::default());
+    }
+
+    #[test]
+    fn cloned_metrics_share_counters() {
+        let metrics = RegistryMetrics::default();
+        let clone = metrics.clone();
+
+        clone
+            .counters
+            .executions_succeeded
+            .fetch_add(2, Ordering::Relaxed);
+
+        assert_eq!(
+            metrics.executions_succeeded(),
+            2,
+            "the execution future records through a clone, so clones must share counters"
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_every_counter() {
+        let metrics = RegistryMetrics::default();
+        let counters = &metrics.counters;
+
+        counters.tools_registered.fetch_add(1, Ordering::Relaxed);
+        counters.tools_unregistered.fetch_add(2, Ordering::Relaxed);
+        counters.executions_requested.fetch_add(3, Ordering::Relaxed);
+        counters.executions_succeeded.fetch_add(4, Ordering::Relaxed);
+        counters.executions_failed.fetch_add(5, Ordering::Relaxed);
+
+        assert_eq!(
+            metrics.snapshot(),
+            RegistryMetricsSnapshot {
+                tools_registered: 1,
+                tools_unregistered: 2,
+                executions_requested: 3,
+                executions_succeeded: 4,
+                executions_failed: 5,
+            }
+        );
     }
 
     #[test]
