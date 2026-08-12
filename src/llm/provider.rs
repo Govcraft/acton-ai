@@ -473,15 +473,14 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         // The dropped request's caller is still waiting on its stream. The
         // dispatch path suppressed the terminal event because a retry was
         // expected, so this handler owns closing the round; without it the
-        // caller waits forever. `StopReason` has no error variant, so
-        // `EndTurn` is the only terminal signal available.
+        // caller waits forever.
         let broker = actor.broker().clone();
         let correlation_id = request.correlation_id;
         Reply::pending(async move {
             broker
                 .broadcast(LLMStreamEnd {
                     correlation_id,
-                    stop_reason: StopReason::EndTurn,
+                    stop_reason: StopReason::Error,
                 })
                 .await;
         })
@@ -805,7 +804,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                 broker
                     .broadcast(LLMStreamEnd {
                         correlation_id: correlation_id.clone(),
-                        stop_reason: StopReason::EndTurn,
+                        stop_reason: StopReason::Error,
                     })
                     .await;
             }
@@ -1075,13 +1074,14 @@ mod tests {
 
         let mut runtime = ActonApp::launch_async().await;
 
-        let (end_tx, mut end_rx) = tokio::sync::mpsc::channel::<CorrelationId>(1);
+        let (end_tx, mut end_rx) = tokio::sync::mpsc::channel::<(CorrelationId, StopReason)>(1);
         let mut probe = runtime.new_actor::<EndProbe>();
         probe.act_on::<LLMStreamEnd>(move |_actor, ctx| {
             let tx = end_tx.clone();
             let correlation_id = ctx.message().correlation_id.clone();
+            let stop_reason = ctx.message().stop_reason;
             Reply::pending(async move {
-                let _ = tx.send(correlation_id).await;
+                let _ = tx.send((correlation_id, stop_reason)).await;
             })
         });
         probe.handle().subscribe::<LLMStreamEnd>().await;
@@ -1113,11 +1113,12 @@ mod tests {
             })
             .await;
 
-        let ended = tokio::time::timeout(Duration::from_secs(5), end_rx.recv())
+        let (ended, stop_reason) = tokio::time::timeout(Duration::from_secs(5), end_rx.recv())
             .await
             .expect("dropping a rate-limited request must close its stream")
             .expect("probe channel closed before delivering the stream end");
         assert_eq!(ended, correlation_id);
+        assert_eq!(stop_reason, StopReason::Error);
 
         runtime
             .shutdown_all()

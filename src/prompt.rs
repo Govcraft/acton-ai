@@ -853,6 +853,7 @@ impl PromptBuilder {
         let mut executed_tool_calls = Vec::new();
         let mut total_token_count = 0;
         let mut final_text;
+        let final_stop_reason;
         let mut rounds = 0;
 
         // Wrap callbacks in Arc<Mutex> for sharing across multiple rounds
@@ -910,13 +911,20 @@ impl PromptBuilder {
             total_token_count += token_count;
 
             match stop_reason {
+                StopReason::Error => {
+                    return Err(ActonAIError::prompt_failed(
+                        "LLM request failed; see provider logs for details",
+                    ));
+                }
                 StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
                     // Conversation complete
+                    final_stop_reason = stop_reason;
                     break;
                 }
                 StopReason::ToolUse => {
                     if tool_calls.is_empty() {
                         // No tool calls but ToolUse stop reason - treat as complete
+                        final_stop_reason = stop_reason;
                         break;
                     }
 
@@ -978,7 +986,7 @@ impl PromptBuilder {
 
         Ok(CollectedResponse::with_tool_calls(
             final_text,
-            StopReason::EndTurn,
+            final_stop_reason,
             total_token_count,
             executed_tool_calls,
         ))

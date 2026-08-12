@@ -401,6 +401,12 @@ pub enum StopReason {
     ToolUse,
     /// User-initiated stop
     StopSequence,
+    /// The request failed terminally and will not be retried.
+    ///
+    /// Emitted by the provider when a request errors without a retry (or
+    /// after retries are exhausted), so collectors can distinguish a failed
+    /// round from an empty successful one. Details are in the provider logs.
+    Error,
 }
 
 // =============================================================================
