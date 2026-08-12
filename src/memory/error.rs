@@ -16,7 +16,12 @@ pub struct PersistenceError {
 }
 
 /// Specific persistence error types.
+///
+/// Marked `#[non_exhaustive]`: this enum gains variants as the store learns to
+/// report more failure modes, and a downstream `match` should not break each
+/// time it does. Match on the variants you handle and add a `_` arm.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PersistenceErrorKind {
     /// Failed to open or create database
     DatabaseOpen {
@@ -56,6 +61,8 @@ pub enum PersistenceErrorKind {
     },
     /// Store is shutting down
     ShuttingDown,
+    /// Store has not finished opening its database yet
+    NotInitialized,
     /// Transaction failed
     TransactionFailed {
         /// Error message
@@ -169,6 +176,15 @@ impl PersistenceError {
         Self::new(PersistenceErrorKind::ShuttingDown)
     }
 
+    /// Creates a not-initialized error.
+    ///
+    /// Returned when a request reaches the store before `InitMemoryStore` has
+    /// finished opening the database.
+    #[must_use]
+    pub fn not_initialized() -> Self {
+        Self::new(PersistenceErrorKind::NotInitialized)
+    }
+
     /// Creates a transaction failed error.
     #[must_use]
     pub fn transaction_failed(message: impl Into<String>) -> Self {
@@ -232,6 +248,12 @@ impl PersistenceError {
     pub fn is_shutting_down(&self) -> bool {
         matches!(*self.kind, PersistenceErrorKind::ShuttingDown)
     }
+
+    /// Returns true if the store has not finished initializing.
+    #[must_use]
+    pub fn is_not_initialized(&self) -> bool {
+        matches!(*self.kind, PersistenceErrorKind::NotInitialized)
+    }
 }
 
 impl fmt::Display for PersistenceError {
@@ -271,6 +293,12 @@ impl fmt::Display for PersistenceError {
                 write!(
                     f,
                     "memory store is shutting down; cannot accept new requests"
+                )
+            }
+            PersistenceErrorKind::NotInitialized => {
+                write!(
+                    f,
+                    "memory store has no database connection; send InitMemoryStore and wait for it to complete before issuing requests"
                 )
             }
             PersistenceErrorKind::TransactionFailed { message } => {
@@ -380,6 +408,31 @@ mod tests {
         assert!(error.is_shutting_down());
         let msg = error.to_string();
         assert!(msg.contains("shutting down"));
+    }
+
+    #[test]
+    fn persistence_error_not_initialized() {
+        let error = PersistenceError::not_initialized();
+
+        assert!(error.is_not_initialized());
+        assert!(!error.is_shutting_down());
+    }
+
+    #[test]
+    fn not_initialized_message_says_what_to_do_about_it() {
+        let msg = PersistenceError::not_initialized().to_string();
+
+        assert!(
+            msg.contains("InitMemoryStore"),
+            "the message must name the fix, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn not_initialized_is_not_retriable_without_action() {
+        // Retrying the same request against a store that was never initialized
+        // will fail identically; the caller has to initialize it first.
+        assert!(!PersistenceError::not_initialized().is_retriable());
     }
 
     #[test]

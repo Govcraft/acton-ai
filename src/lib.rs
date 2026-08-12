@@ -104,11 +104,12 @@ pub mod prelude {
         RateLimitConfig, SamplingParams,
     };
     pub use crate::memory::{
-        AgentStateSnapshot, ContextStats, ContextWindow, ContextWindowConfig,
+        AgentStateSnapshot, ContextStats, ContextWindow, ContextWindowConfig, ContextWindowData,
         ContextWindowResponse, Embedding, EmbeddingError, EmbeddingProvider, GetContextWindow,
         InitMemoryStore, LoadMemories, MemoriesLoaded, Memory, MemorySearchResults, MemoryStore,
-        MemoryStoreMetrics, MemoryStored, PersistenceConfig, PersistenceError, ScoredMemory,
-        SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
+        MemoryStoreMetrics, MemoryStoreMetricsSnapshot, MemoryStored, OperationCompleted,
+        PersistenceConfig, PersistenceError, ScoredMemory, SearchMemories, StoreMemory,
+        StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
     pub use crate::tools::builtins::BuiltinTools;

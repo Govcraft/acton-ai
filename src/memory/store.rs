@@ -2,6 +2,21 @@
 //!
 //! The `MemoryStore` actor manages all database operations asynchronously,
 //! spawning tokio tasks for database operations to avoid Sync constraints.
+//!
+//! # Replies are `ask`-oriented
+//!
+//! Every request in this module has a matching response type carrying a
+//! `Result`, and every failure path replies. Use [`ActorHandle::ask`] to issue
+//! them:
+//!
+//! ```rust,ignore
+//! let loaded = store.ask(LoadMemories { agent_id, limit: None }).await?;
+//! let memories = loaded.result?;
+//! ```
+//!
+//! A plain `send` discards the reply. acton-reactive points a handler's reply
+//! envelope back at the *receiving* actor unless the caller used `ask`, so a
+//! reply to a `send` goes nowhere.
 
 use crate::memory::context::{ContextStats, ContextWindow, ContextWindowConfig};
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
@@ -11,6 +26,10 @@ use crate::messages::Message;
 use crate::types::{AgentId, ConversationId, MemoryId, MessageId};
 use acton_reactive::prelude::*;
 use libsql::{Connection, Database};
+use std::future::Future;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 // =============================================================================
 // Messages
@@ -30,11 +49,15 @@ pub struct CreateConversation {
     pub agent_id: AgentId,
 }
 
-/// Response with newly created conversation ID.
+/// Response with the newly created conversation ID.
 #[acton_message]
 pub struct ConversationCreated {
-    /// The ID of the new conversation
-    pub conversation_id: ConversationId,
+    /// The new conversation ID, or why one could not be created
+    pub result: Result<ConversationId, PersistenceError>,
+}
+
+impl Request for CreateConversation {
+    type Response = ConversationCreated;
 }
 
 /// Request to save a message.
@@ -46,11 +69,15 @@ pub struct SaveMessage {
     pub message: Message,
 }
 
-/// Response with saved message ID.
+/// Response with the saved message ID.
 #[acton_message]
 pub struct MessageSaved {
-    /// The ID of the saved message
-    pub message_id: MessageId,
+    /// The ID of the saved message, or why it could not be saved
+    pub result: Result<MessageId, PersistenceError>,
+}
+
+impl Request for SaveMessage {
+    type Response = MessageSaved;
 }
 
 /// Request to load conversation messages.
@@ -60,13 +87,17 @@ pub struct LoadConversation {
     pub conversation_id: ConversationId,
 }
 
-/// Response with loaded messages.
+/// Response with the loaded messages.
 #[acton_message]
 pub struct ConversationLoaded {
-    /// The conversation ID
+    /// The conversation that was requested
     pub conversation_id: ConversationId,
-    /// The messages in the conversation
-    pub messages: Vec<Message>,
+    /// The messages in the conversation, or why they could not be loaded
+    pub result: Result<Vec<Message>, PersistenceError>,
+}
+
+impl Request for LoadConversation {
+    type Response = ConversationLoaded;
 }
 
 /// Request to get an agent's latest conversation.
@@ -76,32 +107,46 @@ pub struct GetLatestConversation {
     pub agent_id: AgentId,
 }
 
-/// Response with optional conversation ID.
+/// Response with the agent's most recent conversation.
 #[acton_message]
 pub struct LatestConversationResponse {
-    /// The latest conversation ID if one exists
-    pub conversation_id: Option<ConversationId>,
+    /// The latest conversation ID, `Ok(None)` if the agent has none, or why
+    /// the lookup failed
+    pub result: Result<Option<ConversationId>, PersistenceError>,
 }
 
-/// Request to save agent state snapshot.
+impl Request for GetLatestConversation {
+    type Response = LatestConversationResponse;
+}
+
+/// Request to save an agent state snapshot.
 #[acton_message]
 pub struct SaveAgentState {
     /// The state snapshot to save
     pub snapshot: AgentStateSnapshot,
 }
 
-/// Request to load agent state snapshot.
+impl Request for SaveAgentState {
+    type Response = OperationCompleted;
+}
+
+/// Request to load an agent state snapshot.
 #[acton_message]
 pub struct LoadAgentState {
     /// The agent to load state for
     pub agent_id: AgentId,
 }
 
-/// Response with optional agent state.
+/// Response with the agent's stored state.
 #[acton_message]
 pub struct AgentStateLoaded {
-    /// The loaded state snapshot if one exists
-    pub snapshot: Option<AgentStateSnapshot>,
+    /// The stored snapshot, `Ok(None)` if the agent has none, or why the load
+    /// failed
+    pub result: Result<Option<AgentStateSnapshot>, PersistenceError>,
+}
+
+impl Request for LoadAgentState {
+    type Response = AgentStateLoaded;
 }
 
 /// Request to delete a conversation.
@@ -111,6 +156,10 @@ pub struct DeleteConversation {
     pub conversation_id: ConversationId,
 }
 
+impl Request for DeleteConversation {
+    type Response = OperationCompleted;
+}
+
 /// Request to list all conversations for an agent.
 #[acton_message]
 pub struct ListConversations {
@@ -118,18 +167,34 @@ pub struct ListConversations {
     pub agent_id: AgentId,
 }
 
-/// Response with conversation list.
+/// Response with the agent's conversations.
 #[acton_message]
 pub struct ConversationList {
-    /// The list of conversation IDs
-    pub conversations: Vec<ConversationId>,
+    /// The conversation IDs, most recent first, or why they could not be listed
+    pub result: Result<Vec<ConversationId>, PersistenceError>,
+}
+
+impl Request for ListConversations {
+    type Response = ConversationList;
+}
+
+/// Response for a request whose only outcome is success or failure.
+///
+/// Used by the delete and state-save requests, which have nothing to return
+/// but still need to report failure rather than fail silently.
+#[acton_message]
+pub struct OperationCompleted {
+    /// The operation that was attempted, for logging and correlation
+    pub operation: &'static str,
+    /// Whether it succeeded, and why not if it did not
+    pub result: Result<(), PersistenceError>,
 }
 
 // -----------------------------------------------------------------------------
 // Memory Messages
 // -----------------------------------------------------------------------------
 
-/// Request to store a memory with optional embedding.
+/// Request to store a memory with an optional embedding.
 #[acton_message]
 pub struct StoreMemory {
     /// The agent this memory belongs to
@@ -140,11 +205,15 @@ pub struct StoreMemory {
     pub embedding: Option<Embedding>,
 }
 
-/// Response with stored memory ID.
+/// Response with the stored memory ID.
 #[acton_message]
 pub struct MemoryStored {
-    /// The ID of the stored memory
-    pub memory_id: MemoryId,
+    /// The ID of the stored memory, or why it could not be stored
+    pub result: Result<MemoryId, PersistenceError>,
+}
+
+impl Request for StoreMemory {
+    type Response = MemoryStored;
 }
 
 /// Request to search memories by semantic similarity.
@@ -163,8 +232,12 @@ pub struct SearchMemories {
 /// Response with ranked memory results.
 #[acton_message]
 pub struct MemorySearchResults {
-    /// Memories ranked by similarity (highest first)
-    pub results: Vec<ScoredMemory>,
+    /// Memories ranked by similarity (highest first), or why the search failed
+    pub result: Result<Vec<ScoredMemory>, PersistenceError>,
+}
+
+impl Request for SearchMemories {
+    type Response = MemorySearchResults;
 }
 
 /// Request to load memories for an agent.
@@ -176,11 +249,15 @@ pub struct LoadMemories {
     pub limit: Option<usize>,
 }
 
-/// Response with loaded memories.
+/// Response with the loaded memories.
 #[acton_message]
 pub struct MemoriesLoaded {
-    /// The loaded memories
-    pub memories: Vec<Memory>,
+    /// The loaded memories, or why they could not be loaded
+    pub result: Result<Vec<Memory>, PersistenceError>,
+}
+
+impl Request for LoadMemories {
+    type Response = MemoriesLoaded;
 }
 
 /// Request to delete a memory.
@@ -190,11 +267,19 @@ pub struct DeleteMemory {
     pub memory_id: MemoryId,
 }
 
+impl Request for DeleteMemory {
+    type Response = OperationCompleted;
+}
+
 /// Request to delete all memories for an agent.
 #[acton_message]
 pub struct DeleteAgentMemories {
     /// The agent whose memories to delete
     pub agent_id: AgentId,
+}
+
+impl Request for DeleteAgentMemories {
+    type Response = OperationCompleted;
 }
 
 /// Internal message to set the database connection after async initialization.
@@ -204,7 +289,7 @@ struct SetConnection {
     conn: Connection,
 }
 
-/// Request optimized context window.
+/// Request an optimized context window.
 #[acton_message]
 pub struct GetContextWindow {
     /// The agent requesting context
@@ -221,24 +306,60 @@ pub struct GetContextWindow {
     pub memory_limit: usize,
 }
 
-/// Response with optimized context.
-#[acton_message]
-pub struct ContextWindowResponse {
+/// A built context window.
+#[derive(Debug, Clone)]
+pub struct ContextWindowData {
     /// Optimized messages for LLM context
     pub messages: Vec<Message>,
     /// Statistics about the context window
     pub stats: ContextStats,
-    /// Memories included in context
+    /// Number of memories included in the context
     pub included_memories: usize,
+}
+
+/// Response with the optimized context.
+#[acton_message]
+pub struct ContextWindowResponse {
+    /// The built context window, or why it could not be built
+    pub result: Result<ContextWindowData, PersistenceError>,
+}
+
+impl Request for GetContextWindow {
+    type Response = ContextWindowResponse;
 }
 
 // =============================================================================
 // Metrics
 // =============================================================================
 
-/// Metrics for the Memory Store.
+/// Counters behind [`MemoryStoreMetrics`].
+///
+/// Held behind an `Arc` so read-only (`act_on`) handlers, which receive the
+/// actor by shared reference, can still record what they did.
+#[derive(Debug, Default)]
+struct MemoryStoreCounters {
+    conversations_created: AtomicU64,
+    messages_saved: AtomicU64,
+    conversations_loaded: AtomicU64,
+    state_saves: AtomicU64,
+    state_loads: AtomicU64,
+    memories_stored: AtomicU64,
+    memory_searches: AtomicU64,
+    context_windows_built: AtomicU64,
+}
+
+/// A handle to the Memory Store's counters.
+///
+/// Cloning shares the same counters rather than copying their values; use
+/// [`snapshot`](Self::snapshot) for a point-in-time copy.
 #[derive(Debug, Clone, Default)]
 pub struct MemoryStoreMetrics {
+    counters: Arc<MemoryStoreCounters>,
+}
+
+/// A point-in-time copy of [`MemoryStoreMetrics`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MemoryStoreMetricsSnapshot {
     /// Number of conversations created
     pub conversations_created: u64,
     /// Number of messages saved
@@ -255,6 +376,71 @@ pub struct MemoryStoreMetrics {
     pub memory_searches: u64,
     /// Number of context windows built
     pub context_windows_built: u64,
+}
+
+impl MemoryStoreMetrics {
+    /// Number of conversations created.
+    #[must_use]
+    pub fn conversations_created(&self) -> u64 {
+        self.counters.conversations_created.load(Ordering::Relaxed)
+    }
+
+    /// Number of messages saved.
+    #[must_use]
+    pub fn messages_saved(&self) -> u64 {
+        self.counters.messages_saved.load(Ordering::Relaxed)
+    }
+
+    /// Number of conversations loaded.
+    #[must_use]
+    pub fn conversations_loaded(&self) -> u64 {
+        self.counters.conversations_loaded.load(Ordering::Relaxed)
+    }
+
+    /// Number of agent state saves.
+    #[must_use]
+    pub fn state_saves(&self) -> u64 {
+        self.counters.state_saves.load(Ordering::Relaxed)
+    }
+
+    /// Number of agent state loads.
+    #[must_use]
+    pub fn state_loads(&self) -> u64 {
+        self.counters.state_loads.load(Ordering::Relaxed)
+    }
+
+    /// Number of memories stored.
+    #[must_use]
+    pub fn memories_stored(&self) -> u64 {
+        self.counters.memories_stored.load(Ordering::Relaxed)
+    }
+
+    /// Number of memory searches performed.
+    #[must_use]
+    pub fn memory_searches(&self) -> u64 {
+        self.counters.memory_searches.load(Ordering::Relaxed)
+    }
+
+    /// Number of context windows built.
+    #[must_use]
+    pub fn context_windows_built(&self) -> u64 {
+        self.counters.context_windows_built.load(Ordering::Relaxed)
+    }
+
+    /// Takes a point-in-time copy of every counter.
+    #[must_use]
+    pub fn snapshot(&self) -> MemoryStoreMetricsSnapshot {
+        MemoryStoreMetricsSnapshot {
+            conversations_created: self.conversations_created(),
+            messages_saved: self.messages_saved(),
+            conversations_loaded: self.conversations_loaded(),
+            state_saves: self.state_saves(),
+            state_loads: self.state_loads(),
+            memories_stored: self.memories_stored(),
+            memory_searches: self.memory_searches(),
+            context_windows_built: self.context_windows_built(),
+        }
+    }
 }
 
 // =============================================================================
@@ -300,9 +486,10 @@ impl MemoryStore {
                 Reply::ready()
             })
             .before_stop(|actor| {
+                let metrics = actor.model.metrics.snapshot();
                 tracing::info!(
-                    conversations_created = actor.model.metrics.conversations_created,
-                    messages_saved = actor.model.metrics.messages_saved,
+                    conversations_created = metrics.conversations_created,
+                    messages_saved = metrics.messages_saved,
                     "Memory Store shutting down"
                 );
                 Reply::ready()
@@ -313,15 +500,78 @@ impl MemoryStore {
 
         builder.start().await
     }
+
+    /// Returns a usable connection, or the reason there is not one.
+    ///
+    /// Callers turn the error into a reply so that a request issued before
+    /// initialization completes, or during shutdown, gets a definite answer
+    /// instead of silence.
+    fn ready_connection(&self) -> Result<Connection, PersistenceError> {
+        if self.shutting_down {
+            return Err(PersistenceError::shutting_down());
+        }
+
+        self.connection
+            .clone()
+            .ok_or_else(PersistenceError::not_initialized)
+    }
+}
+
+// =============================================================================
+// Handler plumbing
+// =============================================================================
+
+/// The future type acton-reactive expects back from a handler.
+///
+/// Mirrors the crate's internal `FutureBox`, which is not publicly exported.
+/// The `Sync` bound is what forces database work onto a task: libsql's futures
+/// are `Send` but not `Sync`.
+type ReplyFuture = Pin<Box<dyn Future<Output = ()> + Send + Sync + 'static>>;
+
+/// Runs database work on a task while keeping it attached to the handler.
+///
+/// libsql's futures are not `Sync`, but acton-reactive's reply futures must be
+/// `Send + Sync`. A `JoinHandle` is both, so the work is spawned and the handle
+/// awaited inside the reply future — the work stays tied to the handler's
+/// lifetime rather than being detached and forgotten.
+fn attached<F>(work: F) -> ReplyFuture
+where
+    F: Future<Output = ()> + Send + 'static,
+{
+    let task = tokio::spawn(work);
+
+    Reply::pending(async move {
+        if let Err(e) = task.await {
+            tracing::error!(error = %e, "Memory store task did not complete");
+        }
+    })
+}
+
+/// Sends a reply that is already known without touching the database.
+fn reply_now<M>(reply: OutboundEnvelope, message: M) -> ReplyFuture
+where
+    M: ActonMessage + 'static,
+{
+    Reply::pending(async move {
+        reply.send(message).await;
+    })
+}
+
+/// Logs a failed operation, leaving successes silent.
+fn log_failure<T>(operation: &'static str, result: &Result<T, PersistenceError>) {
+    if let Err(e) = result {
+        tracing::error!(operation, error = %e, "Memory store operation failed");
+    }
 }
 
 /// Configures message handlers for the Memory Store actor.
 fn configure_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     configure_init_handler(builder);
-    configure_conversation_handlers(builder);
-    configure_message_handlers(builder);
+    configure_conversation_write_handlers(builder);
+    configure_conversation_read_handlers(builder);
     configure_state_handlers(builder);
-    configure_memory_handlers(builder);
+    configure_memory_write_handlers(builder);
+    configure_memory_read_handlers(builder);
 }
 
 /// Configures the initialization handler.
@@ -338,9 +588,7 @@ fn configure_init_handler(builder: &mut ManagedActor<Idle, MemoryStore>) {
         let actor_handle = actor.handle().clone();
         actor.model.config = Some(config.clone());
 
-        // Spawn a tokio task to do the async database work
-        // The JoinHandle is Send + Sync, so we can use it in Reply::pending
-        let handle = tokio::spawn(async move {
+        attached(async move {
             match initialize_database(&config).await {
                 Ok((_db, conn)) => {
                     // Send connection back to actor via message
@@ -351,10 +599,6 @@ fn configure_init_handler(builder: &mut ManagedActor<Idle, MemoryStore>) {
                     tracing::error!(error = %e, "Memory Store initialization failed");
                 }
             }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
         })
     });
 }
@@ -371,514 +615,479 @@ async fn initialize_database(
     Ok((db, conn))
 }
 
-/// Configures conversation-related handlers.
-fn configure_conversation_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
-    // Handle conversation creation
+// -----------------------------------------------------------------------------
+// Conversation writes
+//
+// These stay on `mutate_on` deliberately. acton-reactive does not guarantee
+// ordering between read-only handlers, and a conversation log is order
+// sensitive: two racing `SaveMessage`s would persist a user turn and the
+// assistant turn that answered it in an arbitrary order.
+// -----------------------------------------------------------------------------
+
+/// Configures the conversation handlers that write.
+fn configure_conversation_write_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     builder.mutate_on::<CreateConversation>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting CreateConversation - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
+        let reply = envelope.reply_envelope();
         let agent_id = envelope.message().agent_id.clone();
-        let reply = envelope.reply_envelope();
-        actor.model.metrics.conversations_created += 1;
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, ConversationCreated { result: Err(e) }),
+        };
 
-            match persistence::create_conversation(&conn, &agent_id).await {
-                Ok(conversation_id) => {
-                    reply.send(ConversationCreated { conversation_id }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to create conversation");
-                }
-            }
-        });
+        actor
+            .model
+            .metrics
+            .counters
+            .conversations_created
+            .fetch_add(1, Ordering::Relaxed);
 
-        Reply::pending(async move {
-            let _ = handle.await;
+        attached(async move {
+            let result = persistence::create_conversation(&conn, &agent_id).await;
+            log_failure("create_conversation", &result);
+            reply.send(ConversationCreated { result }).await;
         })
     });
 
-    // Handle conversation loading
-    builder.mutate_on::<LoadConversation>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting LoadConversation - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let conversation_id = envelope.message().conversation_id.clone();
-        let reply = envelope.reply_envelope();
-        actor.model.metrics.conversations_loaded += 1;
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            match persistence::load_conversation_messages(&conn, &conversation_id).await {
-                Ok(messages) => {
-                    reply
-                        .send(ConversationLoaded {
-                            conversation_id,
-                            messages,
-                        })
-                        .await;
-                }
-                Err(e) => {
-                    tracing::error!(conversation_id = %conversation_id, error = %e, "Failed to load conversation");
-                }
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
-
-    // Handle get latest conversation
-    builder.mutate_on::<GetLatestConversation>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting GetLatestConversation - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let agent_id = envelope.message().agent_id.clone();
-        let reply = envelope.reply_envelope();
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            match persistence::get_latest_conversation(&conn, &agent_id).await {
-                Ok(conversation_id) => {
-                    reply
-                        .send(LatestConversationResponse { conversation_id })
-                        .await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to get latest conversation");
-                }
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
-
-    // Handle conversation deletion
-    builder.mutate_on::<DeleteConversation>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting DeleteConversation - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let conversation_id = envelope.message().conversation_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            if let Err(e) = persistence::delete_conversation(&conn, &conversation_id).await {
-                tracing::error!(conversation_id = %conversation_id, error = %e, "Failed to delete conversation");
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
-
-    // Handle list conversations
-    builder.mutate_on::<ListConversations>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting ListConversations - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let agent_id = envelope.message().agent_id.clone();
-        let reply = envelope.reply_envelope();
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            match persistence::list_conversations(&conn, &agent_id).await {
-                Ok(conversations) => {
-                    reply.send(ConversationList { conversations }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to list conversations");
-                }
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
-}
-
-/// Configures message-related handlers.
-fn configure_message_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     builder.mutate_on::<SaveMessage>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting SaveMessage - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
+        let reply = envelope.reply_envelope();
         let msg = envelope.message();
         let conversation_id = msg.conversation_id.clone();
         let message = msg.message.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, MessageSaved { result: Err(e) }),
+        };
+
+        actor
+            .model
+            .metrics
+            .counters
+            .messages_saved
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
+            let result = persistence::save_message(&conn, &conversation_id, &message).await;
+            log_failure("save_message", &result);
+            reply.send(MessageSaved { result }).await;
+        })
+    });
+
+    builder.mutate_on::<DeleteConversation>(|actor, envelope| {
         let reply = envelope.reply_envelope();
-        actor.model.metrics.messages_saved += 1;
+        let conversation_id = envelope.message().conversation_id.clone();
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            match persistence::save_message(&conn, &conversation_id, &message).await {
-                Ok(message_id) => {
-                    reply.send(MessageSaved { message_id }).await;
-                }
-                Err(e) => {
-                    tracing::error!(conversation_id = %conversation_id, error = %e, "Failed to save message");
-                }
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    OperationCompleted {
+                        operation: "delete_conversation",
+                        result: Err(e),
+                    },
+                );
             }
-        });
+        };
 
-        Reply::pending(async move {
-            let _ = handle.await;
+        attached(async move {
+            let result = persistence::delete_conversation(&conn, &conversation_id).await;
+            log_failure("delete_conversation", &result);
+            reply
+                .send(OperationCompleted {
+                    operation: "delete_conversation",
+                    result,
+                })
+                .await;
         })
     });
 }
+
+// -----------------------------------------------------------------------------
+// Conversation reads
+//
+// Read-only against the actor's own state, so they run on `act_on` and overlap
+// with each other instead of serialising the whole store behind one query.
+// -----------------------------------------------------------------------------
+
+/// Configures the conversation handlers that only read.
+fn configure_conversation_read_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.act_on::<LoadConversation>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let conversation_id = envelope.message().conversation_id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    ConversationLoaded {
+                        conversation_id,
+                        result: Err(e),
+                    },
+                );
+            }
+        };
+
+        actor
+            .model
+            .metrics
+            .counters
+            .conversations_loaded
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
+            let result = persistence::load_conversation_messages(&conn, &conversation_id).await;
+            log_failure("load_conversation", &result);
+            reply
+                .send(ConversationLoaded {
+                    conversation_id,
+                    result,
+                })
+                .await;
+        })
+    });
+
+    builder.act_on::<GetLatestConversation>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let agent_id = envelope.message().agent_id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, LatestConversationResponse { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::get_latest_conversation(&conn, &agent_id).await;
+            log_failure("get_latest_conversation", &result);
+            reply.send(LatestConversationResponse { result }).await;
+        })
+    });
+
+    builder.act_on::<ListConversations>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let agent_id = envelope.message().agent_id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, ConversationList { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::list_conversations(&conn, &agent_id).await;
+            log_failure("list_conversations", &result);
+            reply.send(ConversationList { result }).await;
+        })
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Agent state
+// -----------------------------------------------------------------------------
 
 /// Configures agent state handlers.
 fn configure_state_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
-    // Handle save agent state
+    // A write, and an upsert at that: concurrent saves for one agent would make
+    // last-writer-wins nondeterministic, so this stays on the serial path.
     builder.mutate_on::<SaveAgentState>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting SaveAgentState - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
+        let reply = envelope.reply_envelope();
         let snapshot = envelope.message().snapshot.clone();
-        actor.model.metrics.state_saves += 1;
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            if let Err(e) = persistence::save_agent_state(&conn, &snapshot).await {
-                tracing::error!(agent_id = %snapshot.agent_id, error = %e, "Failed to save agent state");
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    OperationCompleted {
+                        operation: "save_agent_state",
+                        result: Err(e),
+                    },
+                );
             }
-        });
+        };
 
-        Reply::pending(async move {
-            let _ = handle.await;
+        actor
+            .model
+            .metrics
+            .counters
+            .state_saves
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
+            let result = persistence::save_agent_state(&conn, &snapshot).await;
+            log_failure("save_agent_state", &result);
+            reply
+                .send(OperationCompleted {
+                    operation: "save_agent_state",
+                    result,
+                })
+                .await;
         })
     });
 
-    // Handle load agent state
-    builder.mutate_on::<LoadAgentState>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting LoadAgentState - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let agent_id = envelope.message().agent_id.clone();
+    builder.act_on::<LoadAgentState>(|actor, envelope| {
         let reply = envelope.reply_envelope();
-        actor.model.metrics.state_loads += 1;
+        let agent_id = envelope.message().agent_id.clone();
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, AgentStateLoaded { result: Err(e) }),
+        };
 
-            match persistence::load_agent_state(&conn, &agent_id).await {
-                Ok(snapshot) => {
-                    reply.send(AgentStateLoaded { snapshot }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to load agent state");
-                }
-            }
-        });
+        actor
+            .model
+            .metrics
+            .counters
+            .state_loads
+            .fetch_add(1, Ordering::Relaxed);
 
-        Reply::pending(async move {
-            let _ = handle.await;
+        attached(async move {
+            let result = persistence::load_agent_state(&conn, &agent_id).await;
+            log_failure("load_agent_state", &result);
+            reply.send(AgentStateLoaded { result }).await;
         })
     });
 }
 
-/// Configures memory-related handlers.
-fn configure_memory_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
-    // Handle store memory
-    builder.mutate_on::<StoreMemory>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting StoreMemory - store is shutting down");
-            return Reply::ready();
-        }
+// -----------------------------------------------------------------------------
+// Memory writes
+// -----------------------------------------------------------------------------
 
-        let conn = actor.model.connection.clone();
+/// Configures the memory handlers that write.
+fn configure_memory_write_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.mutate_on::<StoreMemory>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let content = msg.content.clone();
         let embedding = msg.embedding.clone();
-        let reply = envelope.reply_envelope();
-        actor.model.metrics.memories_stored += 1;
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, MemoryStored { result: Err(e) }),
+        };
 
+        actor
+            .model
+            .metrics
+            .counters
+            .memories_stored
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
             let memory = match embedding {
-                Some(emb) => Memory::with_embedding(agent_id.clone(), content, emb),
-                None => Memory::new(agent_id.clone(), content),
+                Some(emb) => Memory::with_embedding(agent_id, content, emb),
+                None => Memory::new(agent_id, content),
             };
 
-            match persistence::save_memory(&conn, &memory).await {
-                Ok(memory_id) => {
-                    reply.send(MemoryStored { memory_id }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to store memory");
-                }
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
+            let result = persistence::save_memory(&conn, &memory).await;
+            log_failure("store_memory", &result);
+            reply.send(MemoryStored { result }).await;
         })
     });
 
-    // Handle search memories
-    builder.mutate_on::<SearchMemories>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting SearchMemories - store is shutting down");
-            return Reply::ready();
-        }
+    builder.mutate_on::<DeleteMemory>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let memory_id = envelope.message().memory_id.clone();
 
-        let conn = actor.model.connection.clone();
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    OperationCompleted {
+                        operation: "delete_memory",
+                        result: Err(e),
+                    },
+                );
+            }
+        };
+
+        attached(async move {
+            let result = persistence::delete_memory(&conn, &memory_id).await;
+            log_failure("delete_memory", &result);
+            reply
+                .send(OperationCompleted {
+                    operation: "delete_memory",
+                    result,
+                })
+                .await;
+        })
+    });
+
+    builder.mutate_on::<DeleteAgentMemories>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let agent_id = envelope.message().agent_id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    OperationCompleted {
+                        operation: "delete_agent_memories",
+                        result: Err(e),
+                    },
+                );
+            }
+        };
+
+        attached(async move {
+            let result = persistence::delete_memories_for_agent(&conn, &agent_id).await;
+            log_failure("delete_agent_memories", &result);
+            reply
+                .send(OperationCompleted {
+                    operation: "delete_agent_memories",
+                    result,
+                })
+                .await;
+        })
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Memory reads
+// -----------------------------------------------------------------------------
+
+/// Configures the memory handlers that only read.
+fn configure_memory_read_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.act_on::<SearchMemories>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let query_embedding = msg.query_embedding.clone();
         let limit = msg.limit;
         let min_similarity = msg.min_similarity;
-        let reply = envelope.reply_envelope();
-        actor.model.metrics.memory_searches += 1;
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, MemorySearchResults { result: Err(e) }),
+        };
 
-            match persistence::search_memories_by_embedding(
+        actor
+            .model
+            .metrics
+            .counters
+            .memory_searches
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
+            let result = persistence::search_memories_by_embedding(
                 &conn,
                 &agent_id,
                 &query_embedding,
                 limit,
                 min_similarity,
             )
-            .await
-            {
-                Ok(results) => {
-                    reply.send(MemorySearchResults { results }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to search memories");
-                }
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
+            .await;
+            log_failure("search_memories", &result);
+            reply.send(MemorySearchResults { result }).await;
         })
     });
 
-    // Handle load memories
-    builder.mutate_on::<LoadMemories>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting LoadMemories - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
+    builder.act_on::<LoadMemories>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
         let msg = envelope.message();
         let agent_id = msg.agent_id.clone();
         let limit = msg.limit;
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, MemoriesLoaded { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::load_memories_for_agent(&conn, &agent_id, limit).await;
+            log_failure("load_memories", &result);
+            reply.send(MemoriesLoaded { result }).await;
+        })
+    });
+
+    builder.act_on::<GetContextWindow>(|actor, envelope| {
         let reply = envelope.reply_envelope();
+        let request = ContextWindowRequest::from(envelope.message());
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, ContextWindowResponse { result: Err(e) }),
+        };
 
-            match persistence::load_memories_for_agent(&conn, &agent_id, limit).await {
-                Ok(memories) => {
-                    reply.send(MemoriesLoaded { memories }).await;
-                }
-                Err(e) => {
-                    tracing::error!(agent_id = %agent_id, error = %e, "Failed to load memories");
-                }
-            }
-        });
+        actor
+            .model
+            .metrics
+            .counters
+            .context_windows_built
+            .fetch_add(1, Ordering::Relaxed);
 
-        Reply::pending(async move {
-            let _ = handle.await;
+        attached(async move {
+            let result = build_context_window(&conn, request).await;
+            log_failure("get_context_window", &result);
+            reply.send(ContextWindowResponse { result }).await;
         })
     });
+}
 
-    // Handle delete memory
-    builder.mutate_on::<DeleteMemory>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting DeleteMemory - store is shutting down");
-            return Reply::ready();
+/// Owned copy of the inputs needed to build a context window.
+struct ContextWindowRequest {
+    agent_id: AgentId,
+    system_prompt: String,
+    conversation: Vec<Message>,
+    query_embedding: Option<Embedding>,
+    max_tokens: usize,
+    memory_limit: usize,
+}
+
+impl From<&GetContextWindow> for ContextWindowRequest {
+    fn from(msg: &GetContextWindow) -> Self {
+        Self {
+            agent_id: msg.agent_id.clone(),
+            system_prompt: msg.system_prompt.clone(),
+            conversation: msg.conversation.clone(),
+            query_embedding: msg.query_embedding.clone(),
+            max_tokens: msg.max_tokens,
+            memory_limit: msg.memory_limit,
         }
+    }
+}
 
-        let conn = actor.model.connection.clone();
-        let memory_id = envelope.message().memory_id.clone();
+/// Retrieves relevant memories and assembles them into a context window.
+///
+/// A memory-retrieval failure is fatal here rather than silently degrading to
+/// an empty memory set: a caller asking for context that includes memories
+/// should learn that the memories are missing.
+async fn build_context_window(
+    conn: &Connection,
+    request: ContextWindowRequest,
+) -> Result<ContextWindowData, PersistenceError> {
+    let memories = match request.query_embedding {
+        Some(ref embedding) => persistence::search_memories_by_embedding(
+            conn,
+            &request.agent_id,
+            embedding,
+            request.memory_limit,
+            Some(0.0), // Include all matches
+        )
+        .await?
+        .into_iter()
+        .map(|scored| scored.memory)
+        .collect(),
+        None => Vec::new(),
+    };
 
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
+    let included_memories = memories.len();
 
-            if let Err(e) = persistence::delete_memory(&conn, &memory_id).await {
-                tracing::error!(memory_id = %memory_id, error = %e, "Failed to delete memory");
-            }
-        });
+    let config = ContextWindowConfig::with_max_tokens(request.max_tokens);
+    let window = ContextWindow::new(config);
 
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
+    let messages = window.build_context(&request.system_prompt, &memories, &request.conversation);
+    let stats = window.get_context_stats(&messages);
 
-    // Handle delete agent memories
-    builder.mutate_on::<DeleteAgentMemories>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting DeleteAgentMemories - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let agent_id = envelope.message().agent_id.clone();
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            if let Err(e) = persistence::delete_memories_for_agent(&conn, &agent_id).await {
-                tracing::error!(agent_id = %agent_id, error = %e, "Failed to delete agent memories");
-            }
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
-
-    // Handle get context window
-    builder.mutate_on::<GetContextWindow>(|actor, envelope| {
-        if actor.model.shutting_down {
-            tracing::warn!("Rejecting GetContextWindow - store is shutting down");
-            return Reply::ready();
-        }
-
-        let conn = actor.model.connection.clone();
-        let msg = envelope.message();
-        let agent_id = msg.agent_id.clone();
-        let system_prompt = msg.system_prompt.clone();
-        let conversation = msg.conversation.clone();
-        let query_embedding = msg.query_embedding.clone();
-        let max_tokens = msg.max_tokens;
-        let memory_limit = msg.memory_limit;
-        let reply = envelope.reply_envelope();
-        actor.model.metrics.context_windows_built += 1;
-
-        let handle = tokio::spawn(async move {
-            let Some(conn) = conn else {
-                tracing::error!("Memory Store not initialized");
-                return;
-            };
-
-            // Retrieve relevant memories if query embedding provided
-            let memories = match query_embedding {
-                Some(ref emb) => {
-                    match persistence::search_memories_by_embedding(
-                        &conn,
-                        &agent_id,
-                        emb,
-                        memory_limit,
-                        Some(0.0), // Include all matches
-                    )
-                    .await
-                    {
-                        Ok(results) => results.into_iter().map(|sm| sm.memory).collect(),
-                        Err(e) => {
-                            tracing::warn!(error = %e, "Failed to retrieve memories for context");
-                            Vec::new()
-                        }
-                    }
-                }
-                None => Vec::new(),
-            };
-
-            let included_memories = memories.len();
-
-            // Build context window
-            let config = ContextWindowConfig::with_max_tokens(max_tokens);
-            let window = ContextWindow::new(config);
-
-            let messages = window.build_context(&system_prompt, &memories, &conversation);
-            let stats = window.get_context_stats(&messages);
-
-            reply
-                .send(ContextWindowResponse {
-                    messages,
-                    stats,
-                    included_memories,
-                })
-                .await;
-        });
-
-        Reply::pending(async move {
-            let _ = handle.await;
-        })
-    });
+    Ok(ContextWindowData {
+        messages,
+        stats,
+        included_memories,
+    })
 }
 
 #[cfg(test)]
@@ -886,12 +1095,79 @@ mod tests {
     use super::*;
 
     #[test]
-    fn memory_store_metrics_default() {
+    fn memory_store_metrics_start_at_zero() {
         let metrics = MemoryStoreMetrics::default();
-        assert_eq!(metrics.conversations_created, 0);
-        assert_eq!(metrics.messages_saved, 0);
-        assert_eq!(metrics.conversations_loaded, 0);
-        assert_eq!(metrics.state_saves, 0);
-        assert_eq!(metrics.state_loads, 0);
+
+        assert_eq!(metrics.snapshot(), MemoryStoreMetricsSnapshot::default());
+    }
+
+    #[test]
+    fn cloned_metrics_share_counters() {
+        let metrics = MemoryStoreMetrics::default();
+        let clone = metrics.clone();
+
+        clone.counters.messages_saved.fetch_add(3, Ordering::Relaxed);
+
+        assert_eq!(
+            metrics.messages_saved(),
+            3,
+            "a clone must observe the same counters, not a copy"
+        );
+    }
+
+    #[test]
+    fn snapshot_captures_every_counter() {
+        let metrics = MemoryStoreMetrics::default();
+        let counters = &metrics.counters;
+
+        counters.conversations_created.fetch_add(1, Ordering::Relaxed);
+        counters.messages_saved.fetch_add(2, Ordering::Relaxed);
+        counters.conversations_loaded.fetch_add(3, Ordering::Relaxed);
+        counters.state_saves.fetch_add(4, Ordering::Relaxed);
+        counters.state_loads.fetch_add(5, Ordering::Relaxed);
+        counters.memories_stored.fetch_add(6, Ordering::Relaxed);
+        counters.memory_searches.fetch_add(7, Ordering::Relaxed);
+        counters
+            .context_windows_built
+            .fetch_add(8, Ordering::Relaxed);
+
+        assert_eq!(
+            metrics.snapshot(),
+            MemoryStoreMetricsSnapshot {
+                conversations_created: 1,
+                messages_saved: 2,
+                conversations_loaded: 3,
+                state_saves: 4,
+                state_loads: 5,
+                memories_stored: 6,
+                memory_searches: 7,
+                context_windows_built: 8,
+            }
+        );
+    }
+
+    #[test]
+    fn uninitialized_store_reports_not_initialized() {
+        let store = MemoryStore::default();
+
+        let error = store
+            .ready_connection()
+            .expect_err("a store with no connection cannot serve requests");
+
+        assert!(error.is_not_initialized());
+    }
+
+    #[test]
+    fn shutting_down_takes_precedence_over_missing_connection() {
+        let store = MemoryStore {
+            shutting_down: true,
+            ..MemoryStore::default()
+        };
+
+        let error = store
+            .ready_connection()
+            .expect_err("a shutting-down store cannot serve requests");
+
+        assert!(error.is_shutting_down());
     }
 }

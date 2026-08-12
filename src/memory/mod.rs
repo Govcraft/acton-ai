@@ -94,6 +94,7 @@ pub use store::{
     // Agent state messages
     AgentStateLoaded,
     // Context window messages
+    ContextWindowData,
     ContextWindowResponse,
     // Conversation messages
     ConversationCreated,
@@ -117,9 +118,12 @@ pub use store::{
     // Core store types
     MemoryStore,
     MemoryStoreMetrics,
+    MemoryStoreMetricsSnapshot,
     MemoryStored,
     // Message store messages
     MessageSaved,
+    // Generic completion reply for delete / state-save requests
+    OperationCompleted,
     SaveAgentState,
     SaveMessage,
     SearchMemories,

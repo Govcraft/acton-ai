@@ -302,7 +302,11 @@ pub async fn save_message(
 ///
 /// # Returns
 ///
-/// A vector of messages in chronological order.
+/// A vector of messages in insertion order.
+///
+/// `created_at` has whole-second granularity, so it cannot order two messages
+/// saved in the same second — for a chat turn, that is the common case. SQLite's
+/// monotonic `rowid` breaks the tie, restoring true insertion order.
 ///
 /// # Errors
 ///
@@ -314,7 +318,7 @@ pub async fn load_conversation_messages(
     let mut rows = conn
         .query(
             "SELECT role, content, tool_calls, tool_call_id FROM messages
-             WHERE conversation_id = ?1 ORDER BY created_at ASC",
+             WHERE conversation_id = ?1 ORDER BY created_at ASC, rowid ASC",
             [conversation_id.to_string()],
         )
         .await
@@ -377,7 +381,7 @@ pub async fn get_latest_conversation(
 ) -> Result<Option<ConversationId>, PersistenceError> {
     let mut rows = conn
         .query(
-            "SELECT id FROM conversations WHERE agent_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT id FROM conversations WHERE agent_id = ?1 ORDER BY created_at DESC, rowid DESC LIMIT 1",
             [agent_id.to_string()],
         )
         .await
@@ -538,7 +542,7 @@ pub async fn list_conversations(
 ) -> Result<Vec<ConversationId>, PersistenceError> {
     let mut rows = conn
         .query(
-            "SELECT id FROM conversations WHERE agent_id = ?1 ORDER BY created_at DESC",
+            "SELECT id FROM conversations WHERE agent_id = ?1 ORDER BY created_at DESC, rowid DESC",
             [agent_id.to_string()],
         )
         .await
