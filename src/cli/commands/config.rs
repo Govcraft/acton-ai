@@ -280,6 +280,45 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
         }
     }
 
+    if let Some(introspection) = &report.config.introspection {
+        output.write_line("")?;
+        output.write_line("Introspection:")?;
+        output.write_line(&format!(
+            "  enabled:          {}",
+            introspection.is_enabled()
+        ))?;
+        match crate::introspection::IntrospectionConfig::resolve(
+            introspection.socket_path.clone(),
+            introspection.socket_mode,
+        ) {
+            Ok(resolved) => {
+                match &resolved.socket_path {
+                    Some(path) => {
+                        output.write_line(&format!("  socket_path:      {}", path.display()))?;
+                    }
+                    // Deliberately not the resolved default: that name carries
+                    // a PID, and the only PID available here is this
+                    // short-lived `config` process, so printing it would name a
+                    // socket that has never existed. The directory is the part
+                    // that is actually true, and it is where the commands look.
+                    None => {
+                        output.write_line(&format!(
+                            "  socket_path:      (default: a per-process socket under {})",
+                            crate::introspection::default_socket_dir().display()
+                        ))?;
+                    }
+                }
+                output.write_line(&format!("  socket_mode:      {:#o}", resolved.socket_mode))?;
+            }
+            // Reporting the rejection here beats hiding it: `acton-ai config`
+            // is where someone looks after a launch failed, and a section that
+            // simply vanished would send them hunting the wrong file.
+            Err(error) => {
+                output.write_line(&format!("  (invalid: {error})"))?;
+            }
+        }
+    }
+
     if let Some(sb) = &report.config.sandbox {
         output.write_line("")?;
         output.write_line("Sandbox:")?;

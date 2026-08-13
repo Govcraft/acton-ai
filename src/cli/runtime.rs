@@ -1,6 +1,25 @@
 //! Shared runtime bootstrap for CLI commands.
 //!
 //! Initializes the ActonAI runtime and database from CLI options.
+//!
+//! # Signals and systemd
+//!
+//! Every command built on [`CliRuntime`] drains on `SIGTERM`: the turn already
+//! running finishes, and no new one starts. `run-job` therefore completes its
+//! single prompt and exits 0, and `heartbeat` finishes the entry in hand and
+//! reports the rest as deferred rather than failed.
+//!
+//! It also sends `READY=1` once the runtime is up and `STOPPING=1` when the
+//! signal arrives, so a `Type=notify` unit can tell "started" from "serving"
+//! and give the drain a `TimeoutStopSec` to finish in. Both are no-ops outside
+//! systemd.
+//!
+//! One gap, deliberately left rather than papered over: `chat`'s interactive
+//! REPL blocks in the line editor, so a `SIGTERM` that arrives while it sits
+//! at an idle prompt is not noticed until the next turn is attempted, which is
+//! then refused. Interrupting a blocked terminal read cleanly needs a REPL
+//! redesign, and a half-done version that leaves the terminal in raw mode
+//! would be worse than the gap.
 
 use crate::cli::error::CliError;
 use crate::cli::output::OutputWriter;
@@ -121,7 +140,23 @@ impl CliRuntime {
 
         builder = builder.with_builtins();
 
+        // Unconditional, and not something the config file can switch off: the
+        // alternative to draining on SIGTERM is dying mid-turn, and a turn that
+        // has already run a tool has already changed the world. Nothing here
+        // needs a socket — the gate is in-process state.
+        builder = builder.drain_on_sigterm();
+
         let ai = builder.launch().await?;
+
+        // Only now: with `Type=notify`, systemd holds `systemctl start` open
+        // until this arrives, so it has to mean "providers resolved, tools
+        // registered, MCP servers connected", not "the process started".
+        // A no-op when nothing set $NOTIFY_SOCKET, which is most of the time.
+        crate::introspection::sd_notify::notify_ready();
+        if let Some(socket) = ai.introspection_socket() {
+            tracing::info!(socket = %socket.display(), "introspection socket listening");
+        }
+
         let db_path = resolve_db_path(config_path);
         tracing::info!(
             default_provider = %ai.default_provider_name(),

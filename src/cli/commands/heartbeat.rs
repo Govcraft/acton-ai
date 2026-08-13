@@ -47,6 +47,13 @@ struct HeartbeatReport {
     timestamp: String,
     /// How many entries were processed.
     entries_processed: usize,
+    /// How many due entries were left unattempted because the runtime stopped
+    /// admitting turns partway through — a SIGTERM or a remote `drain`.
+    ///
+    /// Distinct from a failure: these entries are still due, and the next
+    /// heartbeat will pick them up untouched.
+    #[serde(default)]
+    entries_deferred: usize,
     /// Per-entry results.
     results: Vec<EntryResult>,
 }
@@ -71,8 +78,21 @@ pub async fn execute(
     let _ = output.status(&format!("heartbeat: {} due entries found", entries.len()));
 
     let mut results = Vec::with_capacity(entries.len());
+    let mut deferred = 0_usize;
 
     for entry in &entries {
+        // Checked between entries, never inside one: SIGTERM (or a remote
+        // `acton-ai drain`) closes admission, and the entry already running
+        // finishes. Stopping here rather than letting the next prompt be
+        // refused is the difference between a report that says "deferred" and
+        // one that says "error" about work nobody attempted.
+        if !rt.ai.admission_state().admits() {
+            deferred = entries.len().saturating_sub(results.len());
+            let _ = output.status(&format!(
+                "heartbeat: no longer admitting turns; {deferred} entry(s) left for the next run"
+            ));
+            break;
+        }
         let result = process_entry(&rt, &conn, entry, output).await;
         results.push(result);
     }
@@ -80,6 +100,7 @@ pub async fn execute(
     let report = HeartbeatReport {
         timestamp: chrono::Utc::now().to_rfc3339(),
         entries_processed: results.len(),
+        entries_deferred: deferred,
         results,
     };
 
@@ -299,6 +320,7 @@ mod tests {
         let report = HeartbeatReport {
             timestamp: "2026-03-18T12:00:00+00:00".to_string(),
             entries_processed: 1,
+            entries_deferred: 0,
             results: vec![EntryResult {
                 entry_id: "hb_123".to_string(),
                 session_name: "main".to_string(),
@@ -312,6 +334,9 @@ mod tests {
 
         let json = serde_json::to_string(&report).expect("serialization should succeed");
         assert!(json.contains("\"entries_processed\":1"));
+        // A consumer distinguishing "failed" from "not attempted" reads this
+        // field, so it is on the wire even when nothing was deferred.
+        assert!(json.contains("\"entries_deferred\":0"), "{json}");
         assert!(json.contains("\"status\":\"ok\""));
         // error field should be absent due to skip_serializing_if
         assert!(!json.contains("\"error\""));
