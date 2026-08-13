@@ -6,7 +6,7 @@
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
 use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
-use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolDefinition};
+use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -37,6 +37,8 @@ struct ChatCompletionRequest {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<OpenAITool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<serde_json::Value>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -313,6 +315,24 @@ impl OpenAIClient {
             .collect()
     }
 
+    /// Encodes a [`ToolChoice`] in the OpenAI chat-completions wire format.
+    ///
+    /// OpenAI accepts either a bare string (`"auto"`, `"required"`, `"none"`)
+    /// or an object naming one function, so the return type is a raw
+    /// [`serde_json::Value`] rather than a typed struct. Callers pass
+    /// `None` through untouched so the key is omitted entirely.
+    fn convert_tool_choice(choice: &ToolChoice) -> serde_json::Value {
+        match choice {
+            ToolChoice::Auto => serde_json::json!("auto"),
+            ToolChoice::Any => serde_json::json!("required"),
+            ToolChoice::Tool(name) => serde_json::json!({
+                "type": "function",
+                "function": { "name": name },
+            }),
+            ToolChoice::None => serde_json::json!("none"),
+        }
+    }
+
     /// Parses OpenAI stop reason to internal format.
     #[must_use]
     pub fn parse_stop_reason(reason: Option<&str>) -> StopReason {
@@ -411,6 +431,7 @@ impl LLMClient for OpenAIClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMClientResponse, LLMError> {
         let api_messages = self.convert_messages(messages);
 
@@ -419,6 +440,7 @@ impl LLMClient for OpenAIClient {
             max_tokens: Some(self.max_tokens),
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
+            tool_choice: tool_choice.map(Self::convert_tool_choice),
             stream: false,
             temperature: sampling.and_then(|s| s.temperature),
             top_p: sampling.and_then(|s| s.top_p),
@@ -490,6 +512,7 @@ impl LLMClient for OpenAIClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMEventStream, LLMError> {
         use std::collections::{HashMap, VecDeque};
 
@@ -500,6 +523,7 @@ impl LLMClient for OpenAIClient {
             max_tokens: Some(self.max_tokens),
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
+            tool_choice: tool_choice.map(Self::convert_tool_choice),
             stream: true,
             temperature: sampling.and_then(|s| s.temperature),
             top_p: sampling.and_then(|s| s.top_p),
@@ -675,6 +699,63 @@ impl LLMClient for OpenAIClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_choice_body(choice: Option<&ToolChoice>) -> serde_json::Value {
+        let request = ChatCompletionRequest {
+            model: "gpt-test".to_string(),
+            messages: Vec::new(),
+            max_tokens: Some(16),
+            tools: None,
+            tool_choice: choice.map(OpenAIClient::convert_tool_choice),
+            stream: false,
+            temperature: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            seed: None,
+            stop: None,
+        };
+        serde_json::to_value(&request).unwrap()
+    }
+
+    #[test]
+    fn openai_tool_choice_auto_serializes_as_string() {
+        assert_eq!(tool_choice_body(Some(&ToolChoice::Auto))["tool_choice"], "auto");
+    }
+
+    #[test]
+    fn openai_tool_choice_any_serializes_as_required() {
+        assert_eq!(
+            tool_choice_body(Some(&ToolChoice::Any))["tool_choice"],
+            "required"
+        );
+    }
+
+    #[test]
+    fn openai_tool_choice_named_tool_serializes_as_function_object() {
+        let body = tool_choice_body(Some(&ToolChoice::Tool("structured_output".to_string())));
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": "structured_output"}
+            })
+        );
+    }
+
+    #[test]
+    fn openai_tool_choice_none_serializes_as_string() {
+        assert_eq!(tool_choice_body(Some(&ToolChoice::None))["tool_choice"], "none");
+    }
+
+    #[test]
+    fn openai_tool_choice_absent_omits_the_key() {
+        let body = tool_choice_body(None);
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must not appear in the body when unset: {body}"
+        );
+    }
 
     fn create_test_client() -> OpenAIClient {
         let config = ProviderConfig::ollama("llama3.2");

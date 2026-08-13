@@ -6,7 +6,7 @@
 
 use crate::llm::config::SamplingParams;
 use crate::llm::error::LLMError;
-use crate::messages::{Message, StopReason, ToolCall, ToolDefinition};
+use crate::messages::{Message, StopReason, ToolCall, ToolChoice, ToolDefinition};
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
@@ -71,7 +71,7 @@ pub type LLMEventStream = Pin<Box<dyn Stream<Item = Result<LLMStreamEvent, LLMEr
 /// let client = AnthropicClient::new(config)?;
 ///
 /// let messages = vec![Message::user("Hello!")];
-/// let response = client.send_request(&messages, None).await?;
+/// let response = client.send_request(&messages, None, None, None).await?;
 /// ```
 #[async_trait]
 pub trait LLMClient: Send + Sync + std::fmt::Debug {
@@ -82,6 +82,9 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
     /// * `messages` - The conversation messages
     /// * `tools` - Optional tool definitions available to the LLM
     /// * `sampling` - Optional sampling parameters for this request
+    /// * `tool_choice` - Optional constraint on how the model picks a tool.
+    ///   `None` omits the field from the wire request, leaving the
+    ///   provider's default in force.
     ///
     /// # Returns
     ///
@@ -95,6 +98,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMClientResponse, LLMError>;
 
     /// Sends a streaming request to the LLM.
@@ -104,6 +108,9 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
     /// * `messages` - The conversation messages
     /// * `tools` - Optional tool definitions available to the LLM
     /// * `sampling` - Optional sampling parameters for this request
+    /// * `tool_choice` - Optional constraint on how the model picks a tool.
+    ///   `None` omits the field from the wire request, leaving the
+    ///   provider's default in force.
     ///
     /// # Returns
     ///
@@ -117,6 +124,7 @@ pub trait LLMClient: Send + Sync + std::fmt::Debug {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMEventStream, LLMError>;
 
     /// Returns the name of this provider for logging/metrics.

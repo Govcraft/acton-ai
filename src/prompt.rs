@@ -886,6 +886,7 @@ impl PromptBuilder {
                     None
                 },
                 sampling: sampling.clone(),
+                tool_choice: None,
             };
 
             // Collect stream response — reuses the caller-owned collector.

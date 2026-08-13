@@ -168,6 +168,37 @@ impl std::fmt::Display for MessageRole {
 // LLM Messages
 // =============================================================================
 
+/// How the model should choose among the offered tools.
+///
+/// This is a closed protocol concept shared by the Anthropic Messages API and
+/// the OpenAI chat-completions API, so it is deliberately **not**
+/// `#[non_exhaustive]` — the four variants below cover the whole space both
+/// wire formats express, and callers benefit from exhaustive `match`es.
+///
+/// Each client maps the variants onto its own wire encoding:
+///
+/// | Variant        | Anthropic                        | OpenAI-compatible                                    |
+/// |----------------|----------------------------------|------------------------------------------------------|
+/// | [`Self::Auto`] | `{"type":"auto"}`                | `"auto"`                                             |
+/// | [`Self::Any`]  | `{"type":"any"}`                 | `"required"`                                         |
+/// | [`Self::Tool`] | `{"type":"tool","name":…}`       | `{"type":"function","function":{"name":…}}`          |
+/// | [`Self::None`] | `{"type":"none"}`                | `"none"`                                             |
+///
+/// When [`LLMRequest::tool_choice`] is `Option::None` the key is omitted from
+/// the request body entirely, leaving the provider's own default in force.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolChoice {
+    /// Let the model decide whether to call a tool or answer directly.
+    Auto,
+    /// Require the model to call one of the offered tools, its choice which.
+    Any,
+    /// Require the model to call the named tool specifically.
+    Tool(String),
+    /// Forbid tool calls; the model must answer with text.
+    None,
+}
+
 /// Request to the LLM provider.
 #[acton_message]
 #[derive(Serialize, Deserialize)]
@@ -182,6 +213,12 @@ pub struct LLMRequest {
     pub tools: Option<Vec<ToolDefinition>>,
     /// Optional sampling parameters for this request
     pub sampling: Option<SamplingParams>,
+    /// How the model should choose among `tools`.
+    ///
+    /// `None` (the default) omits the field from the wire request, so the
+    /// provider's own default applies — that is the behavior every request
+    /// had before this field existed.
+    pub tool_choice: Option<ToolChoice>,
 }
 
 impl LLMRequest {
@@ -206,6 +243,7 @@ impl LLMRequest {
             messages: vec![Message::user(content)],
             tools: None,
             sampling: None,
+            tool_choice: None,
         }
     }
 
@@ -232,6 +270,7 @@ impl LLMRequest {
             messages: vec![Message::system(system), Message::user(content)],
             tools: None,
             sampling: None,
+            tool_choice: None,
         }
     }
 
@@ -281,6 +320,7 @@ pub struct LLMRequestBuilder {
     messages: Vec<Message>,
     tools: Option<Vec<ToolDefinition>>,
     sampling: Option<SamplingParams>,
+    tool_choice: Option<ToolChoice>,
 }
 
 impl LLMRequestBuilder {
@@ -360,6 +400,16 @@ impl LLMRequestBuilder {
         self
     }
 
+    /// Sets how the model should choose among the request's tools.
+    ///
+    /// Leave unset to send no `tool_choice` at all, which keeps the
+    /// provider's default behavior.
+    #[must_use]
+    pub fn tool_choice(mut self, choice: ToolChoice) -> Self {
+        self.tool_choice = Some(choice);
+        self
+    }
+
     /// Builds the LLM request.
     ///
     /// IDs are auto-generated if not explicitly set.
@@ -371,6 +421,7 @@ impl LLMRequestBuilder {
             messages: self.messages,
             tools: self.tools,
             sampling: self.sampling,
+            tool_choice: self.tool_choice,
         }
     }
 }

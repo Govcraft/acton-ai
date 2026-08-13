@@ -692,7 +692,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
 
     // Start streaming request
     match client
-        .send_streaming_request(&request.messages, tools, sampling)
+        .send_streaming_request(&request.messages, tools, sampling, request.tool_choice.as_ref())
         .await
     {
         Ok(mut stream) => {
@@ -821,7 +821,12 @@ async fn process_non_streaming_request(ctx: &DispatchContext, request: &LLMReque
     let tools = request.tools.as_deref();
 
     match client
-        .send_request(&request.messages, tools, ctx.sampling.as_ref())
+        .send_request(
+            &request.messages,
+            tools,
+            ctx.sampling.as_ref(),
+            request.tool_choice.as_ref(),
+        )
         .await
     {
         Ok(response) => {
@@ -1029,6 +1034,7 @@ mod tests {
             messages: vec![Message::user("Hello world")], // 11 chars
             tools: None,
             sampling: None,
+            tool_choice: None,
         };
 
         let tokens = estimate_tokens(&request);
@@ -1099,6 +1105,7 @@ mod tests {
             messages: vec![Message::user("hello")],
             tools: None,
             sampling: None,
+            tool_choice: None,
         };
         let correlation_id = request.correlation_id.clone();
 

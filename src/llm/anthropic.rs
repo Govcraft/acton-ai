@@ -6,7 +6,7 @@
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
 use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
-use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolDefinition};
+use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -32,6 +32,8 @@ struct MessagesRequest {
     messages: Vec<ApiMessage>,
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<ApiTool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<ApiToolChoice>,
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
@@ -83,6 +85,31 @@ struct ApiTool {
     name: String,
     description: String,
     input_schema: serde_json::Value,
+}
+
+/// Tool-choice constraint in the Anthropic Messages API format.
+///
+/// The API models this as an object with a discriminating `type` key, so it
+/// serializes as an internally tagged enum: `{"type":"auto"}`,
+/// `{"type":"any"}`, `{"type":"tool","name":"…"}`, `{"type":"none"}`.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ApiToolChoice {
+    Auto,
+    Any,
+    Tool { name: String },
+    None,
+}
+
+impl From<&ToolChoice> for ApiToolChoice {
+    fn from(choice: &ToolChoice) -> Self {
+        match choice {
+            ToolChoice::Auto => Self::Auto,
+            ToolChoice::Any => Self::Any,
+            ToolChoice::Tool(name) => Self::Tool { name: name.clone() },
+            ToolChoice::None => Self::None,
+        }
+    }
 }
 
 /// Response from the Anthropic messages API (non-streaming).
@@ -249,6 +276,7 @@ impl AnthropicClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<MessagesResponse, LLMError> {
         let (system, api_messages) = self.convert_messages(messages);
 
@@ -258,6 +286,7 @@ impl AnthropicClient {
             system,
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
+            tool_choice: tool_choice.map(ApiToolChoice::from),
             stream: false,
             temperature: sampling.and_then(|s| s.temperature),
             top_k: sampling.and_then(|s| s.top_k),
@@ -298,6 +327,7 @@ impl AnthropicClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<impl futures::Stream<Item = Result<StreamEvent, LLMError>>, LLMError> {
         let (system, api_messages) = self.convert_messages(messages);
 
@@ -307,6 +337,7 @@ impl AnthropicClient {
             system,
             messages: api_messages,
             tools: tools.map(|t| self.convert_tools(t)),
+            tool_choice: tool_choice.map(ApiToolChoice::from),
             stream: true,
             temperature: sampling.and_then(|s| s.temperature),
             top_k: sampling.and_then(|s| s.top_k),
@@ -622,8 +653,11 @@ impl LLMClient for AnthropicClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMClientResponse, LLMError> {
-        let response = self.send_messages(messages, tools, sampling).await?;
+        let response = self
+            .send_messages(messages, tools, sampling, tool_choice)
+            .await?;
         Ok(LLMClientResponse {
             content: extract_text_content(&response),
             tool_calls: extract_tool_calls(&response),
@@ -640,9 +674,10 @@ impl LLMClient for AnthropicClient {
         messages: &[Message],
         tools: Option<&[ToolDefinition]>,
         sampling: Option<&SamplingParams>,
+        tool_choice: Option<&ToolChoice>,
     ) -> Result<LLMEventStream, LLMError> {
         let stream = self
-            .send_messages_streaming(messages, tools, sampling)
+            .send_messages_streaming(messages, tools, sampling, tool_choice)
             .await?;
         Ok(Box::pin(convert_anthropic_stream(stream)))
     }
@@ -733,6 +768,59 @@ pub fn extract_tool_calls(response: &MessagesResponse) -> Vec<ToolCall> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool_choice_body(choice: Option<&ToolChoice>) -> serde_json::Value {
+        let request = MessagesRequest {
+            model: "claude-test".to_string(),
+            max_tokens: 16,
+            system: None,
+            messages: Vec::new(),
+            tools: None,
+            tool_choice: choice.map(ApiToolChoice::from),
+            stream: false,
+            temperature: None,
+            top_k: None,
+            top_p: None,
+            stop_sequences: None,
+        };
+        serde_json::to_value(&request).unwrap()
+    }
+
+    #[test]
+    fn anthropic_tool_choice_auto_serializes_as_typed_object() {
+        let body = tool_choice_body(Some(&ToolChoice::Auto));
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn anthropic_tool_choice_any_serializes_as_typed_object() {
+        let body = tool_choice_body(Some(&ToolChoice::Any));
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "any"}));
+    }
+
+    #[test]
+    fn anthropic_tool_choice_named_tool_serializes_with_name() {
+        let body = tool_choice_body(Some(&ToolChoice::Tool("structured_output".to_string())));
+        assert_eq!(
+            body["tool_choice"],
+            serde_json::json!({"type": "tool", "name": "structured_output"})
+        );
+    }
+
+    #[test]
+    fn anthropic_tool_choice_none_serializes_as_typed_object() {
+        let body = tool_choice_body(Some(&ToolChoice::None));
+        assert_eq!(body["tool_choice"], serde_json::json!({"type": "none"}));
+    }
+
+    #[test]
+    fn anthropic_tool_choice_absent_omits_the_key() {
+        let body = tool_choice_body(None);
+        assert!(
+            body.get("tool_choice").is_none(),
+            "tool_choice must not appear in the body when unset: {body}"
+        );
+    }
 
     #[test]
     fn parse_stop_reason_end_turn() {

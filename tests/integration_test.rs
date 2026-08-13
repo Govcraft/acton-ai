@@ -207,6 +207,7 @@ fn test_llm_request_creation() {
         messages: vec![Message::system("You are helpful"), Message::user("Hello")],
         tools: None,
         sampling: None,
+        tool_choice: None,
     };
 
     assert_eq!(request.correlation_id, corr_id);
