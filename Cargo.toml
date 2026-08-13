@@ -1,6 +1,6 @@
 [package]
 name = "acton-ai"
-version = "0.29.0"
+version = "0.30.0"
 edition = "2021"
 description = "An agentic AI framework where each agent is an actor"
 license = "MIT"
@@ -83,7 +83,7 @@ termimad = "0.34.1"
 rmcp = { version = "3.1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
 schemars = "1.2.2"
 serde_path_to_error = "0.1.20"
-acton-ai-macros = { version = "0.29.0", path = "macros", optional = true }
+acton-ai-macros = { version = "0.30.0", path = "macros", optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"
