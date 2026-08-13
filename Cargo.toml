@@ -26,13 +26,23 @@ default-members = [".", "macros"]
 resolver = "2"
 
 [features]
-default = ["sandbox-hardening", "derive"]
+default = ["sandbox-hardening", "derive", "otel"]
 # Enables Linux-specific OS hardening (landlock + seccomp) for the process
 # sandbox child. A no-op on non-Linux platforms.
 sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 # Enables the `#[tool]` attribute macro, which turns an annotated `async fn`
 # into a `Tool` implementation. Independent of `sandbox-hardening`.
 derive = ["dep:acton-ai-macros"]
+# Enables OpenTelemetry export: OTLP traces over the prompt loop and metrics
+# for tokens, latency, and reliability. Part of the default set so released
+# binaries can be pointed at a collector without a rebuild; lean library
+# consumers already build with `--no-default-features`.
+#
+# The OTLP transport is HTTP/protobuf backed by reqwest's *blocking* client,
+# deliberately: `BatchSpanProcessor` and `PeriodicReader` both export from a
+# dedicated `std::thread` via `futures_executor::block_on`, where an async
+# client would have no reactor to drive its IO. No tonic, no gRPC stack.
+otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
@@ -84,15 +94,30 @@ rmcp = { version = "3.1.2", features = ["client", "transport-child-process", "tr
 schemars = "1.2.2"
 serde_path_to_error = "0.1.20"
 acton-ai-macros = { version = "0.30.0", path = "macros", optional = true }
+opentelemetry = { version = "0.32", optional = true }
+opentelemetry_sdk = { version = "0.32", optional = true }
+opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "internal-logs"], optional = true }
 
 [dev-dependencies]
 anyhow = "1.0.100"
 axum = "0.8.9"
 colored = "3.1.1"
+opentelemetry_sdk = { version = "0.32", features = ["testing"] }
 rmcp = { version = "3.1.2", features = ["server", "transport-async-rw"] }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }
 tokio-test = "0.4"
 trybuild = "1.0.120"
+
+# Targets that only compile with the feature they exercise. Without these,
+# `--all-targets --no-default-features` fails on code that legitimately cannot
+# build in that configuration, which hides real findings behind noise.
+[[example]]
+name = "tool_macro"
+required-features = ["derive"]
+
+[[test]]
+name = "tool_macro"
+required-features = ["derive"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4.4", optional = true }

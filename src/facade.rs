@@ -134,6 +134,10 @@ pub(crate) struct ActonAIInner {
     pub(crate) providers: HashMap<String, ActorHandle>,
     /// The name of the default provider
     pub(crate) default_provider: String,
+    /// Model served by each configured provider, keyed by provider name.
+    ///
+    /// Read by the prompt loop to label round spans and latency metrics.
+    pub(crate) provider_models: HashMap<String, String>,
     /// Built-in tools (if enabled)
     pub(crate) builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
@@ -182,8 +186,44 @@ pub(crate) struct ActonAIInner {
     /// When present, these tools are injected into every prompt: configuring
     /// a server *is* the request to use it, so there is no separate opt-in.
     pub(crate) mcp: Option<crate::mcp::McpTools>,
+    /// Installed telemetry, when it was configured.
+    ///
+    /// `None` means no `[telemetry]` section and no builder call, which is
+    /// the state in which nothing here costs anything.
+    pub(crate) telemetry: Option<TelemetryRuntime>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
+}
+
+/// The telemetry a launched runtime owns.
+///
+/// Holding one means telemetry is on and the [`TelemetryActor`] was spawned.
+/// The guard inside is `None` when the providers belong to the surrounding
+/// application ([`ActonAIBuilder::telemetry_from_globals`]) — this crate must
+/// then never shut them down, because it does not own them and other parts of
+/// the application are still using them.
+///
+/// [`TelemetryActor`]: crate::telemetry::TelemetryActor
+pub(crate) struct TelemetryRuntime {
+    /// Behind a `Mutex` because shutdown runs through a shared `Arc`, and
+    /// shutting the providers down needs ownership.
+    #[cfg(feature = "otel")]
+    guard: std::sync::Mutex<Option<crate::telemetry::TelemetryGuard>>,
+}
+
+impl TelemetryRuntime {
+    /// Flushes and shuts down the providers this runtime installed.
+    ///
+    /// Idempotent, and a no-op when the providers came from the application.
+    pub(crate) fn shutdown(&self) {
+        #[cfg(feature = "otel")]
+        {
+            let taken = self.guard.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(mut guard) = taken {
+                guard.shutdown();
+            }
+        }
+    }
 }
 
 pub struct ActonAI {
@@ -214,6 +254,7 @@ impl std::fmt::Debug for ActonAI {
                 &self.inner.default_max_tool_rounds,
             )
             .field("usage_tracking", &self.inner.accountant.is_some())
+            .field("telemetry", &self.inner.telemetry.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -321,6 +362,15 @@ impl ActonAI {
     #[must_use]
     pub fn default_provider_name(&self) -> &str {
         &self.inner.default_provider
+    }
+
+    /// The model a configured provider serves, if that provider exists.
+    ///
+    /// Used to label telemetry with the model actually dispatched to, rather
+    /// than leaving it to be inferred from the provider name.
+    #[must_use]
+    pub fn provider_model(&self, name: &str) -> Option<&str> {
+        self.inner.provider_models.get(name).map(String::as_str)
     }
 
     /// Returns the default `max_tool_rounds` seeded into every new prompt.
@@ -624,10 +674,24 @@ impl ActonAI {
         // Get the runtime clone for shutdown. The Arc may still be shared,
         // so we clone the ActorRuntime (which is itself cheap to clone).
         let mut runtime = self.inner.runtime.clone();
-        runtime
+        let stopped = runtime
             .shutdown_all()
             .await
-            .map_err(|e| ActonAIError::launch_failed(e.to_string()))
+            .map_err(|e| ActonAIError::launch_failed(e.to_string()));
+
+        // Telemetry goes last, deliberately: the actors above broadcast on
+        // their way down, and the telemetry actor records those broadcasts.
+        // Flushing first would drop exactly the final batch — the spans and
+        // counters covering the end of the run, which are the ones an
+        // operator went looking for.
+        //
+        // Run even when stopping the actors failed: a failed shutdown is
+        // precisely when the telemetry is worth having.
+        if let Some(telemetry) = self.inner.telemetry.as_ref() {
+            telemetry.shutdown();
+        }
+
+        stopped
     }
 }
 
@@ -749,6 +813,40 @@ pub struct ActonAIBuilder {
     budget_file: Option<crate::config::BudgetFileConfig>,
     /// Callback registered with [`on_budget_event`](Self::on_budget_event).
     budget_event_callback: Option<Arc<dyn Fn(BudgetEvent) + Send + Sync>>,
+    /// Telemetry set programmatically with [`telemetry`](Self::telemetry),
+    /// [`telemetry_otlp`](Self::telemetry_otlp), or
+    /// [`telemetry_from_globals`](Self::telemetry_from_globals).
+    ///
+    /// Present, this replaces `[telemetry]` from the config file
+    /// **wholesale** — the same rule `budget` and `usage_tracking` follow.
+    #[cfg(feature = "otel")]
+    telemetry: Option<TelemetrySetup>,
+    /// The `[telemetry]` section from a config file, used only when the
+    /// builder sets no telemetry of its own. Resolved at launch rather than
+    /// in [`apply_config`](Self::apply_config), so a builder call wins
+    /// whether it comes before or after `.from_config()`.
+    ///
+    /// Unconditional: a build without the `otel` feature still has to notice
+    /// this section and refuse the launch rather than ignore it.
+    telemetry_file: Option<crate::config::TelemetryFileConfig>,
+}
+
+/// How a runtime's telemetry providers come to exist.
+///
+/// Two genuinely different situations rather than one with a flag: either
+/// this crate installs the providers, or the surrounding application already
+/// installed its own and this crate should emit into them.
+#[cfg(feature = "otel")]
+#[derive(Debug)]
+enum TelemetrySetup {
+    /// Install providers of our own, exporting over OTLP.
+    Otlp(Box<crate::telemetry::Telemetry>),
+    /// Take ownership of providers the caller already assembled through
+    /// [`install_with_exporters`](crate::telemetry::install_with_exporters).
+    Guard(Box<crate::telemetry::TelemetryGuard>),
+    /// Emit into whatever providers are already installed as the process
+    /// globals. Installs nothing and holds no guard.
+    Globals,
 }
 
 impl ActonAIBuilder {
@@ -971,6 +1069,139 @@ impl ActonAIBuilder {
         self
     }
 
+    // =========================================================================
+    // Telemetry
+    // =========================================================================
+
+    /// Exports traces and metrics over OTLP to `endpoint`.
+    ///
+    /// The one-liner form of [`telemetry`](Self::telemetry). `endpoint` is
+    /// the collector's base HTTP address; the exporter appends `/v1/traces`
+    /// and `/v1/metrics`.
+    ///
+    /// Replaces any `[telemetry]` section from a config file wholesale.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .telemetry_otlp("http://localhost:4318")
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn telemetry_otlp(self, endpoint: impl Into<String>) -> Self {
+        self.telemetry(crate::telemetry::Telemetry::otlp(endpoint))
+    }
+
+    /// Exports traces and metrics using the supplied [`Telemetry`] settings.
+    ///
+    /// Replaces any `[telemetry]` section from a config file wholesale,
+    /// whether `.from_config()` was called before or after this — a
+    /// half-merged telemetry config points at an endpoint nobody wrote.
+    ///
+    /// The endpoint and interval are validated at launch, so this stays
+    /// infallible and every configuration error surfaces from one place.
+    ///
+    /// [`Telemetry`]: crate::telemetry::Telemetry
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::telemetry::Telemetry;
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .telemetry(
+    ///         Telemetry::otlp("https://collector.example:4318")
+    ///             .service_name("my-agent")
+    ///             .metrics_interval_secs(15)
+    ///             .header("authorization", "Bearer ..."),
+    ///     )
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn telemetry(mut self, telemetry: crate::telemetry::Telemetry) -> Self {
+        self.telemetry = Some(TelemetrySetup::Otlp(Box::new(telemetry)));
+        self
+    }
+
+    /// Emits into the OpenTelemetry providers already installed in this
+    /// process instead of installing any.
+    ///
+    /// For applications that have already configured OpenTelemetry for
+    /// themselves — an HTTP server, a job runner — and want this crate's
+    /// spans and metrics to land in the same pipeline rather than in a
+    /// second, competing one. Nothing is installed and no exporter is built,
+    /// so the endpoint, service name, and interval all come from whatever the
+    /// application set up.
+    ///
+    /// If no providers are installed, OpenTelemetry's globals are no-ops and
+    /// this is simply telemetry that goes nowhere.
+    ///
+    /// # Lifecycle
+    ///
+    /// The application owns those providers, so
+    /// [`shutdown`](ActonAI::shutdown) deliberately neither flushes nor shuts
+    /// them down — doing either to a provider the rest of the application is
+    /// still using would be worse than the batch it saved. Flush them
+    /// yourself before exiting, or use
+    /// [`telemetry_guard`](Self::telemetry_guard) to hand this runtime the
+    /// lifecycle instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // The application installed its own providers earlier in main().
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .telemetry_from_globals()
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn telemetry_from_globals(mut self) -> Self {
+        self.telemetry = Some(TelemetrySetup::Globals);
+        self
+    }
+
+    /// Emits into providers assembled with
+    /// [`install_with_exporters`](crate::telemetry::install_with_exporters),
+    /// and takes over their lifecycle.
+    ///
+    /// This is the escape hatch from OTLP: build the providers around any
+    /// exporters you like — a different protocol, a file, an in-memory
+    /// recorder — and hand the resulting guard over. Unlike
+    /// [`telemetry_from_globals`](Self::telemetry_from_globals), this runtime
+    /// now owns them, so [`shutdown`](ActonAI::shutdown) flushes and shuts
+    /// them down after the actors stop, exactly as it does for OTLP.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::telemetry::{install_with_exporters, Telemetry};
+    ///
+    /// let config = Telemetry::otlp("http://unused:4318").to_config()?;
+    /// let guard = install_with_exporters(&config, my_span_exporter, my_metric_exporter);
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .telemetry_guard(guard)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[cfg(feature = "otel")]
+    #[must_use]
+    pub fn telemetry_guard(mut self, guard: crate::telemetry::TelemetryGuard) -> Self {
+        self.telemetry = Some(TelemetrySetup::Guard(Box::new(guard)));
+        self
+    }
+
     /// Installs an explicit [`ContextWindow`](crate::memory::ContextWindow).
     ///
     /// Wins over the per-provider and config-file cascade at
@@ -1115,6 +1346,13 @@ impl ActonAIBuilder {
         // call may still be coming, and it replaces this section wholesale.
         if let Some(budget) = config.budget {
             self.budget_file = Some(budget);
+        }
+
+        // Same reasoning for `[telemetry]`, and additionally: stashing it
+        // unconditionally is what lets a build without the `otel` feature
+        // notice the section at launch and say so, rather than drop it.
+        if let Some(telemetry) = config.telemetry {
+            self.telemetry_file = Some(telemetry);
         }
 
         // Stash `[context]` settings — resolved at launch after the default
@@ -1578,7 +1816,17 @@ impl ActonAIBuilder {
             validate_budget_coverage(budget, &self.providers, &self.pricing)?;
         }
 
-        let app_name = self.app_name.unwrap_or_else(|| "acton-ai".to_string());
+        // Telemetry is resolved and installed before anything is spawned, so
+        // spans and metrics from the launch itself have somewhere to land.
+        // Resolution can fail (bad endpoint, missing feature), and a failure
+        // here must stop the launch rather than produce a runtime that
+        // silently exports nothing.
+        let telemetry = self.resolve_telemetry()?;
+
+        let app_name = self
+            .app_name
+            .take()
+            .unwrap_or_else(|| "acton-ai".to_string());
 
         // Launch the actor runtime
         let mut runtime = ActonApp::launch_async().await;
@@ -1602,7 +1850,13 @@ impl ActonAIBuilder {
 
         // Spawn all LLM providers
         let mut providers = HashMap::new();
-        for (name, config) in self.providers {
+        // Captured here because the config map is consumed by this loop, and
+        // the prompt loop needs the model name to label round spans and
+        // latency metrics — the provider actor knows it, but by then the
+        // telemetry has already been recorded.
+        let mut provider_models = HashMap::new();
+        for (name, config) in std::mem::take(&mut self.providers) {
+            provider_models.insert(name.clone(), config.model.clone());
             // The provider is told its configured name so the usage reports
             // it broadcasts are keyed by it rather than by vendor.
             let handle = LLMProvider::spawn(&mut runtime, name.clone(), config).await;
@@ -1716,6 +1970,15 @@ impl ActonAIBuilder {
             crate::accounting::BudgetEventListener::spawn(&mut runtime, callback).await;
         }
 
+        // Only when telemetry is configured: with no providers installed the
+        // actor would subscribe to three broadcasts and record every one of
+        // them into a no-op instrument.
+        #[cfg(feature = "otel")]
+        if telemetry.is_some() {
+            crate::telemetry::TelemetryActor::spawn(&mut runtime).await;
+            tracing::debug!("telemetry enabled");
+        }
+
         let context_window = resolve_context_window(
             self.context_window_override.take(),
             self.context_window_disabled,
@@ -1731,6 +1994,7 @@ impl ActonAIBuilder {
                 runtime,
                 providers,
                 default_provider: default_provider_name,
+                provider_models,
                 builtins,
                 auto_builtins: self.auto_builtins,
                 skills,
@@ -1740,9 +2004,66 @@ impl ActonAIBuilder {
                 accountant,
                 budget,
                 mcp,
+                telemetry,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Resolves the effective telemetry: builder first, then `[telemetry]`
+    /// TOML, and installs the providers.
+    ///
+    /// Wholesale, never field-by-field — the same precedence `budget` and
+    /// `usage_tracking` follow.
+    ///
+    /// Without the `otel` feature this is where a configured `[telemetry]`
+    /// section becomes a launch failure. Ignoring it would leave an operator
+    /// debugging a collector that was never going to receive anything.
+    fn resolve_telemetry(&mut self) -> Result<Option<TelemetryRuntime>, ActonAIError> {
+        #[cfg(feature = "otel")]
+        {
+            if let Some(setup) = self.telemetry.take() {
+                let config = match setup {
+                    TelemetrySetup::Otlp(telemetry) => telemetry.to_config()?,
+                    // Already installed by the caller; we only take over the
+                    // flushing and shutting down.
+                    TelemetrySetup::Guard(guard) => {
+                        return Ok(Some(TelemetryRuntime {
+                            guard: std::sync::Mutex::new(Some(*guard)),
+                        }))
+                    }
+                    // Nothing to build and nothing to own: the application
+                    // installed the providers and owns their lifecycle.
+                    TelemetrySetup::Globals => {
+                        return Ok(Some(TelemetryRuntime {
+                            guard: std::sync::Mutex::new(None),
+                        }))
+                    }
+                };
+                let guard = crate::telemetry::init_telemetry(&config)?;
+                return Ok(Some(TelemetryRuntime {
+                    guard: std::sync::Mutex::new(Some(guard)),
+                }));
+            }
+
+            match self.telemetry_file.take() {
+                Some(file) => {
+                    let config = file.to_telemetry()?;
+                    let guard = crate::telemetry::init_telemetry(&config)?;
+                    Ok(Some(TelemetryRuntime {
+                        guard: std::sync::Mutex::new(Some(guard)),
+                    }))
+                }
+                None => Ok(None),
+            }
+        }
+        #[cfg(not(feature = "otel"))]
+        {
+            if self.telemetry_file.is_some() {
+                return Err(crate::telemetry::unsupported_error());
+            }
+            Ok(None)
+        }
     }
 
     /// Resolves the effective budget: builder first, then `[budget]` TOML.
@@ -2359,6 +2680,87 @@ mod tests {
         crate::config::ActonAIConfig::new()
             .with_provider("claude", provider)
             .with_default_provider("claude")
+    }
+
+    // -------------------------------------------------------------------
+    // Telemetry
+    // -------------------------------------------------------------------
+
+    /// A config carrying a `[telemetry]` section pointing at a nonsense
+    /// scheme, so a launch that reaches telemetry resolution must fail and
+    /// one that ignores the section would silently succeed.
+    #[cfg(feature = "otel")]
+    fn config_with_bad_telemetry() -> crate::config::ActonAIConfig {
+        crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [telemetry]\notlp_endpoint = \"grpc://localhost:4317\"\n",
+        )
+        .expect("the section parses even when it cannot be honoured")
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn launch_fails_when_a_telemetry_endpoint_is_not_http() {
+        let err = ActonAI::builder()
+            .apply_config(config_with_bad_telemetry())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect_err("an OTLP/HTTP exporter cannot use a grpc endpoint");
+
+        assert!(err.is_configuration(), "err = {err}");
+        assert!(
+            err.to_string().contains("telemetry.otlp_endpoint"),
+            "err = {err}"
+        );
+    }
+
+    #[cfg(feature = "otel")]
+    #[tokio::test]
+    async fn a_builder_telemetry_call_replaces_the_toml_section_wholesale() {
+        // The TOML section is unusable. If the builder's telemetry replaced it
+        // only field-by-field, the bad endpoint would survive and the launch
+        // would fail — so a clean launch is the proof of wholesale precedence.
+        let ai = ActonAI::builder()
+            .apply_config(config_with_bad_telemetry())
+            .expect("apply_config")
+            .telemetry_from_globals()
+            .launch()
+            .await
+            .expect("the builder's telemetry replaces the section entirely");
+
+        assert!(format!("{ai:?}").contains("telemetry: true"));
+    }
+
+    /// Without the `otel` feature, a configured `[telemetry]` section must
+    /// stop the launch and say why.
+    ///
+    /// This is the outcome the whole feature-off code path exists to produce:
+    /// an operator who configured telemetry into a binary that cannot export
+    /// it needs to be told, not left watching an empty collector.
+    #[cfg(not(feature = "otel"))]
+    #[tokio::test]
+    async fn launch_fails_when_telemetry_is_configured_without_the_otel_feature() {
+        let config = crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [telemetry]\notlp_endpoint = \"http://localhost:4318\"\n",
+        )
+        .expect("the section must parse even without the feature");
+
+        let err = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect_err("telemetry that cannot be exported must not be ignored");
+
+        assert!(err.is_configuration(), "err = {err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("otel"), "err = {rendered}");
+        assert!(
+            rendered.contains("built without"),
+            "the error must name the missing feature: {rendered}"
+        );
     }
 
     #[tokio::test]

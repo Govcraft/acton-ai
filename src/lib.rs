@@ -75,6 +75,7 @@ pub mod memory;
 pub mod messages;
 pub mod prompt;
 pub mod stream;
+pub mod telemetry;
 pub mod tools;
 pub mod types;
 

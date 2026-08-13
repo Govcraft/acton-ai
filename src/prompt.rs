@@ -1003,6 +1003,42 @@ impl PromptBuilder {
         self,
         session: &StreamCollectorSession,
     ) -> Result<(CollectedResponse, Option<serde_json::Value>), ActonAIError> {
+        // The turn span brackets the whole run, so it is opened out here and
+        // closed on every exit path — including the failures, which are the
+        // spans an operator most wants to find. `run_rounds` reports what it
+        // accumulated through `stats` so the outcome can be recorded even
+        // when it returns early with an error.
+        let billed_provider = self
+            .provider_name
+            .clone()
+            .unwrap_or_else(|| self.runtime.default_provider_name().to_string());
+        let turn =
+            crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
+
+        let mut stats = TurnStats::default();
+        let result = self.run_rounds(session, &turn, &mut stats).await;
+
+        let outcome = match &result {
+            Ok(_) => crate::telemetry::metrics::OUTCOME_OK,
+            Err(error) => outcome_for(error),
+        };
+        turn.finish(stats.rounds, &stats.usage, outcome);
+
+        result
+    }
+
+    /// The prompt/tool loop proper.
+    ///
+    /// Split out of [`Self::run_prompt_loop`] so the turn span has exactly one
+    /// place to be closed however the loop ends. Everything it accumulates
+    /// that the span needs travels in `stats`, because most of the ways this
+    /// returns are early errors.
+    async fn run_rounds(
+        self,
+        session: &StreamCollectorSession,
+        turn: &crate::telemetry::spans::TurnSpan,
+        stats: &mut TurnStats,
+    ) -> Result<(CollectedResponse, Option<serde_json::Value>), ActonAIError> {
         // Destructure self to take ownership of all fields
         let PromptBuilder {
             runtime,
@@ -1078,13 +1114,19 @@ impl PromptBuilder {
         // Track executed tool calls and total tokens
         let mut executed_tool_calls = Vec::new();
         let mut total_token_count = 0;
-        // Usage is summed across every round of the tool loop: one `collect()`
-        // can drive several provider requests, and the caller is billed for
-        // all of them.
-        let mut total_usage = Usage::default();
         let mut final_text;
         let final_stop_reason;
-        let mut rounds = 0;
+        // Loop iterations, which is what `max_tool_rounds` bounds. Distinct
+        // from `stats.rounds`, which counts dispatches that actually happened.
+        let mut iteration = 0;
+
+        // The model this provider serves, resolved once. Round spans and the
+        // latency histogram are both labelled with it, so a dashboard can
+        // separate a slow model from a slow provider.
+        let billed_model = runtime
+            .provider_model(&billed_provider)
+            .unwrap_or_default()
+            .to_string();
 
         // Wrap callbacks in Arc<Mutex> for sharing across multiple rounds
         let on_start: Option<WrappedStartCallback> =
@@ -1094,8 +1136,8 @@ impl PromptBuilder {
         let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
 
         loop {
-            rounds += 1;
-            if rounds > max_tool_rounds {
+            iteration += 1;
+            if iteration > max_tool_rounds {
                 return Err(ActonAIError::prompt_failed(format!(
                     "exceeded maximum tool rounds ({max_tool_rounds})",
                 )));
@@ -1111,6 +1153,9 @@ impl PromptBuilder {
             // Generate new IDs for this round
             let correlation_id = CorrelationId::new();
             let agent_id = AgentId::new();
+            // Kept for the round span, which is opened after the request has
+            // taken ownership of the original.
+            let round_agent_id = agent_id.to_string();
 
             // Constrain the choice only while extracting. Plain `collect()`
             // keeps sending no `tool_choice` at all, so nothing changes for
@@ -1147,18 +1192,72 @@ impl PromptBuilder {
                 on_end: on_end.clone(),
                 token_target: token_target.clone(),
             };
-            let (text, stop_reason, token_count, round_usage, tool_calls) = run_stream_round(
+            // Counted here rather than at the top of the loop, so a turn
+            // refused by the budget check reports the rounds that actually
+            // dispatched — not the iteration that never got to.
+            stats.rounds += 1;
+
+            // One span and one latency sample per provider dispatch, opened
+            // as a child of the turn.
+            let round_span = turn.round(
+                &billed_provider,
+                &billed_model,
+                &round_correlation_id.to_string(),
+                &round_agent_id,
+                stats.rounds,
+            );
+            let round_started = std::time::Instant::now();
+
+            let round = run_stream_round(
                 session,
                 &provider_handle,
                 &request,
                 correlation_id,
                 round_callbacks,
             )
-            .await?;
+            .await;
+
+            let elapsed = round_started.elapsed().as_secs_f64();
+
+            // A transport failure never reaches the collector, so the round
+            // still has to be closed and measured before the error escapes.
+            let (text, stop_reason, token_count, round_usage, tool_calls) = match round {
+                Ok(round) => round,
+                Err(error) => {
+                    crate::telemetry::metrics::record_request_duration(
+                        &billed_provider,
+                        &billed_model,
+                        crate::telemetry::metrics::OUTCOME_ERROR,
+                        elapsed,
+                    );
+                    round_span.finish(
+                        &Usage::default(),
+                        StopReason::Error,
+                        crate::telemetry::metrics::OUTCOME_ERROR,
+                    );
+                    return Err(error);
+                }
+            };
+
+            // A round that ends in `StopReason::Error` cost time and possibly
+            // tokens, so it is recorded as a round that happened and failed —
+            // not as one that never ran.
+            let round_outcome = if stop_reason == StopReason::Error {
+                crate::telemetry::metrics::OUTCOME_ERROR
+            } else {
+                crate::telemetry::metrics::OUTCOME_OK
+            };
+            crate::telemetry::metrics::record_request_duration(
+                &billed_provider,
+                &billed_model,
+                round_outcome,
+                elapsed,
+            );
+            round_span.finish(&round_usage, stop_reason, round_outcome);
 
             final_text = text.clone();
             total_token_count += token_count;
-            total_usage += round_usage;
+            stats.usage += round_usage;
 
             if stop_reason == StopReason::Error {
                 return Err(ActonAIError::prompt_failed(
@@ -1211,7 +1310,28 @@ impl PromptBuilder {
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
+                        // Child of the turn, not of the round: the tool runs
+                        // after its round has closed, and nesting it under a
+                        // finished span would misreport when it ran.
+                        let tool_span = turn.tool(&tool_call.name);
+                        let tool_started = std::time::Instant::now();
+
                         let result = execute_tool_with_callback(&mut tools, tool_call).await;
+
+                        let tool_outcome = if result.is_ok() {
+                            crate::telemetry::metrics::OUTCOME_OK
+                        } else {
+                            crate::telemetry::metrics::OUTCOME_ERROR
+                        };
+                        crate::telemetry::metrics::record_tool_duration(
+                            &tool_call.name,
+                            tool_outcome,
+                            tool_started.elapsed().as_secs_f64(),
+                        );
+                        // Name and outcome only. The arguments and the result
+                        // are user data of unbounded size and are never
+                        // recorded — see `crate::telemetry::spans`.
+                        tool_span.finish(tool_outcome);
 
                         // Broadcast a compact result event so observers
                         // (the CLI chat REPL) can render success/failure
@@ -1294,9 +1414,44 @@ impl PromptBuilder {
                 total_token_count,
                 executed_tool_calls,
             )
-            .with_usage(total_usage),
+            .with_usage(stats.usage),
             captured,
         ))
+    }
+}
+
+/// What the turn span needs from a run that may not have finished.
+///
+/// Passed into [`PromptBuilder::run_rounds`] by `&mut` so the totals survive
+/// an early error return and the span can still record how far the turn got.
+#[derive(Debug, Default)]
+pub(crate) struct TurnStats {
+    /// Rounds started, including the one that failed.
+    rounds: usize,
+    /// Usage summed across every round of the tool loop: one `collect()` can
+    /// drive several provider requests, and the caller is billed for all of
+    /// them.
+    usage: Usage,
+}
+
+/// The span outcome label for an error.
+///
+/// These strings are what operators filter and group on, so they are a
+/// deliberately small, stable vocabulary rather than rendered messages —
+/// `budget_exceeded` in particular is the one a team watches once a cap is in
+/// force.
+fn outcome_for(error: &ActonAIError) -> &'static str {
+    use crate::error::ActonAIErrorKind as Kind;
+    match &error.kind {
+        Kind::BudgetExceeded { .. } => "budget_exceeded",
+        Kind::Configuration { .. } => "configuration",
+        Kind::LaunchFailed { .. } => "launch_failed",
+        Kind::PromptFailed { .. } => "prompt_failed",
+        Kind::StreamError { .. } => "stream_error",
+        Kind::ProviderError { .. } => "provider_error",
+        Kind::RuntimeShutdown => "runtime_shutdown",
+        Kind::Mcp { .. } => "mcp",
+        Kind::Extraction { .. } => "extraction",
     }
 }
 

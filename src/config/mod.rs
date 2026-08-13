@@ -84,5 +84,5 @@ pub use types::{
     parse_truncation_strategy, ActonAIConfig, ActonAIDefaults, BudgetFileConfig, CliFileConfig,
     ContextFileConfig, JobConfig, McpServerConfig, NamedProviderConfig, PersistenceFileConfig,
     PricingFileConfig, RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig,
-    SkillsFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
+    SkillsFileConfig, TelemetryFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
 };

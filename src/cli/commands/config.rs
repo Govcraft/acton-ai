@@ -140,6 +140,15 @@ fn scrub_secrets(mut cfg: ActonAIConfig) -> ActonAIConfig {
             provider.api_key = Some("[redacted]".to_string());
         }
     }
+    // Telemetry headers are how a collector is authenticated, so their values
+    // are bearer tokens as surely as `api_key` is. Scrubbed here as well as at
+    // the render site, so the secret is gone from the value itself rather than
+    // relying on every future printer to remember.
+    if let Some(telemetry) = cfg.telemetry.as_mut() {
+        for value in telemetry.headers.values_mut() {
+            "[redacted]".clone_into(value);
+        }
+    }
     cfg
 }
 
@@ -249,6 +258,25 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
         }
         for (name, cap) in &budget.providers {
             output.write_line(&format!("  provider {name}: {cap:.2}"))?;
+        }
+    }
+
+    if let Some(telemetry) = &report.config.telemetry {
+        output.write_line("")?;
+        output.write_line("Telemetry:")?;
+        if let Some(endpoint) = &telemetry.otlp_endpoint {
+            output.write_line(&format!("  otlp_endpoint:         {endpoint}"))?;
+        }
+        if let Some(name) = &telemetry.service_name {
+            output.write_line(&format!("  service_name:          {name}"))?;
+        }
+        if let Some(secs) = telemetry.metrics_interval_secs {
+            output.write_line(&format!("  metrics_interval_secs: {secs}"))?;
+        }
+        // Header names, never header values: these carry bearer tokens, and
+        // `acton-ai config` is the command people paste into issues.
+        for name in telemetry.headers.keys() {
+            output.write_line(&format!("  header {name}: [redacted]"))?;
         }
     }
 
@@ -390,6 +418,28 @@ mod tests {
         let scrubbed = scrub_secrets(cfg);
         let claude = scrubbed.providers.get("claude").unwrap();
         assert_eq!(claude.api_key.as_deref(), Some("[redacted]"));
+    }
+
+    #[test]
+    fn scrub_secrets_redacts_telemetry_header_values_but_keeps_the_names() {
+        // The name is what an operator needs to confirm; the value is a
+        // bearer token, and `acton-ai config` output gets pasted into issues.
+        let mut cfg = ActonAIConfig::new();
+        let mut headers = std::collections::BTreeMap::new();
+        headers.insert("authorization".to_string(), "Bearer hunter2".to_string());
+        cfg.telemetry = Some(crate::config::TelemetryFileConfig {
+            otlp_endpoint: Some("http://localhost:4318".to_string()),
+            headers,
+            ..Default::default()
+        });
+
+        let scrubbed = scrub_secrets(cfg);
+        let telemetry = scrubbed.telemetry.unwrap();
+        assert_eq!(
+            telemetry.headers.get("authorization").map(String::as_str),
+            Some("[redacted]")
+        );
+        assert!(!format!("{telemetry:?}").contains("hunter2"));
     }
 
     #[test]

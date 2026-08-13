@@ -732,6 +732,12 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
         })
         .await;
 
+    // Time to first token is measured from here rather than from the first
+    // byte off the socket: what a caller waits through includes establishing
+    // the request and the model's own prefill, and a metric that excluded
+    // them would report a latency nobody experiences.
+    let stream_started = std::time::Instant::now();
+
     // Start streaming request
     match client
         .send_streaming_request(
@@ -748,6 +754,10 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
             let mut stop_reason = StopReason::EndTurn;
             let mut usage = Usage::default();
 
+            // Taken once per round and cleared by the first token, which is
+            // what keeps a long stream from re-recording on every chunk.
+            let mut awaiting_first_token = Some(stream_started);
+
             while let Some(result) = stream.next().await {
                 match result {
                     Ok(event) => {
@@ -756,6 +766,13 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                                 // Stream already started, no action needed
                             }
                             LLMStreamEvent::Token { text } => {
+                                if let Some(started) = awaiting_first_token.take() {
+                                    crate::telemetry::metrics::record_time_to_first_token(
+                                        &ctx.configured_name,
+                                        &ctx.model,
+                                        started.elapsed().as_secs_f64(),
+                                    );
+                                }
                                 accumulated_text.push_str(&text);
 
                                 // Broadcast token

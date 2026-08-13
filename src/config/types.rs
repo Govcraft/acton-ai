@@ -111,6 +111,95 @@ pub struct ActonAIConfig {
     /// section wholesale — there is no field-level merging.
     #[serde(default)]
     pub budget: Option<BudgetFileConfig>,
+
+    /// OpenTelemetry export settings.
+    ///
+    /// Corresponds to `[telemetry]` in TOML. A
+    /// [`Telemetry`](crate::telemetry::Telemetry) set on the builder replaces
+    /// this section wholesale — there is no field-level merging.
+    ///
+    /// The section parses even in a build without the `otel` feature; the
+    /// launch is what refuses, naming the missing feature. Silently ignoring
+    /// an operator's telemetry config is the one outcome worth ruling out —
+    /// they would go looking for a broken collector rather than a lean build.
+    #[serde(default)]
+    pub telemetry: Option<TelemetryFileConfig>,
+}
+
+/// OpenTelemetry export settings loaded from `[telemetry]` in TOML.
+///
+/// ```toml
+/// [telemetry]
+/// otlp_endpoint = "http://localhost:4318"   # required; presence enables export
+/// service_name = "my-agent"                 # optional, default "acton-ai"
+/// metrics_interval_secs = 60                # optional, default 60
+///
+/// [telemetry.headers]                       # optional; authenticated collectors
+/// authorization = "Bearer ..."
+/// ```
+///
+/// Header values are secrets. They are never rendered by `acton-ai config`,
+/// which prints key names only.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TelemetryFileConfig {
+    /// Base OTLP HTTP endpoint, e.g. `http://localhost:4318`. Signal paths
+    /// (`/v1/traces`, `/v1/metrics`) are appended by the exporter.
+    ///
+    /// Required: its presence is what enables export at all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub otlp_endpoint: Option<String>,
+
+    /// `service.name` resource attribute. Defaults to
+    /// [`DEFAULT_SERVICE_NAME`](crate::telemetry::DEFAULT_SERVICE_NAME).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub service_name: Option<String>,
+
+    /// How often the periodic metrics reader exports, in seconds. Defaults to
+    /// [`DEFAULT_METRICS_INTERVAL_SECS`](crate::telemetry::DEFAULT_METRICS_INTERVAL_SECS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metrics_interval_secs: Option<u64>,
+
+    /// Headers sent with every OTLP request, for authenticated collectors.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub headers: BTreeMap<String, String>,
+}
+
+impl TelemetryFileConfig {
+    /// Validates the section and resolves defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when `otlp_endpoint` is missing, is not
+    /// a parseable URL, or does not use `http`/`https`; and when
+    /// `metrics_interval_secs` is zero.
+    ///
+    /// ```rust
+    /// use acton_ai::config::TelemetryFileConfig;
+    ///
+    /// let section: TelemetryFileConfig =
+    ///     toml::from_str("otlp_endpoint = 'http://localhost:4318'").unwrap();
+    /// let resolved = section.to_telemetry().unwrap();
+    /// assert_eq!(resolved.service_name, "acton-ai");
+    ///
+    /// let empty = TelemetryFileConfig::default();
+    /// assert!(empty.to_telemetry().is_err());
+    /// ```
+    pub fn to_telemetry(&self) -> Result<crate::telemetry::TelemetryConfig, ActonAIError> {
+        let endpoint = self.otlp_endpoint.as_ref().ok_or_else(|| {
+            ActonAIError::configuration(
+                "telemetry.otlp_endpoint",
+                "the [telemetry] section sets no otlp_endpoint; add one (e.g. \
+                 \"http://localhost:4318\"), or drop the section entirely to disable export",
+            )
+        })?;
+
+        crate::telemetry::TelemetryConfig::resolve(
+            endpoint,
+            self.service_name.clone(),
+            self.metrics_interval_secs,
+            self.headers.clone(),
+        )
+    }
 }
 
 /// Spending caps loaded from `[budget]` in TOML.
@@ -1573,6 +1662,7 @@ max_execution_ms = 60000
             defaults: None,
             skills: None,
             context: None,
+            telemetry: None,
             mcp_servers: HashMap::new(),
             budget: None,
         };
@@ -1614,6 +1704,105 @@ model = "qwen2.5:7b"
 
         let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
         assert!(config.defaults.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // [telemetry]
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn telemetry_section_parses_in_full() {
+        let toml_str = r#"
+[telemetry]
+otlp_endpoint = "https://collector.example:4318"
+service_name = "my-agent"
+metrics_interval_secs = 15
+
+[telemetry.headers]
+authorization = "Bearer hunter2"
+x-tenant = "acme"
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let telemetry = config
+            .telemetry
+            .expect("the [telemetry] section must parse");
+
+        assert_eq!(
+            telemetry.otlp_endpoint.as_deref(),
+            Some("https://collector.example:4318")
+        );
+        assert_eq!(telemetry.service_name.as_deref(), Some("my-agent"));
+        assert_eq!(telemetry.metrics_interval_secs, Some(15));
+        assert_eq!(
+            telemetry.headers.get("authorization").map(String::as_str),
+            Some("Bearer hunter2")
+        );
+
+        let resolved = telemetry.to_telemetry().expect("a valid section");
+        assert_eq!(resolved.service_name, "my-agent");
+        assert_eq!(resolved.metrics_interval_secs(), 15);
+        assert_eq!(resolved.headers.len(), 2);
+    }
+
+    #[test]
+    fn a_minimal_telemetry_section_takes_the_framework_defaults() {
+        let config: ActonAIConfig =
+            toml::from_str("[telemetry]\notlp_endpoint = \"http://localhost:4318\"\n").unwrap();
+        let resolved = config
+            .telemetry
+            .expect("the section must parse")
+            .to_telemetry()
+            .expect("a lone endpoint is a valid section");
+
+        assert_eq!(
+            resolved.service_name,
+            crate::telemetry::DEFAULT_SERVICE_NAME
+        );
+        assert_eq!(
+            resolved.metrics_interval_secs(),
+            crate::telemetry::DEFAULT_METRICS_INTERVAL_SECS
+        );
+        assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn no_telemetry_section_means_no_export() {
+        let config: ActonAIConfig = toml::from_str("").unwrap();
+        assert!(config.telemetry.is_none());
+    }
+
+    #[test]
+    fn a_telemetry_section_without_an_endpoint_is_refused() {
+        // An endpoint is the whole of what enables export; a section without
+        // one is a half-finished edit, not a request to export nowhere.
+        let config: ActonAIConfig =
+            toml::from_str("[telemetry]\nservice_name = \"my-agent\"\n").unwrap();
+        let err = config
+            .telemetry
+            .expect("the section parses")
+            .to_telemetry()
+            .expect_err("a section with no endpoint cannot export");
+
+        assert!(err.to_string().contains("otlp_endpoint"), "err = {err}");
+    }
+
+    #[test]
+    fn a_zero_metrics_interval_in_toml_is_refused() {
+        let config: ActonAIConfig = toml::from_str(
+            "[telemetry]\notlp_endpoint = \"http://localhost:4318\"\nmetrics_interval_secs = 0\n",
+        )
+        .unwrap();
+        let err = config
+            .telemetry
+            .expect("the section parses")
+            .to_telemetry()
+            .expect_err("zero is not a schedule");
+
+        assert!(
+            err.to_string().contains("metrics_interval_secs"),
+            "err = {err}"
+        );
     }
 
     // -------------------------------------------------------------------
