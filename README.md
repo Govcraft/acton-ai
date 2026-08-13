@@ -39,6 +39,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Process sandboxing** — Portable subprocess isolation for tool execution with rlimits, timeouts, and optional Linux hardening (landlock + seccomp)
 - **Usage & cost tracking** — Token usage from every provider tallied per provider and model, priced from your own rate table; on by default
 - **Spending budgets** — Hard process-wide and per-provider caps checked before every request, with warnings on the way up and a typed refusal at the ceiling
+- **OpenTelemetry export** — Traces spanning each prompt loop (turn → rounds → tools) plus token, latency, and reliability metrics, over OTLP to any collector
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -63,9 +64,10 @@ cargo add acton-ai
 ```
 
 The default features are `sandbox-hardening` (Linux landlock + seccomp for the
-process sandbox; a no-op elsewhere) and `derive` (the [`#[tool]`](#deriving-tools-with-tool)
-attribute macro). Both are independent — `--no-default-features --features derive`
-gets you the macro with no OS hardening.
+process sandbox; a no-op elsewhere), `derive` (the [`#[tool]`](#deriving-tools-with-tool)
+attribute macro), and `otel` ([OpenTelemetry export](#observability)). All three are
+independent — `--no-default-features --features derive` gets you the macro with no OS
+hardening and no telemetry stack.
 
 For Ollama (local), no API key is needed. For cloud providers, set environment variables:
 
@@ -341,6 +343,55 @@ invisibly, so it fails the launch unless `Budget::allow_unpriced()` says the
 blind spot is acceptable. A cap is a circuit breaker, not an exact meter — a
 request already in flight when the ceiling is crossed still completes.
 
+### Observability
+
+Point the runtime at an OTLP collector and every prompt becomes a trace —
+`acton_ai.turn` with a child span per provider round and per tool call —
+alongside metrics for tokens, latency, and rate limits:
+
+```rust
+use acton_ai::prelude::*;
+
+let runtime = ActonAI::builder()
+    .anthropic_from_env()
+    .telemetry_otlp("http://localhost:4318")
+    .launch()
+    .await?;
+
+// ... prompts ...
+
+// Flushes telemetry after the actors stop, so the final batch is exported
+// rather than dropped on the way out.
+runtime.shutdown().await?;
+```
+
+The TOML twin, with the knobs the one-liner defaults:
+
+```toml
+[telemetry]
+otlp_endpoint = "http://localhost:4318"   # required; presence enables export
+service_name = "my-agent"                 # default "acton-ai"
+metrics_interval_secs = 60                # default 60
+
+[telemetry.headers]                       # optional; authenticated collectors
+authorization = "Bearer ..."
+```
+
+To see the traces, run a collector with a UI and browse
+<http://localhost:16686>:
+
+```bash
+docker run --rm -p 4318:4318 -p 16686:16686 jaegertracing/jaeger:latest
+```
+
+Tool arguments and results are **never** recorded on spans — they are user
+data and unbounded in size. Correlation and agent IDs go on spans only, never
+on metrics, where one series per request would melt the backend. The exporter
+is OTLP over HTTP/protobuf; no gRPC stack is pulled in.
+
+Already running OpenTelemetry in your application? `.telemetry_from_globals()`
+emits into the providers you installed instead of installing competing ones.
+
 ## Built-in Tools
 
 Available when you call `.with_builtins()`:
@@ -592,6 +643,9 @@ cargo run --example budget
 
 # Deriving tools from functions with #[tool]
 cargo run --example tool_macro
+
+# OpenTelemetry traces and metrics over OTLP
+cargo run --example telemetry
 ```
 
 ## Documentation

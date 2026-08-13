@@ -115,9 +115,17 @@ trybuild = "1.0.120"
 name = "tool_macro"
 required-features = ["derive"]
 
+[[example]]
+name = "telemetry"
+required-features = ["otel"]
+
 [[test]]
 name = "tool_macro"
 required-features = ["derive"]
+
+[[test]]
+name = "telemetry"
+required-features = ["otel"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 landlock = { version = "0.4.4", optional = true }

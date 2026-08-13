@@ -14,6 +14,41 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- OpenTelemetry export behind the new `otel` feature, which joins the default
+  set. Every prompt loop run becomes an `acton_ai.turn` span with an
+  `acton_ai.llm_round` child per provider dispatch and an `acton_ai.tool`
+  child per tool execution, parented explicitly rather than through ambient
+  context. Metrics cover tokens (`acton_ai.tokens`, split by kind), requests,
+  rate limits, budget events, round latency, time to first token, and tool
+  duration.
+- `ActonAIBuilder::telemetry_otlp("http://localhost:4318")` for the common
+  case, `ActonAIBuilder::telemetry(Telemetry::otlp(..).service_name(..)
+  .metrics_interval_secs(..).header(..))` for the rest, and a `[telemetry]`
+  TOML section with the same shape. A builder-set telemetry replaces the TOML
+  section wholesale.
+- `ActonAIBuilder::telemetry_from_globals()` emits into OpenTelemetry
+  providers the surrounding application already installed, instead of
+  installing competing ones. That application keeps the lifecycle, so
+  `shutdown()` deliberately neither flushes nor shuts those providers down.
+- `ActonAIBuilder::telemetry_guard(guard)` plus the public
+  `telemetry::install_with_exporters` assemble the providers around any
+  exporters you supply — a different protocol, a file, an in-memory recorder —
+  with this runtime owning their lifecycle.
+- `ActonAI::shutdown` flushes telemetry **after** the actors stop, so the
+  final broadcasts are recorded rather than dropped with the last batch.
+- `ActonAI::provider_model(name)` exposes the model a configured provider
+  serves.
+- Tool arguments and results are never recorded on spans, and correlation and
+  agent IDs are recorded on spans only, never as metric attributes. Both are
+  deliberate: the first is unbounded user data, the second would create one
+  time series per request.
+- The OTLP transport is HTTP/protobuf over reqwest's blocking client. No gRPC
+  or tonic stack is pulled in, and the blocking client is required rather than
+  incidental — `BatchSpanProcessor` and `PeriodicReader` export from a plain
+  `std::thread` where an async client would have no reactor.
+- A `[telemetry]` section parses in builds without the `otel` feature and
+  fails the launch naming the missing feature, rather than being silently
+  ignored.
 - Spending budgets. `Budget` sets a process-wide cap and/or per-provider caps;
   the prompt loop asks the accountant before every provider dispatch and fails
   with `ActonAIErrorKind::BudgetExceeded` once a ceiling is reached. The check

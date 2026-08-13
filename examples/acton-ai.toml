@@ -48,3 +48,29 @@ tokens_per_minute = 1000000
 # max_execution_ms = 30000
 # # Maximum memory (address space) in MB (default: 256)
 # max_memory_mb = 256
+
+# OpenTelemetry export (optional)
+# Uncomment to export traces and metrics to an OTLP collector over
+# HTTP/protobuf. Every prompt becomes an `acton_ai.turn` trace with a child
+# span per provider round and per tool call; metrics cover tokens, latency,
+# rate limits, and budget events.
+#
+# To look at the traces locally:
+#   docker run --rm -p 4318:4318 -p 16686:16686 jaegertracing/jaeger:latest
+# then browse http://localhost:16686.
+#
+# Requires the `otel` feature, which is on by default. A binary built without
+# it fails to launch with this section present rather than ignoring it.
+
+# [telemetry]
+# # Required — its presence is what enables export.
+# otlp_endpoint = "http://localhost:4318"
+# # How traces and metrics are grouped in the backend (default: "acton-ai")
+# service_name = "my-agent"
+# # Periodic metrics reader interval in seconds (default: 60)
+# metrics_interval_secs = 60
+#
+# # Optional, for authenticated collectors. Values are secrets and are never
+# # printed by `acton-ai config`, which shows key names only.
+# [telemetry.headers]
+# authorization = "Bearer ..."
