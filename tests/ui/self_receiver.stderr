@@ -1,0 +1,5 @@
+error: `#[tool]` applies to free functions, not methods; a tool is a unit struct with no state to borrow, so remove the `self` parameter
+ --> tests/ui/self_receiver.rs:8:25
+  |
+8 |     async fn calculator(&self, expr: String) -> Result<serde_json::Value, ToolError> {
+  |                         ^^^^^

@@ -1,0 +1,5 @@
+error: `#[tool]` needs a plain name for each parameter, because the name becomes the JSON property the model fills in; bind the whole value to one identifier and destructure it in the body
+ --> tests/ui/destructuring_parameter.rs:5:19
+  |
+5 | async fn add_pair((a, b): (i64, i64)) -> Result<i64, ToolError> {
+  |                   ^^^^^^

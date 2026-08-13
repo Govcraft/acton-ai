@@ -1,0 +1,5 @@
+error: `#[tool]` takes no arguments; the tool's name comes from the function name and its description from the doc comment
+ --> tests/ui/attribute_arguments.rs:4:8
+  |
+4 | #[tool(name = "calc")]
+  |        ^^^^^^^^^^^^^

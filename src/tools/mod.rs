@@ -85,9 +85,11 @@ pub mod executor;
 pub mod registry;
 pub mod sandbox;
 pub mod security;
+pub mod tool_trait;
 
 // Re-exports
 pub use crate::messages::ToolDefinition;
+pub use tool_trait::{Tool, ToolFuture};
 pub use actor::{
     ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync,
 };

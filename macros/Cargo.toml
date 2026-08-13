@@ -1,0 +1,18 @@
+[package]
+name = "acton-ai-macros"
+version = "0.29.0"
+edition = "2021"
+description = "Procedural macros for acton-ai: the #[tool] attribute that turns a function into an LLM tool"
+license = "MIT"
+repository = "https://github.com/rodzilla/acton-ai"
+keywords = ["ai", "agents", "llm", "macros", "proc-macro"]
+categories = ["development-tools::procedural-macro-helpers"]
+include = ["src/**/*", "README.md", "LICENSE-MIT"]
+
+[lib]
+proc-macro = true
+
+[dependencies]
+proc-macro2 = "1.0.107"
+quote = "1.0.47"
+syn = { version = "3.0.3", features = ["full", "extra-traits"] }

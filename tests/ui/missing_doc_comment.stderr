@@ -1,0 +1,5 @@
+error: `#[tool]` requires a doc comment on `calculator`: add a `///` comment describing what the tool does and when to use it. It becomes the tool description the model sees, and is the only thing it has to go on when deciding whether to call this tool
+ --> tests/ui/missing_doc_comment.rs:4:10
+  |
+4 | async fn calculator(expr: String) -> Result<serde_json::Value, ToolError> {
+  |          ^^^^^^^^^^

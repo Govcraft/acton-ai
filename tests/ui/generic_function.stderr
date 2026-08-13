@@ -1,0 +1,5 @@
+error: `#[tool]` does not support generic functions; the generated tool is a unit struct with no way to choose the type arguments, so use concrete types in the signature
+ --> tests/ui/generic_function.rs:5:15
+  |
+5 | async fn echo<T: serde::Serialize>(value: T) -> Result<T, ToolError> {
+  |               ^^^^^^^^^^^^^^^^^^^

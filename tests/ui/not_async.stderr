@@ -1,0 +1,5 @@
+error: `#[tool]` requires an `async fn`; tools are awaited by the prompt loop, so add `async` before `fn`
+ --> tests/ui/not_async.rs:5:1
+  |
+5 | fn calculator(expr: String) -> Result<serde_json::Value, ToolError> {
+  | ^^

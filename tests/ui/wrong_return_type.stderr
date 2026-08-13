@@ -1,0 +1,21 @@
+error: `#[tool]` requires the return type to be spelled `Result<T, ToolError>`, where `T: serde::Serialize`; the `Ok` value is serialized and sent back to the model
+ --> tests/ui/wrong_return_type.rs:5:30
+  |
+5 | async fn plain(expr: String) -> String {
+  |                              ^^^^^^^^^
+
+error: `#[tool]` requires the return type to be spelled `Result<T, ToolError>`, where `T: serde::Serialize`; the `Ok` value is serialized and sent back to the model
+  --> tests/ui/wrong_return_type.rs:11:56
+   |
+11 | async fn foreign_error(expr: String) -> Result<String, std::io::Error> {
+   |                                                        ^^^^^^^^^^^^^^
+
+error: `#[tool]` requires the return type to be spelled `Result<T, ToolError>`, where `T: serde::Serialize`; the `Ok` value is serialized and sent back to the model
+
+       this function returns `()`
+  --> tests/ui/wrong_return_type.rs:16:1
+   |
+16 | #[tool]
+   | ^^^^^^^
+   |
+   = note: this error originates in the attribute macro `tool` (in Nightly builds, run with -Z macro-backtrace for more info)

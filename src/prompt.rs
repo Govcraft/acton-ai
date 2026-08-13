@@ -57,7 +57,6 @@ use acton_reactive::prelude::*;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
 use std::future::Future;
-use std::pin::Pin;
 use std::sync::Arc;
 use tokio::sync::Notify;
 
@@ -88,7 +87,10 @@ type EndCallback = Box<dyn FnMut(StopReason) + Send + 'static>;
 type ToolResultCallback = Box<dyn FnMut(Result<&serde_json::Value, &str>) + Send + 'static>;
 
 /// Type alias for tool execution futures.
-type ToolFuture = Pin<Box<dyn Future<Output = Result<serde_json::Value, ToolError>> + Send>>;
+///
+/// Re-exported from [`crate::tools`] so the fluent API and the [`Tool`] trait
+/// speak the same future type rather than two structurally-equal aliases.
+use crate::tools::ToolFuture;
 
 /// Trait for tool execution functions.
 ///
@@ -111,6 +113,27 @@ where
 {
     fn call(&self, args: serde_json::Value) -> ToolFuture {
         Box::pin((self.func)(args))
+    }
+}
+
+/// Adapter that lets a [`Tool`](crate::tools::Tool) implementation stand in
+/// wherever the prompt loop expects a `ToolExecutorFn`.
+///
+/// The two traits already agree on the call shape — `serde_json::Value` in,
+/// [`ToolFuture`] out — so this forwards without adaptation. It exists only
+/// because the loop is generic over `ToolExecutorFn`, and making `Tool` a
+/// subtrait of it would leak a loop-internal trait into the public API that
+/// tool authors implement.
+struct TraitToolExecutor<T> {
+    tool: T,
+}
+
+impl<T> ToolExecutorFn for TraitToolExecutor<T>
+where
+    T: crate::tools::Tool,
+{
+    fn call(&self, args: serde_json::Value) -> ToolFuture {
+        self.tool.call(args)
     }
 }
 
@@ -494,6 +517,57 @@ impl PromptBuilder {
         };
 
         self.tools.push(spec);
+        self
+    }
+
+    /// Registers a value implementing the [`Tool`] trait.
+    ///
+    /// [`Tool`] bundles the name, description, schema, and executor that
+    /// [`tool`](Self::tool) takes as four separate arguments, so a tool can be
+    /// defined once and registered anywhere. The usual way to get one is the
+    /// [`#[tool]`](macro@crate::tool) attribute, which generates the
+    /// implementation from an `async fn`:
+    ///
+    /// ```rust
+    /// use acton_ai::prelude::*;
+    ///
+    /// /// Adds two numbers.
+    /// #[tool]
+    /// async fn add(a: i64, b: i64) -> Result<serde_json::Value, ToolError> {
+    ///     Ok(serde_json::json!({ "sum": a + b }))
+    /// }
+    ///
+    /// # async fn run(runtime: ActonAI) -> Result<(), ActonAIError> {
+    /// let response = runtime
+    ///     .prompt("What is 42 + 17?")
+    ///     .add_tool(Add)
+    ///     .collect()
+    ///     .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// # Why not `with_tool`?
+    ///
+    /// [`with_tool`](Self::with_tool) already means "a `ToolDefinition` plus a
+    /// closure" and predates this trait. Rust cannot overload on arity, so
+    /// this is a separate method rather than a second form of that one.
+    #[must_use]
+    pub fn add_tool<T>(mut self, tool: T) -> Self
+    where
+        T: crate::tools::Tool,
+    {
+        let definition = ToolDefinition {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        };
+
+        self.tools.push(ToolSpec {
+            definition,
+            executor: Arc::new(TraitToolExecutor { tool }),
+            on_result: None,
+        });
         self
     }
 
