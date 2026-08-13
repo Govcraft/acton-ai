@@ -135,8 +135,7 @@ async fn extract_returns_a_typed_value_and_forces_the_synthetic_tool() {
         "subschemas must be inlined, found a $ref: {schema:#}"
     );
     assert_eq!(
-        schema["properties"]["line_items"]["items"]["properties"]["cents"]["type"],
-        "integer",
+        schema["properties"]["line_items"]["items"]["properties"]["cents"]["type"], "integer",
         "the nested item schema must be inlined in full: {schema:#}"
     );
 }
@@ -149,7 +148,11 @@ async fn invalid_arguments_trigger_a_repair_round_that_feeds_back_the_error() {
             STRUCTURED_OUTPUT_TOOL,
             invalid_invoice_arguments(),
         ),
-        Round::tool_call("call_good", STRUCTURED_OUTPUT_TOOL, valid_invoice_arguments()),
+        Round::tool_call(
+            "call_good",
+            STRUCTURED_OUTPUT_TOOL,
+            valid_invoice_arguments(),
+        ),
     ])
     .await;
     let runtime = runtime_pointed_at(&server, "structured-output-test").await;
@@ -213,9 +216,21 @@ async fn invalid_arguments_trigger_a_repair_round_that_feeds_back_the_error() {
 #[tokio::test]
 async fn repeated_invalid_arguments_exhaust_the_repair_budget() {
     let server = MockServer::start(vec![
-        Round::tool_call("call_1", STRUCTURED_OUTPUT_TOOL, invalid_invoice_arguments()),
-        Round::tool_call("call_2", STRUCTURED_OUTPUT_TOOL, invalid_invoice_arguments()),
-        Round::tool_call("call_3", STRUCTURED_OUTPUT_TOOL, invalid_invoice_arguments()),
+        Round::tool_call(
+            "call_1",
+            STRUCTURED_OUTPUT_TOOL,
+            invalid_invoice_arguments(),
+        ),
+        Round::tool_call(
+            "call_2",
+            STRUCTURED_OUTPUT_TOOL,
+            invalid_invoice_arguments(),
+        ),
+        Round::tool_call(
+            "call_3",
+            STRUCTURED_OUTPUT_TOOL,
+            invalid_invoice_arguments(),
+        ),
     ])
     .await;
     let runtime = runtime_pointed_at(&server, "structured-output-test").await;
@@ -263,7 +278,11 @@ async fn a_real_tool_runs_first_and_a_stalled_round_is_nudged_into_answering() {
         // Round 2: prose, no answer recorded — this is the stall.
         Round::text("The vendor is Acme Supplies."),
         // Round 3: under a forced choice, it records the answer.
-        Round::tool_call("call_answer", STRUCTURED_OUTPUT_TOOL, valid_invoice_arguments()),
+        Round::tool_call(
+            "call_answer",
+            STRUCTURED_OUTPUT_TOOL,
+            valid_invoice_arguments(),
+        ),
     ])
     .await;
     let runtime = runtime_pointed_at(&server, "structured-output-test").await;

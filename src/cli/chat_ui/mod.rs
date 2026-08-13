@@ -215,14 +215,8 @@ pub async fn run(
     // Subscribe to broadcast events BEFORE starting. `StreamToken` is sent
     // point-to-point via the handle returned below, so it doesn't need a
     // broadcast subscription.
-    token_actor
-        .handle()
-        .subscribe::<LLMStreamStart>()
-        .await;
-    token_actor
-        .handle()
-        .subscribe::<LLMStreamToolCall>()
-        .await;
+    token_actor.handle().subscribe::<LLMStreamStart>().await;
+    token_actor.handle().subscribe::<LLMStreamToolCall>().await;
     token_actor
         .handle()
         .subscribe::<LLMStreamToolResult>()
@@ -319,10 +313,7 @@ pub async fn run(
                 // The DB still has historical rows; truncating would be a
                 // destructive surprise. New messages simply start fresh.
                 persist_cursor = 0;
-                println!(
-                    "{}(history cleared){}",
-                    theme.dim_open, theme.dim_close
-                );
+                println!("{}(history cleared){}", theme.dim_open, theme.dim_close);
             }
             slash::SlashAction::History => print_history(&conv.history(), &theme),
             slash::SlashAction::Exit => break Ok(()),
@@ -384,10 +375,7 @@ struct TurnContext<'a> {
     render_markdown: bool,
 }
 
-async fn send_turn(
-    ctx: &TurnContext<'_>,
-    content: &str,
-) -> Result<TurnOutcome, ActonAIError> {
+async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, ActonAIError> {
     // Reset per-turn signals so the token handler emits the label again and
     // any previous cancel no longer silences output.
     ctx.muted.store(false, Ordering::Relaxed);
@@ -451,7 +439,11 @@ async fn send_turn(
             eprintln!(
                 "\n{}^C canceled{}",
                 ctx.theme.warn_open,
-                if ctx.theme.colors_enabled { "\x1b[0m" } else { "" },
+                if ctx.theme.colors_enabled {
+                    "\x1b[0m"
+                } else {
+                    ""
+                },
             );
             Ok(TurnOutcome::Canceled)
         }
@@ -520,10 +512,7 @@ fn build_editor(history_path: Option<&Path>) -> Reedline {
 
 fn print_history(messages: &[Message], theme: &Theme) {
     if messages.is_empty() {
-        println!(
-            "{}(no messages yet){}",
-            theme.dim_open, theme.dim_close
-        );
+        println!("{}(no messages yet){}", theme.dim_open, theme.dim_close);
         return;
     }
     for (i, msg) in messages.iter().enumerate() {

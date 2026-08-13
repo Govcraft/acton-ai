@@ -47,8 +47,8 @@ use crate::extract::{
 use crate::facade::ActonAI;
 use crate::llm::SamplingParams;
 use crate::messages::{
-    LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message, Usage,
-    StopReason, ToolCall, ToolChoice, ToolDefinition,
+    LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, Usage,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall};
 use crate::tools::ToolError;
@@ -1182,8 +1182,7 @@ impl PromptBuilder {
                             // siblings: every tool call in an assistant
                             // message needs a matching tool result, and the
                             // siblings deliberately never ran.
-                            messages
-                                .push(Message::assistant_with_tools(text, vec![call.clone()]));
+                            messages.push(Message::assistant_with_tools(text, vec![call.clone()]));
                             messages.push(Message::tool(&call.id, validation_feedback(&message)));
                             force_structured = true;
                             continue;
@@ -1395,8 +1394,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
 
     // Stream start — fire the caller's on_start callback for the current round.
     collector.mutate_on::<LLMStreamStart>(move |actor, envelope| {
-        if actor.model.expected_correlation_id.as_ref()
-            != Some(&envelope.message().correlation_id)
+        if actor.model.expected_correlation_id.as_ref() != Some(&envelope.message().correlation_id)
         {
             return Reply::ready();
         }
@@ -1410,8 +1408,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
 
     // Stream token — accumulate, fire caller's callback, forward to target.
     collector.mutate_on::<LLMStreamToken>(move |actor, envelope| {
-        if actor.model.expected_correlation_id.as_ref()
-            != Some(&envelope.message().correlation_id)
+        if actor.model.expected_correlation_id.as_ref() != Some(&envelope.message().correlation_id)
         {
             return Reply::ready();
         }
@@ -1436,8 +1433,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
 
     // Stream tool call — accumulate into per-round state.
     collector.mutate_on::<LLMStreamToolCall>(move |actor, envelope| {
-        if actor.model.expected_correlation_id.as_ref()
-            != Some(&envelope.message().correlation_id)
+        if actor.model.expected_correlation_id.as_ref() != Some(&envelope.message().correlation_id)
         {
             return Reply::ready();
         }
@@ -1451,8 +1447,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
     // Stream end — take the accumulated state into the shared result slot
     // and signal completion so the caller can pick up the round result.
     collector.mutate_on::<LLMStreamEnd>(move |actor, envelope| {
-        if actor.model.expected_correlation_id.as_ref()
-            != Some(&envelope.message().correlation_id)
+        if actor.model.expected_correlation_id.as_ref() != Some(&envelope.message().correlation_id)
         {
             return Reply::ready();
         }

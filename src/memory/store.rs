@@ -28,8 +28,8 @@ use acton_reactive::prelude::*;
 use libsql::{Connection, Database};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 // =============================================================================
 // Messages
@@ -1106,7 +1106,10 @@ mod tests {
         let metrics = MemoryStoreMetrics::default();
         let clone = metrics.clone();
 
-        clone.counters.messages_saved.fetch_add(3, Ordering::Relaxed);
+        clone
+            .counters
+            .messages_saved
+            .fetch_add(3, Ordering::Relaxed);
 
         assert_eq!(
             metrics.messages_saved(),
@@ -1120,9 +1123,13 @@ mod tests {
         let metrics = MemoryStoreMetrics::default();
         let counters = &metrics.counters;
 
-        counters.conversations_created.fetch_add(1, Ordering::Relaxed);
+        counters
+            .conversations_created
+            .fetch_add(1, Ordering::Relaxed);
         counters.messages_saved.fetch_add(2, Ordering::Relaxed);
-        counters.conversations_loaded.fetch_add(3, Ordering::Relaxed);
+        counters
+            .conversations_loaded
+            .fetch_add(3, Ordering::Relaxed);
         counters.state_saves.fetch_add(4, Ordering::Relaxed);
         counters.state_loads.fetch_add(5, Ordering::Relaxed);
         counters.memories_stored.fetch_add(6, Ordering::Relaxed);

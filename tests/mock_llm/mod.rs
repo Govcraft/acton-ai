@@ -363,7 +363,10 @@ fn scripted_rounds_render_the_wire_shape_the_client_parses() {
 
     // Tool-call arguments ride as a JSON-encoded *string*, not an object.
     let tool_call = &chunks[1]["choices"][0]["delta"]["tool_calls"][0];
-    assert_eq!(tool_call["function"]["arguments"], json!(r#"{"value":"hi"}"#));
+    assert_eq!(
+        tool_call["function"]["arguments"],
+        json!(r#"{"value":"hi"}"#)
+    );
 
     // A round with tool calls must finish as `tool_calls`, or the client
     // never flushes the accumulated call.
@@ -376,12 +379,18 @@ fn scripted_rounds_render_the_wire_shape_the_client_parses() {
     assert_eq!(usage["choices"], json!([]));
     assert_eq!(usage["usage"]["prompt_tokens"], json!(100));
     assert_eq!(usage["usage"]["completion_tokens"], json!(5));
-    assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], json!(40));
+    assert_eq!(
+        usage["usage"]["prompt_tokens_details"]["cached_tokens"],
+        json!(40)
+    );
 
     // `Round::with_usage` is the same path with no cache split.
     let plain = Round::text("hi").with_usage(7, 8).to_sse();
     assert!(plain.contains(r#""prompt_tokens":7"#), "{plain}");
-    assert!(plain.ends_with("data: [DONE]\n\n"), "the stream must terminate");
+    assert!(
+        plain.ends_with("data: [DONE]\n\n"),
+        "the stream must terminate"
+    );
 }
 
 /// Pins the TOML this harness renders, and that it round-trips through the

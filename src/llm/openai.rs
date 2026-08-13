@@ -839,7 +839,10 @@ mod tests {
 
     #[test]
     fn openai_tool_choice_auto_serializes_as_string() {
-        assert_eq!(tool_choice_body(Some(&ToolChoice::Auto))["tool_choice"], "auto");
+        assert_eq!(
+            tool_choice_body(Some(&ToolChoice::Auto))["tool_choice"],
+            "auto"
+        );
     }
 
     #[test]
@@ -864,7 +867,10 @@ mod tests {
 
     #[test]
     fn openai_tool_choice_none_serializes_as_string() {
-        assert_eq!(tool_choice_body(Some(&ToolChoice::None))["tool_choice"], "none");
+        assert_eq!(
+            tool_choice_body(Some(&ToolChoice::None))["tool_choice"],
+            "none"
+        );
     }
 
     #[test]

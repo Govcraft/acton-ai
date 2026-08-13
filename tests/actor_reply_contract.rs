@@ -9,9 +9,9 @@
 //! now overlap instead of serialising behind one another.
 
 use acton_ai::memory::{
-    CreateConversation, GetContextWindow, GetLatestConversation,
-    InitMemoryStore, ListConversations, LoadConversation, LoadMemories, MemoryStore,
-    PersistenceConfig, SaveMessage, StoreMemory,
+    CreateConversation, GetContextWindow, GetLatestConversation, InitMemoryStore,
+    ListConversations, LoadConversation, LoadMemories, MemoryStore, PersistenceConfig, SaveMessage,
+    StoreMemory,
 };
 use acton_ai::prelude::*;
 use acton_ai::tools::{
@@ -96,12 +96,10 @@ async fn uninitialized_store_answers_writes_too() {
         .await
         .expect("an uninitialized store must still reply to writes");
 
-    assert!(
-        created
-            .result
-            .expect_err("no database means no conversation")
-            .is_not_initialized()
-    );
+    assert!(created
+        .result
+        .expect_err("no database means no conversation")
+        .is_not_initialized());
 
     runtime.shutdown_all().await.expect("shutdown failed");
 }
@@ -126,12 +124,10 @@ async fn uninitialized_store_answers_context_window_requests() {
         .await
         .expect("an uninitialized store must still reply");
 
-    assert!(
-        response
-            .result
-            .expect_err("no database means no context window")
-            .is_not_initialized()
-    );
+    assert!(response
+        .result
+        .expect_err("no database means no context window")
+        .is_not_initialized());
 
     runtime.shutdown_all().await.expect("shutdown failed");
 }

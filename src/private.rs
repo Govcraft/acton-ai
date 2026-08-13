@@ -51,7 +51,9 @@ where
 /// of a schema no human reads.
 #[doc(hidden)]
 #[must_use]
-pub fn object_schema(parameters: Vec<(&'static str, serde_json::Value, bool)>) -> serde_json::Value {
+pub fn object_schema(
+    parameters: Vec<(&'static str, serde_json::Value, bool)>,
+) -> serde_json::Value {
     let mut properties = serde_json::Map::with_capacity(parameters.len());
     let mut required = Vec::new();
 
@@ -143,7 +145,10 @@ where
     T: serde::Serialize,
 {
     serde_json::to_value(value).map_err(|error| {
-        ToolError::execution_failed(tool, format!("could not serialize the tool's result: {error}"))
+        ToolError::execution_failed(
+            tool,
+            format!("could not serialize the tool's result: {error}"),
+        )
     })
 }
 
@@ -221,7 +226,10 @@ mod tests {
             .expect_err("a missing required parameter must be rejected");
 
         let message = error.to_string();
-        assert!(message.contains("expr"), "must name the parameter: {message}");
+        assert!(
+            message.contains("expr"),
+            "must name the parameter: {message}"
+        );
         assert!(message.contains("missing"), "{message}");
     }
 
@@ -229,8 +237,8 @@ mod tests {
     fn argument_treats_a_missing_optional_parameter_as_none() {
         let args = serde_json::json!({});
 
-        let value: Option<u8> =
-            argument("calculator", "precision", false, &args).expect("absent optional must be None");
+        let value: Option<u8> = argument("calculator", "precision", false, &args)
+            .expect("absent optional must be None");
 
         assert_eq!(value, None);
     }
@@ -278,8 +286,8 @@ mod tests {
 
     #[test]
     fn output_serializes_a_success_value() {
-        let value = output("calculator", serde_json::json!({"result": 4}))
-            .expect("a Value must serialize");
+        let value =
+            output("calculator", serde_json::json!({"result": 4})).expect("a Value must serialize");
 
         assert_eq!(value, serde_json::json!({"result": 4}));
     }

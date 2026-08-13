@@ -32,8 +32,8 @@ use proc_macro2::{Span, TokenStream};
 use quote::{format_ident, quote};
 use syn::spanned::Spanned;
 use syn::{
-    Expr, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Meta, Pat, PathArguments, ReturnType,
-    Type, Visibility,
+    Expr, ExprLit, FnArg, GenericArgument, Ident, ItemFn, Lit, Meta, Pat, PathArguments,
+    ReturnType, Type, Visibility,
 };
 
 /// Prefix for every binding the expansion introduces.
@@ -316,7 +316,10 @@ fn parameter_of(argument: &FnArg) -> syn::Result<Parameter> {
 /// better than the one about JSON properties silently colliding would be.
 fn ensure_names_are_unique(parameters: &[Parameter]) -> syn::Result<()> {
     for (index, parameter) in parameters.iter().enumerate() {
-        if parameters[..index].iter().any(|prior| prior.name == parameter.name) {
+        if parameters[..index]
+            .iter()
+            .any(|prior| prior.name == parameter.name)
+        {
             return Err(syn::Error::new(
                 parameter.span,
                 format!(
@@ -806,9 +809,8 @@ mod tests {
 
     #[test]
     fn parse_inherits_the_function_visibility() {
-        let tool =
-            parse_fn("/// Doc.\npub async fn f() -> Result<String, ToolError> { todo!() }")
-                .expect("a pub tool must parse");
+        let tool = parse_fn("/// Doc.\npub async fn f() -> Result<String, ToolError> { todo!() }")
+            .expect("a pub tool must parse");
 
         assert!(matches!(tool.visibility, Visibility::Public(_)));
     }

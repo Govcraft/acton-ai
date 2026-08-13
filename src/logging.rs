@@ -131,11 +131,13 @@ pub fn mark_subscriber_installed() {
 /// case there's simply nothing to build.
 pub fn journald_layer<S>(
     config: &LoggingConfig,
-) -> Option<tracing_subscriber::filter::Filtered<
-    tracing_journald::Layer,
-    tracing_subscriber::filter::LevelFilter,
-    S,
->>
+) -> Option<
+    tracing_subscriber::filter::Filtered<
+        tracing_journald::Layer,
+        tracing_subscriber::filter::LevelFilter,
+        S,
+    >,
+>
 where
     S: tracing::Subscriber + for<'span> tracing_subscriber::registry::LookupSpan<'span>,
 {

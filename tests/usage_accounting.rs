@@ -225,10 +225,17 @@ async fn the_accountant_tallies_per_provider_per_model_and_in_total() {
 
     // Per model within each provider.
     assert_eq!(
-        claude_tally.model("sonnet-mock").unwrap().usage.output_tokens,
+        claude_tally
+            .model("sonnet-mock")
+            .unwrap()
+            .usage
+            .output_tokens,
         10
     );
-    assert_eq!(local_tally.model("qwen-mock").unwrap().usage.output_tokens, 3);
+    assert_eq!(
+        local_tally.model("qwen-mock").unwrap().usage.output_tokens,
+        3
+    );
 
     ai.shutdown().await.expect("clean shutdown");
 }
@@ -301,7 +308,12 @@ async fn pricing_floors_sub_microdollar_remainders() {
     let usage = ai.usage().await.unwrap();
 
     assert_eq!(
-        usage.provider("claude").unwrap().cost.unwrap().total_microusd,
+        usage
+            .provider("claude")
+            .unwrap()
+            .cost
+            .unwrap()
+            .total_microusd,
         3,
         "the remainder floors; it never rounds up"
     );
@@ -334,11 +346,19 @@ async fn an_unpriced_provider_still_counts_tokens_but_reports_no_cost() {
     assert_eq!(local.requests, 1);
 
     // ...but its cost is unknown, never a fabricated $0.00.
-    assert!(local.cost.is_none(), "an unpriced provider must not price to zero");
+    assert!(
+        local.cost.is_none(),
+        "an unpriced provider must not price to zero"
+    );
 
     // The priced one is unaffected.
     assert_eq!(
-        usage.provider("claude").unwrap().cost.unwrap().total_microusd,
+        usage
+            .provider("claude")
+            .unwrap()
+            .cost
+            .unwrap()
+            .total_microusd,
         3_000_000
     );
 
@@ -372,11 +392,18 @@ async fn disabling_tracking_makes_usage_an_error_not_an_empty_snapshot() {
 
     // Prompting still works — the toggle governs only whether anything
     // listens to the reports providers broadcast regardless.
-    let response = ai.prompt("hello").collect().await.expect("prompts still work");
+    let response = ai
+        .prompt("hello")
+        .collect()
+        .await
+        .expect("prompts still work");
     assert_eq!(response.text, "done");
     assert_eq!(response.usage.input_tokens, 100);
 
-    let error = ai.usage().await.expect_err("usage must not answer when disabled");
+    let error = ai
+        .usage()
+        .await
+        .expect_err("usage must not answer when disabled");
     assert!(
         error.is_configuration(),
         "expected a configuration error, got {error}"

@@ -20,11 +20,7 @@ async fn conversation_with_prompt(system_prompt: &str) -> (ActonAI, Conversation
         .await
         .expect("launching the runtime must succeed");
 
-    let conversation = runtime
-        .conversation()
-        .system(system_prompt)
-        .build()
-        .await;
+    let conversation = runtime.conversation().system(system_prompt).build().await;
 
     (runtime, conversation)
 }
@@ -108,7 +104,10 @@ async fn clear_empties_history_seeded_at_build_time() {
     conv.clear().await;
     conv.sync().await.expect("sync must succeed");
 
-    assert!(conv.is_empty(), "history must be empty after a cleared sync");
+    assert!(
+        conv.is_empty(),
+        "history must be empty after a cleared sync"
+    );
     assert!(conv.history().is_empty());
 
     runtime

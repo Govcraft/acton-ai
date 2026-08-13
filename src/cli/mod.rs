@@ -56,7 +56,8 @@ pub enum Commands {
     Heartbeat(commands::heartbeat::HeartbeatArgs),
 
     /// Send a message or start an interactive chat session.
-    #[command(long_about = "Send a single message, pipe input, or open an interactive \
+    #[command(
+        long_about = "Send a single message, pipe input, or open an interactive \
                             REPL with persistent per-session history.\n\n\
                             EXAMPLES:\n  \
                               Single-shot:    acton-ai chat -m \"what is rust?\"\n  \
@@ -68,7 +69,8 @@ pub enum Commands {
                               With --json, single-shot responses are one line:\n    \
                               {\"schemaVersion\":1,\"session\":\"main\",\"role\":\"assistant\",\n     \
                                \"text\":\"...\",\"tokenCount\":42}\n  \
-                              Schema is versioned — consumers should branch on schemaVersion.")]
+                              Schema is versioned — consumers should branch on schemaVersion."
+    )]
     Chat(commands::chat::ChatArgs),
 
     /// Execute a named job from the configuration file.

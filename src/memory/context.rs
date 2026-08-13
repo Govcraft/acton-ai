@@ -170,8 +170,7 @@ impl Default for CharRatioEstimator {
 
 impl TokenEstimator for CharRatioEstimator {
     fn estimate_message(&self, message: &Message) -> usize {
-        let content_tokens =
-            (message.content.len() as f32 * self.tokens_per_char).ceil() as usize;
+        let content_tokens = (message.content.len() as f32 * self.tokens_per_char).ceil() as usize;
         content_tokens + ROLE_OVERHEAD_TOKENS
     }
 
@@ -944,9 +943,9 @@ mod tests {
         let cw = ContextWindow::new(cfg);
 
         let messages = vec![
-            msg(MessageRole::User, &"old".repeat(60)),    // ~49 tokens — too big
+            msg(MessageRole::User, &"old".repeat(60)), // ~49 tokens — too big
             msg(MessageRole::Assistant, &"mid".repeat(60)),
-            msg(MessageRole::User, "new"),                 // tiny, should survive
+            msg(MessageRole::User, "new"), // tiny, should survive
         ];
 
         let fitted = cw.fit_messages(&messages);

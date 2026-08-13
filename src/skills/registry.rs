@@ -402,9 +402,8 @@ Email body content
         for name in ["email", "bash"] {
             let pkg = dir.path().join(name);
             std::fs::create_dir_all(&pkg).unwrap();
-            let skill = format!(
-                "---\nname: {name}\ndescription: {name} skill\n---\n{name} body\n",
-            );
+            let skill =
+                format!("---\nname: {name}\ndescription: {name} skill\n---\n{name} body\n",);
             std::fs::write(pkg.join("SKILL.md"), skill).unwrap();
         }
 

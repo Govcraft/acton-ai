@@ -414,8 +414,7 @@ mod tests {
 
     #[test]
     fn default_provider_inferred_for_single_provider() {
-        let cfg = ActonAIConfig::new()
-            .with_provider("only", NamedProviderConfig::ollama("q"));
+        let cfg = ActonAIConfig::new().with_provider("only", NamedProviderConfig::ollama("q"));
 
         let (effective, source) = resolve_default_provider(&cfg, None);
         assert_eq!(effective.as_deref(), Some("only"));

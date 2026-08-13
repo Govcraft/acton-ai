@@ -798,10 +798,7 @@ fn convert_one_event(
         StreamEvent::ContentBlockDelta { text, .. } => {
             text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
         }
-        StreamEvent::MessageDelta {
-            stop_reason,
-            usage,
-        } => {
+        StreamEvent::MessageDelta { stop_reason, usage } => {
             usage.apply_to(total);
             stop_reason.map(|reason| {
                 Ok(LLMStreamEvent::End {

@@ -722,7 +722,6 @@ pub enum SystemEvent {
 // Multi-Agent Messages (Phase 6)
 // =============================================================================
 
-
 #[acton_message]
 #[derive(Serialize, Deserialize)]
 pub struct TaskAccepted {
@@ -751,7 +750,6 @@ pub struct TaskFailed {
     /// The error message
     pub error: String,
 }
-
 
 ///
 /// This is what an agent receives when another agent sends it a message.

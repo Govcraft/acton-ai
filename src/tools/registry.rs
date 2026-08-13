@@ -8,8 +8,8 @@ use crate::tools::definition::{BoxedToolExecutor, ToolConfig};
 use crate::tools::error::{ToolError, ToolErrorKind};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// Message to initialize the Tool Registry.
 #[acton_message]
@@ -456,8 +456,12 @@ mod tests {
 
         counters.tools_registered.fetch_add(1, Ordering::Relaxed);
         counters.tools_unregistered.fetch_add(2, Ordering::Relaxed);
-        counters.executions_requested.fetch_add(3, Ordering::Relaxed);
-        counters.executions_succeeded.fetch_add(4, Ordering::Relaxed);
+        counters
+            .executions_requested
+            .fetch_add(3, Ordering::Relaxed);
+        counters
+            .executions_succeeded
+            .fetch_add(4, Ordering::Relaxed);
         counters.executions_failed.fetch_add(5, Ordering::Relaxed);
 
         assert_eq!(

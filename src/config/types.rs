@@ -1557,7 +1557,9 @@ usage_tracking = false
     #[test]
     fn defaults_builder_sets_usage_tracking() {
         assert_eq!(
-            ActonAIDefaults::new().with_usage_tracking(false).usage_tracking,
+            ActonAIDefaults::new()
+                .with_usage_tracking(false)
+                .usage_tracking,
             Some(false)
         );
     }

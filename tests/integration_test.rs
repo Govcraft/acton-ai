@@ -1106,8 +1106,12 @@ fn test_delegation_tracker() {
 fn test_incoming_task_creation() {
     let from = AgentId::new();
 
-    let incoming = IncomingTask::new(from.clone(), "test_task", serde_json::json!({"data": "test"}))
-        .with_deadline(Duration::from_secs(30));
+    let incoming = IncomingTask::new(
+        from.clone(),
+        "test_task",
+        serde_json::json!({"data": "test"}),
+    )
+    .with_deadline(Duration::from_secs(30));
 
     assert_eq!(incoming.from, from);
     assert_eq!(incoming.task_type, "test_task");
@@ -1169,4 +1173,3 @@ fn test_delegated_task_failure() {
     assert!(task.is_terminal());
     assert_eq!(task.error, Some("Something went wrong".to_string()));
 }
-

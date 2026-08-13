@@ -56,9 +56,7 @@ pub fn print_startup(info: &BannerInfo<'_>, output: &OutputWriter, theme: &Theme
             String::new()
         },
     );
-    eprintln!(
-        "{dim_on}Type {dim_off}/help{dim_on} for commands, Ctrl+D to exit.{dim_off}"
-    );
+    eprintln!("{dim_on}Type {dim_off}/help{dim_on} for commands, Ctrl+D to exit.{dim_off}");
 }
 
 /// Print the exit summary on stderr. Shown on clean exit, suppressed when

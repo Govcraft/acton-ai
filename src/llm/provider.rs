@@ -734,7 +734,12 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
 
     // Start streaming request
     match client
-        .send_streaming_request(&request.messages, tools, sampling, request.tool_choice.as_ref())
+        .send_streaming_request(
+            &request.messages,
+            tools,
+            sampling,
+            request.tool_choice.as_ref(),
+        )
         .await
     {
         Ok(mut stream) => {
@@ -1115,8 +1120,8 @@ mod tests {
     fn disabling_queueing_leaves_streaming_alone() {
         // Streaming used to be derived from `queue_when_limited`, so opting out
         // of queueing silently turned streaming off as well.
-        let config =
-            ProviderConfig::new("test-key").with_rate_limit(RateLimitConfig::default().without_queueing());
+        let config = ProviderConfig::new("test-key")
+            .with_rate_limit(RateLimitConfig::default().without_queueing());
 
         assert!(config.streaming);
     }

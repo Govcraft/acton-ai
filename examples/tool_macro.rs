@@ -111,7 +111,10 @@ async fn list_capabilities() -> Result<Vec<String>, ToolError> {
 
 #[tokio::main]
 async fn main() -> Result<(), ActonAIError> {
-    let runtime = ActonAI::builder().app_name("tool-macro-example").launch().await?;
+    let runtime = ActonAI::builder()
+        .app_name("tool-macro-example")
+        .launch()
+        .await?;
 
     // Each `#[tool]` function generated a PascalCase unit struct alongside it:
     // `calculator` -> `Calculator`, `get_weather` -> `GetWeather`.

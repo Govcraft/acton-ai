@@ -229,8 +229,7 @@ pub async fn execute(
                 persist: Some(persist),
                 render_markdown: args.render,
             };
-            let run_result =
-                crate::cli::chat_ui::run(&conv, &rt.ai, run_options).await;
+            let run_result = crate::cli::chat_ui::run(&conv, &rt.ai, run_options).await;
 
             // The REPL flushes every turn as it completes, so by the time we
             // land here the DB is already up to date. `touch_session` is

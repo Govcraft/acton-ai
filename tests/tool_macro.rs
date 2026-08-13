@@ -70,7 +70,10 @@ struct RetryPolicy {
 #[tool]
 async fn fetch_with_policy(url: String, policy: RetryPolicy) -> Result<RetryPolicy, ToolError> {
     if url.is_empty() {
-        return Err(ToolError::validation_failed("fetch_with_policy", "empty url"));
+        return Err(ToolError::validation_failed(
+            "fetch_with_policy",
+            "empty url",
+        ));
     }
     Ok(policy)
 }
@@ -519,8 +522,11 @@ async fn a_generated_tool_round_trips_through_the_prompt_loop() {
 #[tokio::test]
 async fn parallel_calls_to_a_generated_tool_both_run() {
     let server = MockServer::start(vec![
-        Round::tool_call("call_1", "calculator", json!({"expr": "42 * 17"}))
-            .with_tool_call("call_2", "calculator", json!({"expr": "1 / 3", "precision": 3})),
+        Round::tool_call("call_1", "calculator", json!({"expr": "42 * 17"})).with_tool_call(
+            "call_2",
+            "calculator",
+            json!({"expr": "1 / 3", "precision": 3}),
+        ),
         Round::text("Done."),
     ])
     .await;
@@ -534,8 +540,7 @@ async fn parallel_calls_to_a_generated_tool_both_run() {
         .expect("the prompt must complete");
 
     assert_eq!(response.text, "Done.");
-    let follow_up =
-        serde_json::to_string(&server.requests()[1]).expect("request must serialize");
+    let follow_up = serde_json::to_string(&server.requests()[1]).expect("request must serialize");
     assert!(follow_up.contains("714.00"), "{follow_up}");
     assert!(follow_up.contains("0.333"), "{follow_up}");
 }
@@ -567,8 +572,7 @@ async fn a_bad_argument_is_fed_back_to_the_model_not_raised() {
     assert_eq!(response.text, "Sorry, I need an expression.");
     assert!(calls.load(Ordering::SeqCst) > 0, "the stream must have run");
 
-    let follow_up =
-        serde_json::to_string(&server.requests()[1]).expect("request must serialize");
+    let follow_up = serde_json::to_string(&server.requests()[1]).expect("request must serialize");
     assert!(
         follow_up.contains("expr"),
         "the model needs to be told which parameter was missing: {follow_up}"

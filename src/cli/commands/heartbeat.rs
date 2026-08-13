@@ -194,10 +194,7 @@ async fn execute_entry(
                 .await
                 .map(|rows| rows.into_iter().map(|s| s.name).collect())
                 .unwrap_or_default();
-            return Err(CliError::session_not_found(
-                &entry.session_name,
-                available,
-            ));
+            return Err(CliError::session_not_found(&entry.session_name, available));
         }
     };
 

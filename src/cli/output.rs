@@ -27,10 +27,7 @@ impl OutputWriter {
     /// Creates a new output writer with the given mode. Non-quiet by default.
     #[must_use]
     pub fn new(mode: OutputMode) -> Self {
-        Self {
-            mode,
-            quiet: false,
-        }
+        Self { mode, quiet: false }
     }
 
     /// Returns the output mode.

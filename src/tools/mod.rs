@@ -89,7 +89,6 @@ pub mod tool_trait;
 
 // Re-exports
 pub use crate::messages::ToolDefinition;
-pub use tool_trait::{Tool, ToolFuture};
 pub use actor::{
     ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync,
 };
@@ -102,6 +101,7 @@ pub use registry::{
 };
 pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
 pub use security::{PathValidationError, PathValidator};
+pub use tool_trait::{Tool, ToolFuture};
 
 // Stub implementation is only available in tests (security concern in production)
 #[cfg(test)]

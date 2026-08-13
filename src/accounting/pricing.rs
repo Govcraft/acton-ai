@@ -167,7 +167,9 @@ impl core::ops::Add for CostBreakdown {
         Self {
             input_microusd: self.input_microusd.saturating_add(rhs.input_microusd),
             output_microusd: self.output_microusd.saturating_add(rhs.output_microusd),
-            cache_read_microusd: self.cache_read_microusd.saturating_add(rhs.cache_read_microusd),
+            cache_read_microusd: self
+                .cache_read_microusd
+                .saturating_add(rhs.cache_read_microusd),
             cache_creation_microusd: self
                 .cache_creation_microusd
                 .saturating_add(rhs.cache_creation_microusd),
@@ -313,7 +315,10 @@ mod tests {
         let cost = pricing.cost_of(&usage(1, 1, 0, 0));
 
         assert_eq!(cost.input_microusd, 3);
-        assert_eq!(cost.output_microusd, 0, "the remainder floors, never rounds up");
+        assert_eq!(
+            cost.output_microusd, 0,
+            "the remainder floors, never rounds up"
+        );
         assert_eq!(cost.total_microusd, 3);
     }
 

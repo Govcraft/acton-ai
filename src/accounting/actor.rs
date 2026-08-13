@@ -404,11 +404,21 @@ mod tests {
 
         let provider = snapshot.provider("gateway").unwrap();
         assert_eq!(
-            provider.model("sonnet").unwrap().cost.unwrap().total_microusd,
+            provider
+                .model("sonnet")
+                .unwrap()
+                .cost
+                .unwrap()
+                .total_microusd,
             3_000_000
         );
         assert_eq!(
-            provider.model("haiku").unwrap().cost.unwrap().total_microusd,
+            provider
+                .model("haiku")
+                .unwrap()
+                .cost
+                .unwrap()
+                .total_microusd,
             6_000_000
         );
     }

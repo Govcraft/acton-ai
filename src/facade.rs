@@ -71,13 +71,13 @@
 //! }
 //! ```
 
+use crate::accounting::{GetUsage, PricingTable, UsageSnapshot};
 use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::llm::{LLMProvider, ProviderConfig};
 use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::messages::Message;
-use crate::accounting::{GetUsage, PricingTable, UsageSnapshot};
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
 use crate::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
@@ -921,7 +921,8 @@ impl ActonAIBuilder {
             // Dollars become integer micro-USD here, once, at the config
             // boundary — every figure computed downstream is integer.
             if let Some(ref pricing) = provider_config.pricing {
-                self.pricing.insert(name.clone(), pricing.to_model_pricing());
+                self.pricing
+                    .insert(name.clone(), pricing.to_model_pricing());
             }
             let runtime_config = provider_config.to_provider_config();
             self.providers.insert(name, runtime_config);

@@ -19,9 +19,15 @@ fn chat_help_mentions_skill_dir() {
 
 #[test]
 fn chat_accepts_repeated_skill_dir() {
-    let parsed =
-        Cli::try_parse_from(["acton-ai", "chat", "--skill-dir", "./a", "--skill-dir", "./b"])
-            .expect("parse should succeed with valid args");
+    let parsed = Cli::try_parse_from([
+        "acton-ai",
+        "chat",
+        "--skill-dir",
+        "./a",
+        "--skill-dir",
+        "./b",
+    ])
+    .expect("parse should succeed with valid args");
     match parsed.command {
         acton_ai::cli::Commands::Chat(args) => {
             assert_eq!(args.skill_dirs.len(), 2);

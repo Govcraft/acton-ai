@@ -51,9 +51,15 @@ impl CliRuntime {
         } else {
             let found = config::search_paths().into_iter().find(|p| p.exists());
             match &found {
-                Some(p) => (Some(config::from_path(p).map_err(|e| {
-                    CliError::configuration(format!("failed to load config from {}: {e}", p.display()))
-                })?), found.clone()),
+                Some(p) => (
+                    Some(config::from_path(p).map_err(|e| {
+                        CliError::configuration(format!(
+                            "failed to load config from {}: {e}",
+                            p.display()
+                        ))
+                    })?),
+                    found.clone(),
+                ),
                 None => (None, None),
             }
         };
@@ -91,10 +97,7 @@ impl CliRuntime {
             tracing::info!(provider = %provider, "provider override from CLI");
         }
         if !skill_paths.is_empty() {
-            tracing::info!(
-                count = skill_paths.len(),
-                "skill paths from CLI",
-            );
+            tracing::info!(count = skill_paths.len(), "skill paths from CLI",);
             for p in skill_paths {
                 tracing::debug!(path = %p.display(), "skill path");
             }
@@ -201,8 +204,8 @@ pub fn init_tracing(verbosity: u8, quiet: bool) {
 
     let use_ansi = std::io::stderr().is_terminal() && OutputWriter::use_colors();
 
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| filter.into());
+    let env_filter =
+        tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into());
 
     let stderr_layer = tracing_subscriber::fmt::layer()
         .with_writer(std::io::stderr)

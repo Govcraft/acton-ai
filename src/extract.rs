@@ -432,7 +432,10 @@ mod tests {
 
         let message = error.to_string();
         assert!(message.contains("validation exhausted"), "{message}");
-        assert!(message.contains("invalid type: string, expected u64"), "{message}");
+        assert!(
+            message.contains("invalid type: string, expected u64"),
+            "{message}"
+        );
         assert!(message.contains("twelve fifty"), "{message}");
     }
 
