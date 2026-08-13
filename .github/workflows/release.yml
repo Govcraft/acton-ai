@@ -28,7 +28,7 @@ jobs:
             archive_ext: tar.gz
             binary_ext: ""
           - target: x86_64-apple-darwin
-            runner: macos-13
+            runner: macos-15-intel
             archive_ext: tar.gz
             binary_ext: ""
           - target: aarch64-apple-darwin
