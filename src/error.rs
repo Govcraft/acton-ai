@@ -243,6 +243,17 @@ pub enum ActonAIErrorKind {
         /// Rendered description of the underlying MCP failure.
         reason: String,
     },
+    /// Typed structured output could not be produced.
+    ///
+    /// Raised by [`PromptBuilder::extract`](crate::prompt::PromptBuilder::extract)
+    /// when the model never records an answer, when the answers it does
+    /// record never deserialize into the target type, or when the target
+    /// type's schema cannot be turned into something a provider accepts.
+    /// `reason` names which of those happened.
+    Extraction {
+        /// Rendered description of the extraction failure.
+        reason: String,
+    },
 }
 
 impl ActonAIError {
@@ -308,6 +319,19 @@ impl ActonAIError {
         })
     }
 
+    /// Creates a structured-output extraction error.
+    ///
+    /// `reason` should name the failure class up front — validation
+    /// exhausted, the model never called the tool, or schema generation —
+    /// because that is what tells the caller whether to fix the prompt, the
+    /// type, or the model choice.
+    #[must_use]
+    pub fn extraction(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::Extraction {
+            reason: reason.into(),
+        })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -344,6 +368,9 @@ impl fmt::Display for ActonAIError {
             }
             ActonAIErrorKind::Mcp { server, reason } => {
                 write!(f, "MCP server '{server}': {reason}")
+            }
+            ActonAIErrorKind::Extraction { reason } => {
+                write!(f, "structured output extraction failed: {reason}")
             }
         }
     }
@@ -465,6 +492,15 @@ mod tests {
 
         let other = ActonAIError::prompt_failed("test");
         assert!(!other.is_runtime_shutdown());
+    }
+
+    #[test]
+    fn acton_ai_error_extraction_display_names_the_failure_class() {
+        let error = ActonAIError::extraction("the model never called structured_output");
+
+        let message = error.to_string();
+        assert!(message.contains("structured output extraction failed"));
+        assert!(message.contains("never called structured_output"));
     }
 
     #[test]

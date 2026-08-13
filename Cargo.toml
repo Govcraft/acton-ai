@@ -68,9 +68,12 @@ indicatif = "0.18.4"
 strsim = "0.11.1"
 termimad = "0.34.1"
 rmcp = { version = "3.1.2", features = ["client", "transport-child-process", "transport-streamable-http-client-reqwest"] }
+schemars = "1.2.2"
+serde_path_to_error = "0.1.20"
 
 [dev-dependencies]
 anyhow = "1.0.100"
+axum = "0.8.9"
 colored = "3.1.1"
 rmcp = { version = "3.1.2", features = ["server", "transport-async-rw"] }
 tokio = { version = "1.49.0", features = ["macros", "rt-multi-thread"] }

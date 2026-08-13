@@ -65,6 +65,7 @@ pub mod cli;
 pub mod config;
 pub mod conversation;
 pub mod error;
+pub mod extract;
 pub mod facade;
 pub mod llm;
 pub mod logging;
@@ -78,6 +79,16 @@ pub mod types;
 
 pub mod skills;
 
+/// Re-export of the [`schemars`] crate that generated schemas are built with.
+///
+/// [`PromptBuilder::extract`](crate::prompt::PromptBuilder::extract) requires
+/// its target type to implement [`schemars::JsonSchema`]. Normally you add
+/// `schemars` to your own `Cargo.toml` and derive it there; this re-export
+/// exists so the version in use is discoverable and so documentation can link
+/// to it. `JsonSchema` is deliberately **not** in the [`prelude`] — the name
+/// collides too easily with application types.
+pub use schemars;
+
 /// Prelude module for convenient imports
 pub mod prelude {
     // High-level API (recommended for most use cases)
@@ -88,6 +99,7 @@ pub mod prelude {
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
     };
     pub use crate::error::{ActonAIError, ActonAIErrorKind};
+    pub use crate::extract::STRUCTURED_OUTPUT_TOOL;
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};

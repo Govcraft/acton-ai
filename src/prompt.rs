@@ -40,16 +40,22 @@
 
 use crate::conversation::StreamToken;
 use crate::error::ActonAIError;
+use crate::extract::{
+    ensure_name_is_available, repairs_exhausted_error, validation_feedback, StructuredSpec,
+    MAX_VALIDATION_REPAIRS, STRUCTURED_OUTPUT_TOOL,
+};
 use crate::facade::ActonAI;
 use crate::llm::SamplingParams;
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, ToolCall, ToolDefinition,
+    StopReason, ToolCall, ToolChoice, ToolDefinition,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall};
 use crate::tools::ToolError;
 use crate::types::{AgentId, CorrelationId};
 use acton_reactive::prelude::*;
+use schemars::JsonSchema;
+use serde::de::DeserializeOwned;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -61,6 +67,11 @@ use tokio::sync::Notify;
 /// supplies `max_tool_rounds`. Per-prompt calls to
 /// [`PromptBuilder::max_tool_rounds`] still win over this value.
 pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
+
+/// Nudge appended when an extraction round ends in prose instead of a
+/// recorded answer. Sent once per extraction, immediately before the round
+/// that forces the `structured_output` call.
+const STRUCTURED_OUTPUT_NUDGE: &str = "Record your final answer now by calling structured_output.";
 
 /// Type alias for start callbacks.
 type StartCallback = Box<dyn FnMut() + Send + 'static>;
@@ -226,6 +237,9 @@ pub struct PromptBuilder {
     token_target: Option<ActorHandle>,
     /// Optional sampling parameters for this prompt
     sampling: Option<SamplingParams>,
+    /// Set by [`PromptBuilder::extract`]: the schema the model must fill in
+    /// and the type-erased check that its answer really parses.
+    structured: Option<StructuredSpec>,
 }
 
 impl PromptBuilder {
@@ -248,6 +262,7 @@ impl PromptBuilder {
             provider_name: None,
             token_target: None,
             sampling: None,
+            structured: None,
         }
     }
 
@@ -733,6 +748,105 @@ impl PromptBuilder {
         self
     }
 
+    /// Sends the prompt and returns a typed, schema-validated value.
+    ///
+    /// Instead of handing you prose to parse, this appends a synthetic tool
+    /// named `structured_output` whose input schema is the JSON Schema of
+    /// `T`, and constrains the request so the model has to call it. The
+    /// arguments of that call become your `T`. If they don't deserialize,
+    /// the serde error is handed back to the model as a tool result and it
+    /// is asked to correct itself, up to
+    /// [`MAX_VALIDATION_REPAIRS`](crate::extract::MAX_VALIDATION_REPAIRS)
+    /// times.
+    ///
+    /// Real tools still work: anything registered via [`Self::tool`],
+    /// [`Self::use_builtins`], or MCP may run first, and extraction is the
+    /// terminal step. While other tools are available the model chooses
+    /// freely; if a round ends in prose with no answer recorded, it is asked
+    /// once more with the choice forced.
+    ///
+    /// `T` must implement [`serde::Deserialize`] and
+    /// [`schemars::JsonSchema`]. Add `schemars` to your own dependencies and
+    /// derive it there; the crate is also re-exported as
+    /// [`acton_ai::schemars`](crate::schemars).
+    ///
+    /// Streaming callbacks such as [`Self::on_token`] keep firing throughout.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if:
+    /// - The runtime has been shut down
+    /// - A tool named `structured_output` is already registered on this
+    ///   prompt (rename it; extraction will not silently shadow it)
+    /// - The model never records an answer, or never records one that
+    ///   deserializes into `T` within the repair budget — in which case the
+    ///   error carries the serde error and a truncated dump of what the
+    ///   model actually produced
+    /// - Maximum tool rounds exceeded
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::prelude::*;
+    /// use schemars::JsonSchema;
+    /// use serde::Deserialize;
+    ///
+    /// #[derive(Debug, Deserialize, JsonSchema)]
+    /// struct Invoice {
+    ///     vendor: String,
+    ///     total_cents: u64,
+    /// }
+    ///
+    /// let invoice: Invoice = runtime
+    ///     .prompt("Extract the invoice from this email: ...")
+    ///     .extract::<Invoice>()
+    ///     .await?;
+    ///
+    /// println!("{} owes {} cents", invoice.vendor, invoice.total_cents);
+    /// ```
+    pub async fn extract<T>(mut self) -> Result<T, ActonAIError>
+    where
+        T: DeserializeOwned + JsonSchema,
+    {
+        if self.runtime.is_shutdown() {
+            return Err(ActonAIError::runtime_shutdown());
+        }
+        ensure_name_is_available(self.tools.iter().map(|t| t.definition.name.as_str()))?;
+        self.structured = Some(StructuredSpec::for_type::<T>());
+
+        let session = build_stream_collector(&self.runtime).await;
+        let result = self.collect_structured(&session).await;
+        session.shutdown().await;
+        let (value, _response) = result?;
+
+        // The loop already ran `from_value::<T>` on this exact value, so
+        // reaching the error arm means something is deeply wrong rather than
+        // that the model misbehaved — but it is still not an unwrap.
+        serde_json::from_value::<T>(value).map_err(|e| {
+            ActonAIError::extraction(format!(
+                "an answer that passed validation failed to deserialize: {e}"
+            ))
+        })
+    }
+
+    /// Runs the prompt loop in extraction mode and returns the recorded
+    /// answer alongside the usual collected response.
+    ///
+    /// Kept non-generic so the loop itself never has to know `T`; the caller
+    /// ([`Self::extract`]) owns the type parameter.
+    pub(crate) async fn collect_structured(
+        self,
+        session: &StreamCollectorSession,
+    ) -> Result<(serde_json::Value, CollectedResponse), ActonAIError> {
+        let (response, captured) = self.run_prompt_loop(session).await?;
+        match captured {
+            Some(value) => Ok((value, response)),
+            None => Err(ActonAIError::extraction(
+                "the model never called structured_output",
+            )),
+        }
+    }
+
     /// Sends the prompt and collects the complete response.
     ///
     /// This method:
@@ -799,6 +913,21 @@ impl PromptBuilder {
         self,
         session: &StreamCollectorSession,
     ) -> Result<CollectedResponse, ActonAIError> {
+        let (response, _captured) = self.run_prompt_loop(session).await?;
+        Ok(response)
+    }
+
+    /// The shared prompt/tool loop behind both [`Self::collect`] and
+    /// [`Self::extract`].
+    ///
+    /// Returns the collected response plus, when the builder is in
+    /// extraction mode, the arguments of the `structured_output` call that
+    /// passed validation. The loop is deliberately non-generic: extraction
+    /// state travels as a [`StructuredSpec`], never as a type parameter.
+    async fn run_prompt_loop(
+        self,
+        session: &StreamCollectorSession,
+    ) -> Result<(CollectedResponse, Option<serde_json::Value>), ActonAIError> {
         // Destructure self to take ownership of all fields
         let PromptBuilder {
             runtime,
@@ -813,6 +942,7 @@ impl PromptBuilder {
             provider_name,
             token_target,
             sampling,
+            structured,
         } = self;
 
         // Resolve the provider handle
@@ -844,10 +974,24 @@ impl PromptBuilder {
             messages.push(Message::user(&user_content));
         }
 
-        // Collect tool definitions
-        let tool_definitions: Vec<ToolDefinition> =
+        // Collect tool definitions. In extraction mode the synthetic
+        // `structured_output` tool rides along with the caller's own tools;
+        // its name was checked for collisions back in `extract`.
+        let mut tool_definitions: Vec<ToolDefinition> =
             tools.iter().map(|t| t.definition.clone()).collect();
+        let has_caller_tools = !tool_definitions.is_empty();
+        if let Some(ref spec) = structured {
+            tool_definitions.push(spec.tool_definition());
+        }
         let has_tools = !tool_definitions.is_empty();
+
+        // Extraction state. With no caller tools to work through there is
+        // nothing for the model to do but answer, so the choice is forced
+        // from round one; otherwise it works freely until it stalls.
+        let mut force_structured = structured.is_some() && !has_caller_tools;
+        let mut already_nudged = false;
+        let mut repairs = 0_usize;
+        let mut captured: Option<serde_json::Value> = None;
 
         // Track executed tool calls and total tokens
         let mut executed_tool_calls = Vec::new();
@@ -875,6 +1019,17 @@ impl PromptBuilder {
             let correlation_id = CorrelationId::new();
             let agent_id = AgentId::new();
 
+            // Constrain the choice only while extracting. Plain `collect()`
+            // keeps sending no `tool_choice` at all, so nothing changes for
+            // callers who never ask for a typed answer.
+            let tool_choice = structured.as_ref().map(|_| {
+                if force_structured {
+                    ToolChoice::Tool(STRUCTURED_OUTPUT_TOOL.to_string())
+                } else {
+                    ToolChoice::Auto
+                }
+            });
+
             // Create the request
             let request = LLMRequest {
                 correlation_id: correlation_id.clone(),
@@ -886,7 +1041,7 @@ impl PromptBuilder {
                     None
                 },
                 sampling: sampling.clone(),
-                tool_choice: None,
+                tool_choice,
             };
 
             // Collect stream response — reuses the caller-owned collector.
@@ -911,24 +1066,55 @@ impl PromptBuilder {
             final_text = text.clone();
             total_token_count += token_count;
 
-            match stop_reason {
-                StopReason::Error => {
-                    return Err(ActonAIError::prompt_failed(
-                        "LLM request failed; see provider logs for details",
-                    ));
-                }
-                StopReason::EndTurn | StopReason::MaxTokens | StopReason::StopSequence => {
-                    // Conversation complete
-                    final_stop_reason = stop_reason;
-                    break;
-                }
-                StopReason::ToolUse => {
-                    if tool_calls.is_empty() {
-                        // No tool calls but ToolUse stop reason - treat as complete
-                        final_stop_reason = stop_reason;
-                        break;
-                    }
+            if stop_reason == StopReason::Error {
+                return Err(ActonAIError::prompt_failed(
+                    "LLM request failed; see provider logs for details",
+                ));
+            }
 
+            // A recorded answer ends the run whatever the stop reason says —
+            // providers are not consistent about reporting `ToolUse` when the
+            // only call they emit is the terminal one.
+            if let Some(ref spec) = structured {
+                if let Some(call) = tool_calls
+                    .iter()
+                    .find(|call| call.name == STRUCTURED_OUTPUT_TOOL)
+                {
+                    match spec.validate(&call.arguments) {
+                        Ok(()) => {
+                            if tool_calls.len() > 1 {
+                                tracing::debug!(
+                                    skipped = tool_calls.len() - 1,
+                                    "structured_output captured; sibling tool calls in the \
+                                     same round were not executed"
+                                );
+                            }
+                            captured = Some(call.arguments.clone());
+                            final_stop_reason = stop_reason;
+                            break;
+                        }
+                        Err(message) => {
+                            repairs += 1;
+                            if repairs > MAX_VALIDATION_REPAIRS {
+                                return Err(repairs_exhausted_error(&message, &call.arguments));
+                            }
+
+                            // Echo back only the offending call, not its
+                            // siblings: every tool call in an assistant
+                            // message needs a matching tool result, and the
+                            // siblings deliberately never ran.
+                            messages
+                                .push(Message::assistant_with_tools(text, vec![call.clone()]));
+                            messages.push(Message::tool(&call.id, validation_feedback(&message)));
+                            force_structured = true;
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            match stop_reason {
+                StopReason::ToolUse if !tool_calls.is_empty() => {
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
@@ -982,14 +1168,40 @@ impl PromptBuilder {
                         messages.push(Message::tool(&tool_call.id, result_str));
                     }
                 }
+                // The round produced no answer and nothing left to execute:
+                // either the turn genuinely ended, or the provider reported
+                // `ToolUse` with no calls attached.
+                _ => {
+                    if structured.is_some() {
+                        if already_nudged {
+                            return Err(ActonAIError::extraction(
+                                "the model ended its turn without calling structured_output, \
+                                 even after being asked to record its answer",
+                            ));
+                        }
+                        already_nudged = true;
+                        force_structured = true;
+                        if !text.is_empty() {
+                            messages.push(Message::assistant(text));
+                        }
+                        messages.push(Message::user(STRUCTURED_OUTPUT_NUDGE));
+                        continue;
+                    }
+                    // Conversation complete
+                    final_stop_reason = stop_reason;
+                    break;
+                }
             }
         }
 
-        Ok(CollectedResponse::with_tool_calls(
-            final_text,
-            final_stop_reason,
-            total_token_count,
-            executed_tool_calls,
+        Ok((
+            CollectedResponse::with_tool_calls(
+                final_text,
+                final_stop_reason,
+                total_token_count,
+                executed_tool_calls,
+            ),
+            captured,
         ))
     }
 }
