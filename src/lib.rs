@@ -129,7 +129,7 @@ pub mod prelude {
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
     };
-    pub use crate::error::{ActonAIError, ActonAIErrorKind};
+    pub use crate::error::{ActonAIError, ActonAIErrorKind, ProviderAttempt};
     pub use crate::extract::STRUCTURED_OUTPUT_TOOL;
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};

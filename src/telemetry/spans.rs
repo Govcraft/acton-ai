@@ -86,10 +86,15 @@ impl TurnSpan {
     }
 
     /// Starts a round span as a child of this turn.
+    ///
+    /// `acton_ai.model` is deliberately *not* set here: with model
+    /// degradation in play, which model serves a round is only known once the
+    /// round ends, so [`RoundSpan::finish`] sets it from what the provider
+    /// reported. Setting a configured value here too would export the
+    /// attribute twice with different values.
     pub(crate) fn round(
         &self,
         provider: &str,
-        model: &str,
         correlation_id: &str,
         agent_id: &str,
         index: usize,
@@ -101,7 +106,6 @@ impl TurnSpan {
                 .span_builder(names::ROUND)
                 .with_attributes([
                     KeyValue::new("acton_ai.provider", provider.to_string()),
-                    KeyValue::new("acton_ai.model", model.to_string()),
                     KeyValue::new("acton_ai.correlation_id", correlation_id.to_string()),
                     KeyValue::new("acton_ai.agent_id", agent_id.to_string()),
                     KeyValue::new("acton_ai.round", i64::try_from(index).unwrap_or(i64::MAX)),
@@ -111,7 +115,7 @@ impl TurnSpan {
         }
         #[cfg(not(feature = "otel"))]
         {
-            let _ = (provider, model, correlation_id, agent_id, index);
+            let _ = (provider, correlation_id, agent_id, index);
             RoundSpan {}
         }
     }
@@ -183,17 +187,25 @@ pub(crate) struct RoundSpan {
 
 impl RoundSpan {
     /// Closes the round, recording what the provider reported.
+    ///
+    /// `model` is the model that actually served this round, which is not
+    /// necessarily the provider's configured one: a rate limit can degrade a
+    /// round onto the configured `fallback_model`. Recording the served model
+    /// is the whole point of setting the attribute here rather than at
+    /// [`TurnSpan::round`].
     pub(crate) fn finish(
         mut self,
         usage: &crate::messages::Usage,
         stop_reason: crate::messages::StopReason,
         outcome: &'static str,
+        model: &str,
     ) {
         #[cfg(feature = "otel")]
         {
             let Some(mut span) = self.span.take() else {
                 return;
             };
+            span.set_attribute(KeyValue::new("acton_ai.model", model.to_string()));
             span.set_attribute(KeyValue::new(
                 "acton_ai.tokens.input",
                 i64::try_from(usage.input_tokens).unwrap_or(i64::MAX),
@@ -223,7 +235,7 @@ impl RoundSpan {
         }
         #[cfg(not(feature = "otel"))]
         {
-            let _ = (&mut self, usage, stop_reason, outcome);
+            let _ = (&mut self, usage, stop_reason, outcome, model);
         }
     }
 }

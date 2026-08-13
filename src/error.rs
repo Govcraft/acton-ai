@@ -271,6 +271,46 @@ pub enum ActonAIErrorKind {
         /// Spend in that scope when the request was refused, in micro-USD.
         spent_microusd: u64,
     },
+    /// Every provider in a failover chain was unusable, so the round could
+    /// not be dispatched anywhere.
+    ///
+    /// Raised only when a chain is configured. Each attempt is recorded in
+    /// order with the reason it was passed over — an open circuit, a spending
+    /// cap, or the failure it returned — because with a chain in play "the
+    /// request failed" is never the whole story.
+    AllProvidersFailed {
+        /// Each candidate in chain order, paired with why it did not serve.
+        attempts: Vec<ProviderAttempt>,
+    },
+}
+
+/// One provider's turn in a failover chain, and how it ended.
+///
+/// Carried by [`ActonAIErrorKind::AllProvidersFailed`], which is only raised
+/// once every entry has one of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAttempt {
+    /// The configured provider name.
+    pub provider: String,
+    /// Why this provider did not serve the round.
+    pub reason: String,
+}
+
+impl ProviderAttempt {
+    /// Records that `provider` did not serve, for `reason`.
+    #[must_use]
+    pub fn new(provider: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self {
+            provider: provider.into(),
+            reason: reason.into(),
+        }
+    }
+}
+
+impl fmt::Display for ProviderAttempt {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "`{}`: {}", self.provider, self.reason)
+    }
 }
 
 impl ActonAIError {
@@ -368,6 +408,27 @@ impl ActonAIError {
         })
     }
 
+    /// Creates an all-providers-failed error from the attempts, in chain order.
+    ///
+    /// ```rust
+    /// use acton_ai::prelude::{ActonAIError, ProviderAttempt};
+    ///
+    /// let err = ActonAIError::all_providers_failed(vec![
+    ///     ProviderAttempt::new("primary", "circuit open for another 27s"),
+    ///     ProviderAttempt::new("backup", "HTTP 500"),
+    /// ]);
+    ///
+    /// assert!(err.is_all_providers_failed());
+    /// // Every candidate is named, so the chain can be diagnosed from the
+    /// // error alone.
+    /// assert!(err.to_string().contains("`primary`"));
+    /// assert!(err.to_string().contains("`backup`"));
+    /// ```
+    #[must_use]
+    pub fn all_providers_failed(attempts: Vec<ProviderAttempt>) -> Self {
+        Self::new(ActonAIErrorKind::AllProvidersFailed { attempts })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -387,6 +448,28 @@ impl ActonAIError {
     #[must_use]
     pub fn is_budget_exceeded(&self) -> bool {
         matches!(self.kind, ActonAIErrorKind::BudgetExceeded { .. })
+    }
+
+    /// Returns true if a failover chain was exhausted without a dispatch.
+    ///
+    /// Only ever true when a chain is configured; a single-provider runtime
+    /// reports the provider's own failure instead.
+    #[must_use]
+    pub fn is_all_providers_failed(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::AllProvidersFailed { .. })
+    }
+
+    /// The per-provider attempts behind an
+    /// [`ActonAIErrorKind::AllProvidersFailed`], in chain order.
+    ///
+    /// `None` for every other kind, so callers can branch on it without
+    /// matching the kind themselves.
+    #[must_use]
+    pub fn provider_attempts(&self) -> Option<&[ProviderAttempt]> {
+        match &self.kind {
+            ActonAIErrorKind::AllProvidersFailed { attempts } => Some(attempts),
+            _ => None,
+        }
     }
 }
 
@@ -430,6 +513,17 @@ impl fmt::Display for ActonAIError {
                      your config file",
                     crate::accounting::budget::usd(*spent_microusd),
                     crate::accounting::budget::usd(*limit_microusd),
+                )
+            }
+            ActonAIErrorKind::AllProvidersFailed { attempts } => {
+                write!(
+                    f,
+                    "every provider in the failover chain was unusable: {}",
+                    attempts
+                        .iter()
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>()
+                        .join("; "),
                 )
             }
         }
