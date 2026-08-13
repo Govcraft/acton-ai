@@ -35,10 +35,9 @@ jobs:
             runner: macos-14
             archive_ext: tar.gz
             binary_ext: ""
-          - target: x86_64-pc-windows-msvc
-            runner: windows-latest
-            archive_ext: zip
-            binary_ext: ".exe"
+          # x86_64-pc-windows-msvc is disabled until acton-reactive ships a
+          # Windows-compatible config path (9.1.0 uses the Unix-only xdg
+          # crate unconditionally and does not compile on Windows).
     steps:
       - uses: actions/checkout@v4
         with:
