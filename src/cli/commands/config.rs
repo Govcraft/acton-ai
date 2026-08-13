@@ -376,6 +376,29 @@ fn write_provider_plain(
             rl.requests_per_minute, rl.tokens_per_minute
         ))?;
     }
+    // Rendered from the resolved config, not the raw table, so an omitted
+    // `[circuit_breaker]` shows the defaults that are actually in force
+    // rather than nothing at all — the breaker is on whether or not it was
+    // written down.
+    let breaker = p
+        .circuit_breaker
+        .unwrap_or_default()
+        .to_circuit_breaker_config();
+    if breaker.enabled {
+        output.write_line(&format!(
+            "      circuit_breaker: open after {} consecutive failures, {}s cooldown",
+            breaker.failure_threshold,
+            breaker.cooldown.as_secs(),
+        ))?;
+    } else {
+        output.write_line("      circuit_breaker: disabled")?;
+    }
+    if !p.failover.is_empty() {
+        output.write_line(&format!("      failover:    {}", p.failover.join(" → ")))?;
+    }
+    if let Some(model) = &p.fallback_model {
+        output.write_line(&format!("      fallback_model: {model}  (on rate limit)"))?;
+    }
     let mut sampling = Vec::new();
     if let Some(t) = p.temperature {
         sampling.push(format!("temperature={t}"));

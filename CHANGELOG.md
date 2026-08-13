@@ -5,8 +5,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased
 
+### Behavior changes
+
+- **The circuit breaker is on by default.** Five consecutive failures on a
+  provider open its circuit for thirty seconds, during which requests to it
+  are refused with `LLMErrorKind::CircuitOpen` instead of being sent. A
+  provider failing five times in a row should fail fast rather than be
+  hammered, but this is new behavior for existing configurations: opt out per
+  provider with `ProviderConfig::without_circuit_breaker()` or
+  `enabled = false` under `[providers.<name>.circuit_breaker]`. Failover
+  chains and `fallback_model` change routing and stay opt-in.
+
 ### Breaking changes
 
+- `LLMStreamEnd` gains a `model` field carrying the model that actually served
+  the round, which is not the configured one when a rate limit degraded it.
+  Struct literals of it need updating; field access is unchanged.
+- `ActonAIErrorKind` gains an `AllProvidersFailed` variant, so exhaustive
+  matches on it need a new arm.
 - `CostAccountant::spawn` takes a third argument: the optional `BudgetConfig`
   to enforce. Facade users are unaffected.
 - `UsageSnapshot` gains a `budget` field, so struct literals of it need
@@ -14,6 +30,39 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Named **failover chains**: `ProviderConfig::with_failover(["backup", "local"])`
+  and `failover = [...]` in TOML. When a provider cannot serve a round the
+  prompt loop re-dispatches the same round to the next candidate — new
+  correlation ID, its own budget check, its own round span and latency sample.
+  Only the entry provider's chain is consulted, so there are no transitive
+  chains and no cycles to reason about. When every candidate is exhausted the
+  turn fails with `ActonAIError::all_providers_failed`, whose message names
+  each candidate and why it was skipped or how it failed.
+- A **per-provider circuit breaker**, held as pure state inside each
+  `LLMProvider` actor rather than in a shared registry. Configure it with
+  `ProviderConfig::with_circuit_breaker(CircuitBreakerConfig::new(5,
+  Duration::from_secs(30)))` or `[providers.<name>.circuit_breaker]`. Open →
+  half-open is computed lazily from the clock, never timed, and the half-open
+  probe is the next real request — no synthetic traffic is ever sent.
+- **Model degradation on rate limits**: `ProviderConfig::with_fallback_model`
+  / `fallback_model` re-dispatches to a cheaper model on the *same* provider
+  while an API-reported rate limit is in force, and returns to the primary
+  model on its own once the limit clears. `UsageReport.model` and the round
+  span both carry the model that actually served.
+- `FailoverEvent` broadcasts — `CircuitOpened`, `CircuitClosed`, `FailedOver`,
+  `ModelDegraded` — surfaced through `ActonAIBuilder::on_failover_event` and
+  counted by the telemetry actor as `acton_ai.failover.events` with `kind` and
+  `provider` attributes.
+- `CheckHealth` asks a provider for its `ProviderHealth`. The prompt loop only
+  asks when a chain is configured, so a runtime without one performs no extra
+  round trips.
+- Launch-time validation for chains: unknown or self-referencing members,
+  duplicates, a zero failure threshold or cooldown on an enabled breaker, and
+  a `fallback_model` identical to the provider's own model are all refused
+  before anything is spawned.
+- `ActonAI::provider_failover(name)` exposes the chain configured for a
+  provider, and `acton-ai config` renders the resolved failover, breaker, and
+  fallback-model settings.
 - OpenTelemetry export behind the new `otel` feature, which joins the default
   set. Every prompt loop run becomes an `acton_ai.turn` span with an
   `acton_ai.llm_round` child per provider dispatch and an `acton_ai.tool`

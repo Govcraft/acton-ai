@@ -123,8 +123,8 @@ pub mod prelude {
         ProviderUsage, ScopeStatus, UsageSnapshot, DEFAULT_WARN_AT_PERCENT,
     };
     pub use crate::config::{
-        ActonAIConfig, ActonAIDefaults, BudgetFileConfig, McpServerConfig, NamedProviderConfig,
-        PricingFileConfig, RateLimitFileConfig,
+        ActonAIConfig, ActonAIDefaults, BudgetFileConfig, CircuitBreakerFileConfig,
+        McpServerConfig, NamedProviderConfig, PricingFileConfig, RateLimitFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,

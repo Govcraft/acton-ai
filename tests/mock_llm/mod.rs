@@ -68,12 +68,25 @@ pub struct ScriptedUsage {
     cached_tokens: u64,
 }
 
+/// An HTTP failure a round should answer with instead of a stream.
+#[derive(Clone, Copy)]
+pub struct ScriptedFailure {
+    status: u16,
+    /// Seconds for the `retry-after` header, which is what turns a 429 into a
+    /// rate limit the client can honour rather than a bare error.
+    retry_after_secs: Option<u64>,
+}
+
 /// One complete scripted response: some text, some tool calls, then a finish.
+///
+/// Or, for the failover suites, an HTTP failure — a provider that is down is
+/// exactly as scriptable as one that answers.
 #[derive(Clone, Default)]
 pub struct Round {
     text: Option<String>,
     tool_calls: Vec<ScriptedToolCall>,
     usage: Option<ScriptedUsage>,
+    failure: Option<ScriptedFailure>,
 }
 
 impl Round {
@@ -81,17 +94,44 @@ impl Round {
     pub fn text(text: &str) -> Self {
         Self {
             text: Some(text.to_string()),
-            tool_calls: Vec::new(),
-            usage: None,
+            ..Self::default()
         }
     }
 
     /// A round whose only content is one tool call.
     pub fn tool_call(id: &str, name: &str, arguments: Value) -> Self {
         Self {
-            text: None,
             tool_calls: vec![ScriptedToolCall::new(id, name, arguments)],
-            usage: None,
+            ..Self::default()
+        }
+    }
+
+    /// A round the server refuses with HTTP 500.
+    ///
+    /// A 500 carries no `retry-after`, so the client treats it as a terminal
+    /// failure rather than something to wait out — which is the signal both
+    /// the circuit breaker and the failover chain react to.
+    pub fn server_error() -> Self {
+        Self {
+            failure: Some(ScriptedFailure {
+                status: 500,
+                retry_after_secs: None,
+            }),
+            ..Self::default()
+        }
+    }
+
+    /// A round the server refuses with HTTP 429 and a `retry-after`.
+    ///
+    /// This is the provider saying "come back later", which is what model
+    /// degradation reacts to — distinct from the outright failure above.
+    pub fn rate_limited(retry_after_secs: u64) -> Self {
+        Self {
+            failure: Some(ScriptedFailure {
+                status: 429,
+                retry_after_secs: Some(retry_after_secs),
+            }),
+            ..Self::default()
         }
     }
 
@@ -257,6 +297,11 @@ impl MockServer {
         }
     }
 
+    /// The `/v1` base URL this server is listening on.
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
     /// Every request body received so far, in order.
     pub fn requests(&self) -> Vec<Value> {
         self.received
@@ -288,6 +333,20 @@ async fn chat_completions(State(state): State<MockState>, Json(body): Json<Value
         )
             .into_response();
     };
+
+    if let Some(failure) = round.failure {
+        let status = axum::http::StatusCode::from_u16(failure.status)
+            .expect("a scripted failure must use a real status code");
+        let mut response = (status, format!("scripted failure #{index}")).into_response();
+        if let Some(secs) = failure.retry_after_secs {
+            response.headers_mut().insert(
+                header::RETRY_AFTER,
+                header::HeaderValue::from_str(&secs.to_string())
+                    .expect("a number is a valid header value"),
+            );
+        }
+        return response;
+    }
 
     (
         [(header::CONTENT_TYPE, "text/event-stream")],
@@ -324,6 +383,23 @@ pub fn provider_toml(name: &str, server: &MockServer, model: &str) -> String {
         "[providers.{name}]\ntype = \"openai\"\nmodel = \"{model}\"\nbase_url = \"{}\"\n",
         server.base_url
     )
+}
+
+/// The `model` field of every request the server received, in order.
+///
+/// This is the only honest way to see model degradation: the served model is
+/// whatever went out on the wire, not whatever the config says.
+pub fn models_requested(server: &MockServer) -> Vec<String> {
+    server
+        .requests()
+        .iter()
+        .map(|body| {
+            body["model"]
+                .as_str()
+                .expect("every request must name a model")
+                .to_string()
+        })
+        .collect()
 }
 
 /// Finds a named tool's entry in a recorded request body.
@@ -414,6 +490,72 @@ async fn rendered_provider_toml_round_trips_through_the_config_parser() {
         provider.base_url.as_deref(),
         Some(server.base_url.as_str()),
         "the block must point at the port this server actually bound"
+    );
+}
+
+/// Pins the failure shapes the harness serves, and that the client turns each
+/// into the error the failover machinery keys off.
+///
+/// A 500 must be terminal and a 429 must carry its `retry-after`; if either
+/// drifts, the circuit-breaker and degradation suites would still pass while
+/// testing something else entirely.
+#[tokio::test]
+async fn scripted_failures_come_back_as_the_statuses_they_claim() {
+    let server = MockServer::start(vec![
+        Round::server_error(),
+        Round::rate_limited(7),
+        Round::text("recovered"),
+    ])
+    .await;
+    let url = format!("{}/chat/completions", server.base_url());
+    let client = reqwest::Client::new();
+    let body = json!({"model": "mock-model", "messages": []});
+
+    let first = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("the mock must answer");
+    assert_eq!(first.status().as_u16(), 500);
+    assert!(
+        first.headers().get(header::RETRY_AFTER).is_none(),
+        "a 500 must not look retriable"
+    );
+
+    let second = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("the mock must answer");
+    assert_eq!(second.status().as_u16(), 429);
+    assert_eq!(
+        second
+            .headers()
+            .get(header::RETRY_AFTER)
+            .and_then(|value| value.to_str().ok()),
+        Some("7"),
+        "without this header the client has no rate limit to honour"
+    );
+
+    // A failure round consumes its slot, so the script advances past it.
+    let third = client
+        .post(&url)
+        .json(&body)
+        .send()
+        .await
+        .expect("the mock must answer");
+    assert_eq!(third.status().as_u16(), 200);
+
+    assert_eq!(
+        models_requested(&server),
+        vec![
+            "mock-model".to_string(),
+            "mock-model".to_string(),
+            "mock-model".to_string()
+        ],
+        "every request, including the refused ones, is logged with its model"
     );
 }
 

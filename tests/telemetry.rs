@@ -628,6 +628,77 @@ async fn spans_recorded_just_before_shutdown_survive_it() {
 }
 
 // =============================================================================
+// 4b. Failover composition
+// =============================================================================
+
+#[tokio::test]
+async fn a_failed_over_turn_yields_a_round_span_per_provider_and_counts_the_hop() {
+    // Two dispatches inside one turn, to two different providers. If the
+    // spans collapsed onto the configured provider, an operator reading a
+    // trace would never learn the request moved.
+    let harness = Harness::install();
+    let primary = MockServer::start(vec![Round::server_error()]).await;
+    let backup = MockServer::start(vec![Round::text("served").with_usage(11, 22)]).await;
+    let toml = format!(
+        "default_provider = \"primary\"\n\
+         {}failover = [\"backup\"]\n{}",
+        mock_llm::provider_toml("primary", &primary, "primary-model"),
+        mock_llm::provider_toml("backup", &backup, "backup-model"),
+    );
+    let config = acton_ai::config::from_str(&toml).expect("the config must parse");
+    let ai = ActonAI::builder()
+        .app_name("telemetry-failover")
+        .apply_config(config)
+        .expect("the config must apply")
+        .telemetry_from_globals()
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+
+    ai.prompt("who is up?")
+        .collect()
+        .await
+        .expect("the backup serves the round");
+    flush_broadcasts(&ai).await;
+    harness.flush();
+
+    let mut dispatched: Vec<String> = harness
+        .spans_named("acton_ai.llm_round")
+        .iter()
+        .filter_map(|span| attribute(span, "acton_ai.provider"))
+        .collect();
+    dispatched.sort();
+    assert_eq!(
+        dispatched,
+        vec!["backup".to_string(), "primary".to_string()],
+        "each dispatch gets its own round span, labelled with where it went",
+    );
+
+    // Each round span carries the model that served it, not the entry
+    // provider's configured one.
+    let models: Vec<String> = harness
+        .spans_named("acton_ai.llm_round")
+        .iter()
+        .filter_map(|span| attribute(span, "acton_ai.model"))
+        .collect();
+    assert!(
+        models.contains(&"backup-model".to_string()),
+        "the serving model must appear: {models:?}",
+    );
+
+    assert_eq!(
+        harness.counter_total("acton_ai.failover.events", Some(("kind", "failed_over"))),
+        1,
+        "the hop itself is a counted event",
+    );
+    assert_eq!(
+        harness.counter_total("acton_ai.failover.events", Some(("provider", "primary"))),
+        1,
+        "the counter names the provider that gave up the round",
+    );
+}
+
+// =============================================================================
 // 5. Configuration
 // =============================================================================
 

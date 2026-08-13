@@ -40,6 +40,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Usage & cost tracking** — Token usage from every provider tallied per provider and model, priced from your own rate table; on by default
 - **Spending budgets** — Hard process-wide and per-provider caps checked before every request, with warnings on the way up and a typed refusal at the ceiling
 - **OpenTelemetry export** — Traces spanning each prompt loop (turn → rounds → tools) plus token, latency, and reliability metrics, over OTLP to any collector
+- **Failover & circuit breaking** — Named provider chains tried in order, a per-provider circuit breaker with half-open recovery, and model degradation when a vendor throttles instead of dies
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -279,6 +280,18 @@ warn_at_percent = 80        # default 80; 0 disables warnings
 
 [budget.providers]
 claude = 2.00               # per configured provider name
+
+# Optional: where a round goes when this provider cannot serve it, and a
+# cheaper model to use when it is merely rate limited.
+failover = ["claude-backup", "local"]
+fallback_model = "claude-haiku-4-5"
+
+# The circuit breaker is ON by default (5 failures, 30s). This block only
+# changes the numbers, or switches it off.
+[providers.claude.circuit_breaker]
+failure_threshold = 5
+cooldown_secs = 30
+enabled = true
 ```
 
 Load the configuration:
@@ -342,6 +355,43 @@ Budgets need pricing: a provider whose tokens cannot be priced spends
 invisibly, so it fails the launch unless `Budget::allow_unpriced()` says the
 blind spot is acceptable. A cap is a circuit breaker, not an exact meter — a
 request already in flight when the ceiling is crossed still completes.
+
+### Failover and circuit breaking
+
+A chain is tried in order when a provider cannot serve a round. The
+re-dispatch happens inside the same round, so the caller gets an answer rather
+than an error, and billing follows the provider that actually served:
+
+```rust
+use acton_ai::prelude::*;
+use std::time::Duration;
+
+let runtime = ActonAI::builder()
+    .provider_named("claude",
+        ProviderConfig::anthropic(&key)
+            .with_failover(["claude-backup", "local"])
+            .with_fallback_model("claude-haiku-4-5")   // used when rate limited
+            .with_circuit_breaker(CircuitBreakerConfig::new(5, Duration::from_secs(30))))
+    .provider_named("claude-backup", ProviderConfig::anthropic(&backup_key))
+    .provider_named("local", ProviderConfig::ollama("qwen2.5:7b"))
+    .default_provider("claude")
+    .on_failover_event(|e| eprintln!("failover: {e}"))
+    .launch()
+    .await?;
+
+match runtime.prompt("hello").collect().await {
+    // Every candidate refused: the error names each one and why.
+    Err(e) if e.is_all_providers_failed() => println!("{e}"),
+    other => { other?; }
+}
+```
+
+The circuit breaker is **on by default** — five consecutive failures open a
+provider's circuit for thirty seconds, after which the next real request is
+allowed through as a probe. Probes are never synthetic, so recovery costs
+nothing extra. Opt out with `.without_circuit_breaker()` or
+`enabled = false`. Failover chains and `fallback_model` change routing, so
+they are always explicit.
 
 ### Observability
 

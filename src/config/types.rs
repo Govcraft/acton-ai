@@ -4,7 +4,9 @@
 //! and sandbox settings in configuration files.
 
 use crate::error::ActonAIError;
-use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
+use crate::llm::{
+    CircuitBreakerConfig, ProviderConfig, ProviderType, RateLimitConfig, SamplingParams,
+};
 use crate::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
@@ -652,6 +654,29 @@ pub struct NamedProviderConfig {
     /// reported as unknown rather than as zero.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pricing: Option<PricingFileConfig>,
+
+    /// Circuit breaker settings for this provider.
+    ///
+    /// Absent means the built-in defaults, which are **on**: five consecutive
+    /// failures open the circuit for thirty seconds. Switch it off with
+    /// `enabled = false`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerFileConfig>,
+
+    /// Providers to try, in order, when this one cannot serve a round.
+    ///
+    /// Every name must be another provider in the same `[providers]` table;
+    /// a chain naming an unconfigured provider is rejected at launch.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover: Vec<String>,
+
+    /// A cheaper or less contended model on the *same* provider, used when
+    /// the provider reports a rate limit.
+    ///
+    /// Degrading the model keeps the request with a provider that is up but
+    /// throttled, rather than moving it to a different vendor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
 }
 
 /// Per-provider pricing, from `[providers.<name>.pricing]` in TOML.
@@ -726,6 +751,9 @@ impl NamedProviderConfig {
             stop_sequences: None,
             context_window_tokens: None,
             pricing: None,
+            circuit_breaker: None,
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -750,6 +778,9 @@ impl NamedProviderConfig {
             stop_sequences: None,
             context_window_tokens: None,
             pricing: None,
+            circuit_breaker: None,
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -777,6 +808,9 @@ impl NamedProviderConfig {
             stop_sequences: None,
             context_window_tokens: None,
             pricing: None,
+            circuit_breaker: None,
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -942,6 +976,18 @@ impl NamedProviderConfig {
 
         if let Some(ref rate_limit) = self.rate_limit {
             config = config.with_rate_limit(rate_limit.to_rate_limit_config());
+        }
+
+        if let Some(ref breaker) = self.circuit_breaker {
+            config = config.with_circuit_breaker(breaker.to_circuit_breaker_config());
+        }
+
+        if !self.failover.is_empty() {
+            config = config.with_failover(self.failover.iter());
+        }
+
+        if let Some(ref model) = self.fallback_model {
+            config = config.with_fallback_model(model);
         }
 
         // Build sampling params from individual fields
@@ -1182,6 +1228,65 @@ impl Default for RateLimitFileConfig {
         Self {
             requests_per_minute: 50,
             tokens_per_minute: 40_000,
+        }
+    }
+}
+
+/// Circuit-breaker settings from `[providers.<name>.circuit_breaker]`.
+///
+/// ```toml
+/// [providers.claude.circuit_breaker]
+/// failure_threshold = 3
+/// cooldown_secs = 60
+/// ```
+///
+/// Every field is optional and falls back to the built-in default, so a table
+/// that sets only `cooldown_secs` keeps the default threshold. The breaker is
+/// on by default; `enabled = false` is how you turn it off without deleting
+/// the rest of the table.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct CircuitBreakerFileConfig {
+    /// Consecutive failures that open the circuit. Defaults to 5.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure_threshold: Option<u32>,
+
+    /// How long the circuit stays open before one probe is allowed through,
+    /// in seconds. Defaults to 30.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cooldown_secs: Option<u64>,
+
+    /// Whether the breaker trips at all. Defaults to `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+}
+
+impl CircuitBreakerFileConfig {
+    /// Converts to the runtime [`CircuitBreakerConfig`], filling every unset
+    /// field from the built-in defaults.
+    ///
+    /// ```rust
+    /// use acton_ai::prelude::CircuitBreakerFileConfig;
+    ///
+    /// let file = CircuitBreakerFileConfig {
+    ///     cooldown_secs: Some(60),
+    ///     ..Default::default()
+    /// };
+    /// let config = file.to_circuit_breaker_config();
+    ///
+    /// assert_eq!(config.cooldown, std::time::Duration::from_secs(60));
+    /// // Unset fields keep their defaults rather than zeroing out.
+    /// assert_eq!(config.failure_threshold, 5);
+    /// assert!(config.enabled);
+    /// ```
+    #[must_use]
+    pub fn to_circuit_breaker_config(&self) -> CircuitBreakerConfig {
+        let defaults = CircuitBreakerConfig::default();
+        CircuitBreakerConfig {
+            enabled: self.enabled.unwrap_or(defaults.enabled),
+            failure_threshold: self.failure_threshold.unwrap_or(defaults.failure_threshold),
+            cooldown: self
+                .cooldown_secs
+                .map_or(defaults.cooldown, Duration::from_secs),
         }
     }
 }
@@ -2151,5 +2256,99 @@ output_per_mtok = 10.0
             Some(TruncationStrategy::KeepEnds)
         );
         assert_eq!(parse_truncation_strategy("bogus"), None);
+    }
+
+    #[test]
+    fn a_provider_block_parses_its_failover_chain_and_breaker() {
+        let toml = r#"
+[providers.claude]
+type = "anthropic"
+model = "sonnet"
+failover = ["backup", "local"]
+fallback_model = "haiku"
+
+[providers.claude.circuit_breaker]
+failure_threshold = 3
+cooldown_secs = 60
+enabled = true
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("the block must parse");
+        let provider = &config.providers["claude"];
+
+        assert_eq!(provider.failover, vec!["backup", "local"]);
+        assert_eq!(provider.fallback_model.as_deref(), Some("haiku"));
+
+        // Order matters: the chain is tried front to back, so a parser that
+        // reordered it would silently change which vendor serves first.
+        let runtime = provider.to_provider_config();
+        assert_eq!(runtime.failover, vec!["backup", "local"]);
+        assert_eq!(runtime.fallback_model.as_deref(), Some("haiku"));
+        assert_eq!(runtime.circuit_breaker.failure_threshold, 3);
+        assert_eq!(runtime.circuit_breaker.cooldown, Duration::from_secs(60));
+        assert!(runtime.circuit_breaker.enabled);
+    }
+
+    #[test]
+    fn a_provider_block_with_no_failover_keys_gets_the_defaults() {
+        let toml = r#"
+[providers.claude]
+type = "anthropic"
+model = "sonnet"
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("the block must parse");
+        let runtime = config.providers["claude"].to_provider_config();
+
+        // Routing is opt-in; the breaker is not.
+        assert!(runtime.failover.is_empty());
+        assert!(runtime.fallback_model.is_none());
+        assert!(runtime.circuit_breaker.enabled);
+        assert_eq!(runtime.circuit_breaker.failure_threshold, 5);
+        assert_eq!(runtime.circuit_breaker.cooldown, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn a_partial_circuit_breaker_block_keeps_the_defaults_it_omits() {
+        let toml = r#"
+[providers.claude]
+type = "anthropic"
+model = "sonnet"
+
+[providers.claude.circuit_breaker]
+enabled = false
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("the block must parse");
+        let runtime = config.providers["claude"].to_provider_config();
+
+        assert!(!runtime.circuit_breaker.enabled);
+        // Switching the breaker off must not also zero the numbers, or turning
+        // it back on later would arm a breaker that trips instantly.
+        assert_eq!(runtime.circuit_breaker.failure_threshold, 5);
+        assert_eq!(runtime.circuit_breaker.cooldown, Duration::from_secs(30));
+    }
+
+    #[test]
+    fn failover_keys_survive_a_serialization_round_trip() {
+        let mut provider = NamedProviderConfig::anthropic("sonnet");
+        provider.failover = vec!["backup".to_string()];
+        provider.fallback_model = Some("haiku".to_string());
+        provider.circuit_breaker = Some(CircuitBreakerFileConfig {
+            failure_threshold: Some(2),
+            cooldown_secs: Some(15),
+            enabled: Some(true),
+        });
+
+        let mut config = ActonAIConfig::new();
+        config.providers.insert("claude".to_string(), provider);
+        let rendered = toml::to_string(&config).expect("the config must serialize");
+        let parsed: ActonAIConfig = toml::from_str(&rendered).expect("and parse back");
+
+        let round_tripped = parsed.providers["claude"].to_provider_config();
+        assert_eq!(round_tripped.failover, vec!["backup"]);
+        assert_eq!(round_tripped.fallback_model.as_deref(), Some("haiku"));
+        assert_eq!(round_tripped.circuit_breaker.failure_threshold, 2);
+        assert_eq!(
+            round_tripped.circuit_breaker.cooldown,
+            Duration::from_secs(15)
+        );
     }
 }
