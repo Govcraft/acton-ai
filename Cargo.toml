@@ -15,6 +15,11 @@ include = [
     "!docs/**/*",
 ]
 
+# Explicit single-package workspace root, so a checkout nested under another
+# checkout (e.g. a git worktree in .claude/worktrees/) never resolves into the
+# outer manifest's workspace.
+[workspace]
+
 [features]
 default = ["sandbox-hardening"]
 # Enables Linux-specific OS hardening (landlock + seccomp) for the process
@@ -23,7 +28,7 @@ sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
-acton-reactive = "9"
+acton-reactive = "9.1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

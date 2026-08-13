@@ -180,11 +180,12 @@ pub struct LLMProvider {
     _streams: StreamAccumulator,
     /// Whether the provider is shutting down
     shutting_down: bool,
-    /// Whether a queue-drain timer is already armed.
+    /// The queue-drain timer currently armed, if any.
     ///
     /// Guarantees at most one outstanding timer no matter how many requests
-    /// pile up while the provider is rate limited.
-    drain_scheduled: bool,
+    /// pile up while the provider is rate limited. The schedule ends with the
+    /// actor, so it never outlives the provider.
+    drain_timer: Option<ScheduledSend>,
     /// Metrics
     metrics: ProviderMetrics,
 }
@@ -412,7 +413,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
     builder.mutate_on::<ProcessQueue>(|actor, _envelope| {
         // The timer that delivered this message has fired; a later queue
         // insertion is free to arm a new one.
-        actor.model.drain_scheduled = false;
+        actor.model.drain_timer = None;
         actor.model.rate_limiter.clear_expired_rate_limit();
 
         drain_queue(actor);
@@ -546,28 +547,15 @@ fn drain_queue(actor: &mut ManagedActor<Started, LLMProvider>) {
     }
 }
 
-/// Arms a one-shot timer that sends `ProcessQueue` once `at` has passed.
+/// Arms a one-shot scheduled send of `ProcessQueue` once `at` has passed.
 ///
-/// Does nothing if a timer is already armed.
-///
-/// acton-reactive 9.x has no scheduled-send facility, and a `sleep` inside a
-/// read-only handler's future would be worse than a detached task: those
-/// futures are drained *to completion* at the message loop's next flush point,
-/// so the sleep would stall the whole loop. A one-shot task whose only effect
-/// is a single `send` is the smallest correct option — it is inert if the
-/// provider has already stopped, and `drain_scheduled` bounds it to one at a
-/// time.
+/// Does nothing if a timer is already armed: `drain_timer` bounds this to one
+/// outstanding schedule no matter how many requests queue up meanwhile.
 fn arm_drain_timer(actor: &mut ManagedActor<Started, LLMProvider>, at: Instant) {
-    if actor.model.drain_scheduled {
+    if actor.model.drain_timer.is_some() {
         return;
     }
-    actor.model.drain_scheduled = true;
-
-    let handle = actor.handle().clone();
-    tokio::spawn(async move {
-        tokio::time::sleep_until(at.into()).await;
-        handle.send(ProcessQueue).await;
-    });
+    actor.model.drain_timer = Some(actor.handle().send_at(ProcessQueue, at));
 }
 
 /// Sends a request to the provider API on a detached task.

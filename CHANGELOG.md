@@ -64,8 +64,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Release and CI workflows now target Linux (x86_64 + aarch64), macOS
   (Intel + Apple Silicon), and Windows x86_64. The previous `x86_64-linux`
   hard-scoping (required by Hyperlight's KVM dependency) is gone.
+- Minimum `acton-reactive` is now 9.1 (was 9.0), for the scheduled-send
+  facility (`send_after` / `send_at` / `send_every`).
 
 ### Internal
+
+- The LLM provider's rate-limit drain timer now uses acton-reactive 9.1's
+  `send_at` instead of a detached `tokio::spawn` + `sleep`. The schedule is
+  owned by the runtime, ends with the provider actor, and the
+  `drain_scheduled` guard flag became the held `ScheduledSend` itself.
+- `Cargo.toml` declares an explicit single-package `[workspace]`, so a
+  checkout nested under another checkout (e.g. a git worktree in
+  `.claude/worktrees/`) resolves as its own workspace root.
 
 - Deleted `guests/` workspace (hyperlight no_std guest binaries:
   `shell_guest`, `http_guest`).

@@ -22,7 +22,8 @@ Conventions, patterns, and processes for contributing to acton-ai.
 - Actor state structs use the `#[acton_actor]` derive macro.
 - Actor messages use the `#[acton_message]` derive macro, which requires `Any + Send + Sync + Debug + Clone + 'static`. In practice, `#[derive(Clone, Debug)]` on your message struct is sufficient since the blanket impl covers the rest.
 - The public field for user state in actor handlers is `actor.model`.
-- `Reply::pending(async move { ... })` blocks the mailbox -- use it intentionally to serialize message processing. Use `tokio::spawn` inside `Reply::pending` if you need to release the mailbox while awaiting.
+- `Reply::pending(async move { ... })` blocks the mailbox -- use it intentionally to serialize message processing. Use `tokio::spawn` inside `Reply::pending` only when the awaited work must release the mailbox *and* no framework facility covers it (e.g. the HTTP dispatch in the LLM provider, whose response stream is not `Sync`).
+- Never hand-roll timers with `tokio::spawn` + `sleep`. acton-reactive 9.1+ provides scheduled sends -- `handle.send_after(msg, delay)`, `send_at(msg, deadline)`, and `send_every(msg, interval, cadence)` -- which return a cancellable `ScheduledSend`, end with the target actor, and are testable via an injected `Clock`. See `arm_drain_timer` in the LLM provider for the pattern.
 - Keep handler closures focused. Extract complex logic into standalone `async fn` helpers (as seen in `process_streaming_request` in the LLM provider).
 
 ### Naming conventions
