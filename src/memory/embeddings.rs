@@ -30,7 +30,11 @@ use std::fmt;
 // =============================================================================
 
 /// Errors that can occur in embedding operations.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum EmbeddingError {
     /// The embedding vector is empty.
     EmptyVector,

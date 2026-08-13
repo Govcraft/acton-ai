@@ -23,7 +23,11 @@ pub struct CliError {
 }
 
 /// Specific CLI error types.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug)]
+#[non_exhaustive]
 pub enum CliErrorKind {
     /// Configuration error (bad config file, missing provider, etc.).
     Configuration(String),

@@ -17,7 +17,11 @@ pub struct McpError {
 }
 
 /// Specific MCP error cases.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum McpErrorKind {
     /// The transport could not be established, or the MCP handshake failed.
     ConnectFailed {

@@ -10,7 +10,11 @@ use std::path::{Path, PathBuf};
 ///
 /// This error type provides detailed information about why a path
 /// was rejected, enabling users to understand and fix the issue.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PathValidationError {
     /// Path could not be canonicalized (doesn't exist or permission denied).
     CanonicalizeError {

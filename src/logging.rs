@@ -168,7 +168,11 @@ pub struct LoggingError {
 }
 
 /// Specific logging error types.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum LoggingErrorKind {
     /// Subscriber initialization failed (another subscriber was already set).
     SubscriberInitFailed {

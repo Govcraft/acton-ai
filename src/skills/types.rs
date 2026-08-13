@@ -71,7 +71,11 @@ impl LoadedSkill {
 }
 
 /// Errors that can occur when working with skills.
+///
+/// Marked `#[non_exhaustive]` so new failure kinds can be added without
+/// breaking downstream `match`es.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum SkillsError {
     /// Failed to load skill from path
     LoadFailed {
