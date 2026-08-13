@@ -5,6 +5,7 @@
 //!
 //! No external error crates (anyhow, thiserror, eyre) are used.
 
+use crate::accounting::BudgetScope;
 use crate::types::AgentId;
 use std::fmt;
 
@@ -254,6 +255,22 @@ pub enum ActonAIErrorKind {
         /// Rendered description of the extraction failure.
         reason: String,
     },
+    /// A configured spending cap was reached, so the request was refused
+    /// before it was sent.
+    ///
+    /// Raised pre-flight by the prompt loop, which means no money was spent
+    /// on the refused request. Raise the cap with
+    /// [`ActonAIBuilder::budget`](crate::facade::ActonAIBuilder::budget) or
+    /// the `[budget]` section of your config file, or start a runtime without
+    /// one.
+    BudgetExceeded {
+        /// Which ceiling was hit — the process-wide total, or one provider.
+        scope: BudgetScope,
+        /// The ceiling, in integer micro-USD.
+        limit_microusd: u64,
+        /// Spend in that scope when the request was refused, in micro-USD.
+        spent_microusd: u64,
+    },
 }
 
 impl ActonAIError {
@@ -332,6 +349,25 @@ impl ActonAIError {
         })
     }
 
+    /// Creates a budget-exceeded error.
+    ///
+    /// ```rust
+    /// use acton_ai::prelude::{ActonAIError, BudgetScope};
+    ///
+    /// let err = ActonAIError::budget_exceeded(BudgetScope::Total, 5_000_000, 5_200_000);
+    ///
+    /// assert!(err.is_budget_exceeded());
+    /// assert!(err.to_string().contains("$5.0000"));
+    /// ```
+    #[must_use]
+    pub fn budget_exceeded(scope: BudgetScope, limit_microusd: u64, spent_microusd: u64) -> Self {
+        Self::new(ActonAIErrorKind::BudgetExceeded {
+            scope,
+            limit_microusd,
+            spent_microusd,
+        })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -342,6 +378,15 @@ impl ActonAIError {
     #[must_use]
     pub fn is_runtime_shutdown(&self) -> bool {
         matches!(self.kind, ActonAIErrorKind::RuntimeShutdown)
+    }
+
+    /// Returns true if a spending cap refused this request.
+    ///
+    /// The check that produces it is pre-flight, so nothing was spent on the
+    /// refused request.
+    #[must_use]
+    pub fn is_budget_exceeded(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::BudgetExceeded { .. })
     }
 }
 
@@ -371,6 +416,21 @@ impl fmt::Display for ActonAIError {
             }
             ActonAIErrorKind::Extraction { reason } => {
                 write!(f, "structured output extraction failed: {reason}")
+            }
+            ActonAIErrorKind::BudgetExceeded {
+                scope,
+                limit_microusd,
+                spent_microusd,
+            } => {
+                write!(
+                    f,
+                    "budget exceeded for {scope}: ${:.4} spent against a ${:.4} cap; the request \
+                     was refused before it was sent. Raise or remove the cap with \
+                     ActonAIBuilder::budget(...) / .budget_usd(...), or the [budget] section of \
+                     your config file",
+                    crate::accounting::budget::usd(*spent_microusd),
+                    crate::accounting::budget::usd(*limit_microusd),
+                )
             }
         }
     }

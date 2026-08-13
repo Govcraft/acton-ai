@@ -71,7 +71,7 @@
 //! }
 //! ```
 
-use crate::accounting::{GetUsage, PricingTable, UsageSnapshot};
+use crate::accounting::{Budget, BudgetConfig, BudgetEvent, GetUsage, PricingTable, UsageSnapshot};
 use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
@@ -168,6 +168,12 @@ pub(crate) struct ActonAIInner {
     /// [`ActonAI::usage`] reports as a configuration error rather than as an
     /// empty snapshot — zeros would read as "spent nothing".
     pub(crate) accountant: Option<ActorHandle>,
+    /// The caps in force, when a budget was configured.
+    ///
+    /// Kept beside the accountant handle so the prompt loop can skip the
+    /// pre-flight ask entirely — not merely ignore its answer — when nothing
+    /// is capped.
+    pub(crate) budget: Option<BudgetConfig>,
     /// Tools contributed by configured MCP servers, and the supervised actors
     /// owning their connections.
     ///
@@ -356,6 +362,28 @@ impl ActonAI {
     #[must_use]
     pub fn is_usage_tracking(&self) -> bool {
         self.inner.accountant.is_some()
+    }
+
+    /// Returns whether a spending cap is being enforced.
+    ///
+    /// When true, every provider dispatch is preceded by a budget check and
+    /// can fail with
+    /// [`ActonAIErrorKind::BudgetExceeded`](crate::error::ActonAIErrorKind::BudgetExceeded).
+    #[must_use]
+    pub fn is_budget_enforced(&self) -> bool {
+        self.inner.budget.is_some()
+    }
+
+    /// The accountant to pre-flight against, or `None` when nothing is
+    /// capped.
+    ///
+    /// Returning `None` is what lets the prompt loop skip the ask round-trip
+    /// altogether rather than paying for it and discarding the answer.
+    pub(crate) fn budget_accountant(&self) -> Option<&ActorHandle> {
+        self.inner
+            .budget
+            .as_ref()
+            .and(self.inner.accountant.as_ref())
     }
 
     /// Returns a snapshot of the tokens — and, where pricing is configured,
@@ -707,6 +735,20 @@ pub struct ActonAIBuilder {
     /// `[providers.<name>.pricing]` and converted to integer micro-USD at
     /// load. Empty when nothing is priced, which is a supported state.
     pricing: PricingTable,
+    /// Caps set programmatically with [`budget`](Self::budget) or
+    /// [`budget_usd`](Self::budget_usd).
+    ///
+    /// Present, this replaces `[budget]` from the config file **wholesale** —
+    /// the same rule `usage_tracking` follows, and for the same reason: a
+    /// half-merged budget is a cap nobody wrote.
+    budget: Option<Budget>,
+    /// The `[budget]` section from a config file, used only when the builder
+    /// sets no budget of its own. Resolved at launch rather than in
+    /// [`apply_config`](Self::apply_config), so `.budget(..)` wins whether it
+    /// is called before or after `.from_config()`.
+    budget_file: Option<crate::config::BudgetFileConfig>,
+    /// Callback registered with [`on_budget_event`](Self::on_budget_event).
+    budget_event_callback: Option<Arc<dyn Fn(BudgetEvent) + Send + Sync>>,
 }
 
 impl ActonAIBuilder {
@@ -813,6 +855,86 @@ impl ActonAIBuilder {
     #[must_use]
     pub fn usage_tracking(mut self, enabled: bool) -> Self {
         self.usage_tracking = Some(enabled);
+        self
+    }
+
+    /// Caps process-wide spending at `dollars`, refusing requests past it.
+    ///
+    /// The one-liner form of [`budget`](Self::budget): a process-wide cap,
+    /// warning at [`DEFAULT_WARN_AT_PERCENT`](crate::accounting::DEFAULT_WARN_AT_PERCENT),
+    /// refusing at the cap. Reach for the full form when you need
+    /// per-provider caps, a different warning threshold, or unpriced
+    /// providers.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .budget_usd(5.00)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn budget_usd(self, dollars: f64) -> Self {
+        self.budget(Budget::usd(dollars))
+    }
+
+    /// Installs spending caps enforced before every provider dispatch.
+    ///
+    /// Replaces any `[budget]` section from a config file wholesale, whether
+    /// this is called before or after `from_config()`.
+    ///
+    /// Two things fail the launch rather than quietly weakening the cap: a
+    /// budget alongside `usage_tracking(false)` (there would be nothing
+    /// counting), and a budget alongside a configured provider that has no
+    /// pricing (the cap could never be reached). [`Budget::allow_unpriced`]
+    /// opts out of the second.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::prelude::Budget;
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .budget(
+    ///         Budget::usd(5.00)
+    ///             .provider("claude", 2.00)
+    ///             .warn_at_percent(50),
+    ///     )
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn budget(mut self, budget: Budget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Runs `callback` for every [`BudgetEvent`] the accountant broadcasts.
+    ///
+    /// The callback runs inside a small subscriber actor's message loop, so
+    /// it must be cheap and must not block — log, increment a counter, send
+    /// on a channel. Anything slower belongs in an actor of your own
+    /// subscribed to [`BudgetEvent`] directly.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .budget_usd(5.00)
+    ///     .on_budget_event(|event| eprintln!("budget: {event}"))
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn on_budget_event(
+        mut self,
+        callback: impl Fn(BudgetEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.budget_event_callback = Some(Arc::new(callback));
         self
     }
 
@@ -954,6 +1076,12 @@ impl ActonAIBuilder {
         // above). Builder-stage paths come first; config-stage paths append.
         if let Some(skills_cfg) = config.skills {
             self.skill_paths.extend(skills_cfg.paths);
+        }
+
+        // Stash `[budget]` rather than converting it here: a `.budget(..)`
+        // call may still be coming, and it replaces this section wholesale.
+        if let Some(budget) = config.budget {
+            self.budget_file = Some(budget);
         }
 
         // Stash `[context]` settings — resolved at launch after the default
@@ -1401,6 +1529,22 @@ impl ActonAIBuilder {
             .map(|p| p.model.clone())
             .unwrap_or_default();
 
+        // Budgets are settled before anything is spawned. Every failure here
+        // is a cap that would not have held, and discovering that after the
+        // first request is discovering it too late.
+        let budget = self.resolve_budget()?;
+        if let Some(ref budget) = budget {
+            if !self.usage_tracking.unwrap_or(true) {
+                return Err(ActonAIError::configuration(
+                    "budget",
+                    "a budget needs the cost accountant, but usage tracking is off; drop \
+                     usage_tracking(false) / `usage_tracking = false` under [defaults], or drop \
+                     the budget",
+                ));
+            }
+            validate_budget_coverage(budget, &self.providers, &self.pricing)?;
+        }
+
         let app_name = self.app_name.unwrap_or_else(|| "acton-ai".to_string());
 
         // Launch the actor runtime
@@ -1519,13 +1663,25 @@ impl ActonAIBuilder {
         // nothing for supervision to repair — and a restart would zero the
         // very totals it exists to keep.
         let accountant = if self.usage_tracking.unwrap_or(true) {
-            let handle = crate::accounting::CostAccountant::spawn(&mut runtime, self.pricing).await;
-            tracing::debug!("usage tracking enabled");
+            let handle = crate::accounting::CostAccountant::spawn(
+                &mut runtime,
+                self.pricing,
+                budget.clone(),
+            )
+            .await;
+            tracing::debug!(budget = budget.is_some(), "usage tracking enabled");
             Some(handle)
         } else {
             tracing::debug!("usage tracking disabled; ActonAI::usage() will report as much");
             None
         };
+
+        // Spawned after the accountant so the subscription is in place before
+        // anything can broadcast. Only when a callback was actually
+        // registered — an actor whose closure is `None` is pure overhead.
+        if let Some(callback) = self.budget_event_callback.take() {
+            crate::accounting::BudgetEventListener::spawn(&mut runtime, callback).await;
+        }
 
         let context_window = resolve_context_window(
             self.context_window_override.take(),
@@ -1549,10 +1705,25 @@ impl ActonAIBuilder {
                 default_max_tool_rounds,
                 context_window,
                 accountant,
+                budget,
                 mcp,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Resolves the effective budget: builder first, then `[budget]` TOML.
+    ///
+    /// Wholesale, never field-by-field — the same precedence
+    /// `usage_tracking` follows.
+    fn resolve_budget(&self) -> Result<Option<BudgetConfig>, ActonAIError> {
+        if let Some(ref budget) = self.budget {
+            return budget.to_config().map(Some);
+        }
+        self.budget_file
+            .as_ref()
+            .map(crate::config::BudgetFileConfig::to_budget)
+            .transpose()
     }
 
     /// Resolves the default provider name from configuration.
@@ -1603,6 +1774,83 @@ impl ActonAIBuilder {
     pub fn is_auto_builtins(&self) -> bool {
         self.auto_builtins
     }
+}
+
+/// Rejects budgets that could not be enforced against the providers as
+/// configured.
+///
+/// Two ways a cap silently stops being a cap, both caught here:
+///
+/// - it names a provider that was never configured, so nothing is ever
+///   measured against it;
+/// - a configured provider has no pricing, so part of the spend is invisible
+///   and the ceiling can never be reached. [`Budget::allow_unpriced`] is the
+///   deliberate opt-out, which counts that usage as `$0`.
+///
+/// Pure: everything it inspects is an argument.
+fn validate_budget_coverage(
+    budget: &BudgetConfig,
+    providers: &HashMap<String, ProviderConfig>,
+    pricing: &PricingTable,
+) -> Result<(), ActonAIError> {
+    let unknown: Vec<&str> = budget
+        .capped_providers()
+        .filter(|name| !providers.contains_key(*name))
+        .collect();
+    if !unknown.is_empty() {
+        let mut configured: Vec<&str> = providers.keys().map(String::as_str).collect();
+        configured.sort_unstable();
+        return Err(ActonAIError::configuration(
+            "budget.providers",
+            format!(
+                "capped provider(s) {} are not configured, so those caps would never apply; \
+                 configured providers: {}",
+                quoted(&unknown),
+                quoted(&configured),
+            ),
+        ));
+    }
+
+    if budget.allow_unpriced() {
+        return Ok(());
+    }
+
+    let mut unpriced: Vec<&str> = providers
+        .keys()
+        .map(String::as_str)
+        .filter(|name| pricing.get(name).is_none())
+        .collect();
+    if unpriced.is_empty() {
+        return Ok(());
+    }
+    unpriced.sort_unstable();
+
+    let tables = unpriced
+        .iter()
+        .map(|name| {
+            format!("[providers.{name}.pricing]\ninput_per_mtok = ...\noutput_per_mtok = ...")
+        })
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    Err(ActonAIError::configuration(
+        "budget",
+        format!(
+            "a budget is set but provider(s) {} have no pricing, so their spending would be \
+             invisible to the cap. Add:\n\n{tables}\n\nor accept the blind spot with \
+             Budget::allow_unpriced() / `allow_unpriced = true` under [budget]",
+            quoted(&unpriced),
+        ),
+    ))
+}
+
+/// Renders names as a comma-separated, backtick-quoted list.
+fn quoted(names: &[&str]) -> String {
+    names
+        .iter()
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Resolves the runtime [`ContextWindow`] at [`ActonAIBuilder::launch`] time.
@@ -2058,6 +2306,203 @@ mod tests {
         assert_eq!(registry.len(), 1);
         let names: Vec<String> = registry.list().iter().map(|s| s.name.clone()).collect();
         assert!(names.contains(&"sample".to_string()), "names = {names:?}");
+    }
+
+    // -------------------------------------------------------------------
+    // Budgets
+    // -------------------------------------------------------------------
+
+    /// A config whose one provider is priced, which is what a budget needs.
+    fn priced_config() -> crate::config::ActonAIConfig {
+        let mut provider = crate::config::NamedProviderConfig::ollama("test");
+        provider.pricing = Some(crate::config::PricingFileConfig {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: None,
+            cache_creation_per_mtok: None,
+        });
+        crate::config::ActonAIConfig::new()
+            .with_provider("claude", provider)
+            .with_default_provider("claude")
+    }
+
+    #[tokio::test]
+    async fn launch_fails_when_a_budget_has_no_accountant_to_count_for_it() {
+        let err = ActonAI::builder()
+            .apply_config(priced_config())
+            .expect("apply_config")
+            .budget_usd(5.00)
+            .usage_tracking(false)
+            .launch()
+            .await
+            .expect_err("a budget with nothing counting is not a budget");
+
+        assert!(err.is_configuration(), "err = {err}");
+        assert!(err.to_string().contains("usage tracking"), "err = {err}");
+    }
+
+    #[tokio::test]
+    async fn launch_fails_when_a_budget_covers_an_unpriced_provider() {
+        // `ollama("test")` carries no pricing, so its spending would be
+        // invisible to the cap.
+        let err = ActonAI::builder()
+            .ollama("test")
+            .budget_usd(5.00)
+            .launch()
+            .await
+            .expect_err("an unpriced provider under a budget must fail closed");
+
+        let message = err.to_string();
+        assert!(err.is_configuration(), "err = {err}");
+        assert!(
+            message.contains(DEFAULT_PROVIDER_NAME),
+            "the error must name the offending provider: {message}"
+        );
+        assert!(
+            message.contains("pricing"),
+            "the error must name the TOML table to add: {message}"
+        );
+        assert!(
+            message.contains("allow_unpriced"),
+            "the error must name the opt-out: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn allow_unpriced_launches_over_an_unpriced_provider() {
+        let ai = ActonAI::builder()
+            .ollama("test")
+            .budget(Budget::usd(5.00).allow_unpriced())
+            .launch()
+            .await
+            .expect("an explicit blind spot is allowed");
+
+        assert!(ai.is_budget_enforced());
+        ai.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_budget_usd_one_liner_launches_over_a_priced_provider() {
+        let ai = ActonAI::builder()
+            .apply_config(priced_config())
+            .expect("apply_config")
+            .budget_usd(5.00)
+            .launch()
+            .await
+            .expect("a priced provider under a cap launches");
+
+        assert!(ai.is_budget_enforced());
+        let usage = ai.usage().await.expect("usage");
+        let budget = usage.budget.expect("the snapshot must carry the cap");
+        assert_eq!(budget.total.expect("a total cap").limit_microusd, 5_000_000);
+
+        ai.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn launching_without_a_budget_enforces_nothing() {
+        let ai = ActonAI::builder()
+            .ollama("test")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert!(!ai.is_budget_enforced());
+        assert!(
+            ai.usage().await.expect("usage").budget.is_none(),
+            "no budget must read as absent, not as one with room left"
+        );
+
+        ai.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn launch_fails_when_a_cap_names_a_provider_that_was_never_configured() {
+        // Otherwise the typo is a cap that silently never applies.
+        let err = ActonAI::builder()
+            .apply_config(priced_config())
+            .expect("apply_config")
+            .budget(Budget::for_provider("cluade", 2.00))
+            .launch()
+            .await
+            .expect_err("a cap on a provider that does not exist must fail");
+
+        let message = err.to_string();
+        assert!(message.contains("cluade"), "err = {message}");
+        assert!(message.contains("claude"), "err = {message}");
+    }
+
+    #[tokio::test]
+    async fn a_builder_budget_replaces_the_toml_section_wholesale() {
+        let config = crate::config::ActonAIConfig {
+            budget: Some(crate::config::BudgetFileConfig {
+                total_usd: Some(99.0),
+                warn_at_percent: Some(10),
+                allow_unpriced: Some(true),
+                providers: Default::default(),
+            }),
+            ..priced_config()
+        };
+
+        // Applied after the builder call, to prove the precedence does not
+        // depend on the order the two are written in.
+        let ai = ActonAI::builder()
+            .budget(Budget::usd(1.00))
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        let status = ai
+            .usage()
+            .await
+            .expect("usage")
+            .budget
+            .expect("a budget is configured");
+        assert_eq!(status.total.expect("a total cap").limit_microusd, 1_000_000);
+        assert_eq!(
+            status.warn_at_percent,
+            crate::accounting::DEFAULT_WARN_AT_PERCENT,
+            "the builder budget replaces the section, it does not merge with it"
+        );
+        assert!(!status.allow_unpriced);
+
+        ai.shutdown().await.expect("clean shutdown");
+    }
+
+    #[tokio::test]
+    async fn the_toml_budget_applies_when_the_builder_sets_none() {
+        let config = crate::config::ActonAIConfig {
+            budget: Some(crate::config::BudgetFileConfig {
+                total_usd: Some(7.0),
+                warn_at_percent: None,
+                allow_unpriced: None,
+                providers: Default::default(),
+            }),
+            ..priced_config()
+        };
+
+        let ai = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        let status = ai.usage().await.expect("usage").budget.expect("a budget");
+        assert_eq!(status.total.expect("a total cap").limit_microusd, 7_000_000);
+
+        ai.shutdown().await.expect("clean shutdown");
+    }
+
+    #[test]
+    fn an_invalid_budget_is_rejected_before_anything_is_spawned() {
+        let builder = ActonAI::builder()
+            .ollama("test")
+            .budget(Budget::usd(5.0).warn_at_percent(200));
+
+        assert!(builder.resolve_budget().is_err());
     }
 
     #[tokio::test]

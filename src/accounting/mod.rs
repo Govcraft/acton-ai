@@ -29,9 +29,46 @@
 //! bundled price list, because shipping vendor prices means shipping silently
 //! wrong ones the day they change. Absent pricing yields `None`, never
 //! `$0.00`. See [`pricing`] for the money representation.
+//!
+//! # Budgets
+//!
+//! A [`Budget`] turns those tallies into enforcement. Set one and every
+//! provider dispatch is preceded by a [`CheckBudget`] ask; once a cap is
+//! reached the prompt fails with
+//! [`ActonAIErrorKind::BudgetExceeded`](crate::error::ActonAIErrorKind::BudgetExceeded)
+//! instead of spending more.
+//!
+//! ```rust,ignore
+//! let ai = ActonAI::builder()
+//!     .anthropic_from_env()
+//!     .budget_usd(5.00)
+//!     .launch()
+//!     .await?;
+//! ```
+//!
+//! Two limits are worth stating plainly:
+//!
+//! - **A cap is a circuit breaker, not an exact meter.** The check is
+//!   pre-flight, so a request already in flight when the ceiling is crossed
+//!   still completes. Worst-case overshoot is one request per concurrent
+//!   prompt loop.
+//! - **Only the prompt loop is guarded.** Low-level callers that send an
+//!   [`LLMRequest`](crate::messages::LLMRequest) straight to a provider actor
+//!   bypass the check entirely. They can ask the accountant themselves with
+//!   [`CheckBudget`]; nothing in the provider enforces it for them.
+//!
+//! See [`budget`] for the fail-closed rules around unpriced usage.
 
 mod actor;
+pub mod budget;
 pub mod pricing;
 
+pub(crate) use actor::BudgetEventListener;
 pub use actor::{CostAccountant, GetUsage, ModelUsage, ProviderUsage, UsageSnapshot};
-pub use pricing::{dollars_per_mtok_to_microusd, CostBreakdown, ModelPricing, PricingTable};
+pub use budget::{
+    Budget, BudgetConfig, BudgetDecision, BudgetEvent, BudgetScope, BudgetStatus, CheckBudget,
+    ScopeStatus, DEFAULT_WARN_AT_PERCENT,
+};
+pub use pricing::{
+    dollars_per_mtok_to_microusd, dollars_to_microusd, CostBreakdown, ModelPricing, PricingTable,
+};

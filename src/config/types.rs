@@ -3,10 +3,11 @@
 //! This module provides types for defining multiple named LLM providers
 //! and sandbox settings in configuration files.
 
+use crate::error::ActonAIError;
 use crate::llm::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
 use crate::tools::sandbox::{HardeningMode, ProcessSandboxConfig};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -102,6 +103,104 @@ pub struct ActonAIConfig {
     /// `mcp__{server}__{tool}`.
     #[serde(default)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// Spending caps enforced before every provider dispatch.
+    ///
+    /// Corresponds to `[budget]` in TOML. A
+    /// [`Budget`](crate::accounting::Budget) set on the builder replaces this
+    /// section wholesale — there is no field-level merging.
+    #[serde(default)]
+    pub budget: Option<BudgetFileConfig>,
+}
+
+/// Spending caps loaded from `[budget]` in TOML.
+///
+/// Amounts are **dollars**, converted once at launch into the integer
+/// micro-USD everything downstream compares in.
+///
+/// ```toml
+/// [budget]
+/// total_usd = 5.00
+/// warn_at_percent = 80        # optional, default 80; 0 disables warnings
+/// allow_unpriced = false      # optional, default false
+///
+/// [budget.providers]
+/// claude = 2.00               # keyed by configured provider name
+/// ```
+///
+/// A budget requires priced providers: with `allow_unpriced` left false, a
+/// configured provider that has no `[providers.<name>.pricing]` fails the
+/// launch, because a cap that cannot see part of the spend is not a cap.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct BudgetFileConfig {
+    /// Process-wide cap in dollars, across every provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_usd: Option<f64>,
+
+    /// Warning threshold as a percentage of each cap. Defaults to
+    /// [`DEFAULT_WARN_AT_PERCENT`](crate::accounting::DEFAULT_WARN_AT_PERCENT);
+    /// `0` disables warnings without disabling enforcement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub warn_at_percent: Option<u8>,
+
+    /// Whether usage that cannot be priced counts as `$0` rather than
+    /// refusing the next request. Defaults to false.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_unpriced: Option<bool>,
+
+    /// Per-provider caps in dollars, keyed by configured provider name.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub providers: BTreeMap<String, f64>,
+}
+
+impl BudgetFileConfig {
+    /// Validates the section and converts dollars into integer micro-USD.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when a cap is negative or not finite,
+    /// when `warn_at_percent` exceeds 100, or when the section sets no cap at
+    /// all — an empty `[budget]` is far more likely to be a half-finished
+    /// edit than a deliberate request to limit nothing.
+    ///
+    /// ```rust
+    /// use acton_ai::config::BudgetFileConfig;
+    ///
+    /// let section: BudgetFileConfig = toml::from_str("total_usd = 5.0").unwrap();
+    /// assert_eq!(section.to_budget().unwrap().total_microusd(), Some(5_000_000));
+    ///
+    /// let empty = BudgetFileConfig::default();
+    /// assert!(empty.to_budget().is_err());
+    /// ```
+    pub fn to_budget(&self) -> Result<crate::accounting::BudgetConfig, ActonAIError> {
+        // Routed through the same builder the programmatic API uses, so both
+        // paths share one set of validation rules and one dollar boundary.
+        let mut budget = match self.total_usd {
+            Some(total) => crate::accounting::Budget::usd(total),
+            None => {
+                let (name, dollars) = self.providers.iter().next().ok_or_else(|| {
+                    ActonAIError::configuration(
+                        "budget",
+                        "the [budget] section sets no cap; add total_usd, or at least one entry \
+                         under [budget.providers]",
+                    )
+                })?;
+                crate::accounting::Budget::for_provider(name.clone(), *dollars)
+            }
+        };
+
+        for (name, dollars) in &self.providers {
+            budget = budget.provider(name.clone(), *dollars);
+        }
+        if let Some(percent) = self.warn_at_percent {
+            budget = budget.warn_at_percent(percent);
+        }
+        if self.allow_unpriced.unwrap_or(false) {
+            budget = budget.allow_unpriced();
+        }
+
+        budget.to_config()
+    }
 }
 
 /// Skills configuration loaded from `[skills]` in TOML.
@@ -175,6 +274,13 @@ impl ActonAIConfig {
     #[must_use]
     pub fn with_default_provider(mut self, name: impl Into<String>) -> Self {
         self.default_provider = Some(name.into());
+        self
+    }
+
+    /// Sets the `[budget]` section.
+    #[must_use]
+    pub fn with_budget(mut self, budget: BudgetFileConfig) -> Self {
+        self.budget = Some(budget);
         self
     }
 
@@ -1468,6 +1574,7 @@ max_execution_ms = 60000
             skills: None,
             context: None,
             mcp_servers: HashMap::new(),
+            budget: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1507,6 +1614,121 @@ model = "qwen2.5:7b"
 
         let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
         assert!(config.defaults.is_none());
+    }
+
+    // -------------------------------------------------------------------
+    // [budget]
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn budget_section_parses_in_full() {
+        let toml_str = r#"
+[budget]
+total_usd = 5.00
+warn_at_percent = 50
+allow_unpriced = true
+
+[budget.providers]
+claude = 2.00
+local = 0.25
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let budget = config.budget.expect("the [budget] section must parse");
+
+        assert_eq!(budget.total_usd, Some(5.00));
+        assert_eq!(budget.warn_at_percent, Some(50));
+        assert_eq!(budget.allow_unpriced, Some(true));
+        assert_eq!(budget.providers.get("claude"), Some(&2.00));
+        assert_eq!(budget.providers.get("local"), Some(&0.25));
+
+        let converted = budget.to_budget().expect("a valid budget");
+        assert_eq!(converted.total_microusd(), Some(5_000_000));
+        assert_eq!(converted.provider_limit("claude"), Some(2_000_000));
+        assert_eq!(converted.warn_at_percent(), 50);
+        assert!(converted.allow_unpriced());
+    }
+
+    #[test]
+    fn a_minimal_budget_section_takes_the_framework_defaults() {
+        let config: ActonAIConfig = toml::from_str("[budget]\ntotal_usd = 1.5\n").unwrap();
+        let budget = config.budget.expect("the section must parse").to_budget();
+        let budget = budget.expect("a lone total is a valid budget");
+
+        assert_eq!(budget.total_microusd(), Some(1_500_000));
+        assert_eq!(
+            budget.warn_at_percent(),
+            crate::accounting::DEFAULT_WARN_AT_PERCENT
+        );
+        assert!(!budget.allow_unpriced());
+    }
+
+    #[test]
+    fn a_budget_of_provider_caps_alone_needs_no_total() {
+        let toml_str = "[budget.providers]\nclaude = 2.0\n";
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let budget = config
+            .budget
+            .expect("the section must parse")
+            .to_budget()
+            .expect("per-provider caps alone are a budget");
+
+        assert_eq!(budget.total_microusd(), None);
+        assert_eq!(budget.provider_limit("claude"), Some(2_000_000));
+    }
+
+    #[test]
+    fn an_absent_budget_section_is_no_budget() {
+        let config: ActonAIConfig = toml::from_str("default_provider = \"claude\"").unwrap();
+
+        assert!(config.budget.is_none());
+    }
+
+    #[test]
+    fn an_empty_budget_section_is_rejected_at_conversion() {
+        // Far likelier a half-finished edit than a deliberate request to cap
+        // nothing, and silently capping nothing is the expensive reading.
+        let config: ActonAIConfig = toml::from_str("[budget]\n").unwrap();
+        let err = config
+            .budget
+            .expect("an empty table still parses")
+            .to_budget()
+            .expect_err("a budget with no cap is rejected");
+
+        assert!(err.is_configuration(), "err = {err}");
+    }
+
+    #[test]
+    fn invalid_budget_values_are_rejected_at_conversion() {
+        let negative: BudgetFileConfig = toml::from_str("total_usd = -1.0").unwrap();
+        assert!(negative.to_budget().is_err());
+
+        let over_full: BudgetFileConfig =
+            toml::from_str("total_usd = 1.0\nwarn_at_percent = 101").unwrap();
+        assert!(over_full.to_budget().is_err());
+
+        let bad_provider: BudgetFileConfig =
+            toml::from_str("[providers]\nclaude = -2.0\n").unwrap();
+        let err = bad_provider
+            .to_budget()
+            .expect_err("a negative provider cap is rejected");
+        assert!(err.to_string().contains("claude"), "err = {err}");
+    }
+
+    #[test]
+    fn budget_survives_a_serialization_round_trip() {
+        let config = ActonAIConfig::new().with_budget(BudgetFileConfig {
+            total_usd: Some(5.0),
+            warn_at_percent: Some(90),
+            allow_unpriced: None,
+            providers: [("claude".to_string(), 2.0)].into_iter().collect(),
+        });
+
+        let rendered = toml::to_string(&config).unwrap();
+        let parsed: ActonAIConfig = toml::from_str(&rendered).unwrap();
+
+        assert_eq!(parsed.budget, config.budget);
     }
 
     #[test]

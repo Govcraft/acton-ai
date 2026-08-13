@@ -39,6 +39,30 @@ const TOKENS_PER_MTOK: u128 = 1_000_000;
 /// read as "free", never wrap into an enormous positive rate.
 #[must_use]
 pub fn dollars_per_mtok_to_microusd(dollars: f64) -> u64 {
+    dollars_to_microusd(dollars)
+}
+
+/// Converts a dollar amount into integer micro-USD.
+///
+/// The same conversion [`dollars_per_mtok_to_microusd`] performs — the two
+/// differ only in what the number *means* (a rate there, an amount here), and
+/// sharing one implementation is what keeps a budget cap and the prices it is
+/// compared against rounding identically.
+///
+/// **Rounded to the nearest micro-USD**, not truncated: `5.55` dollars is
+/// `5_550_000` micro-USD, where truncating the inexact binary representation
+/// would lose a micro-dollar. Negative or non-finite input clamps to `0` —
+/// callers that must reject nonsense (budgets do) validate before converting.
+///
+/// ```rust
+/// use acton_ai::prelude::dollars_to_microusd;
+///
+/// assert_eq!(dollars_to_microusd(5.0), 5_000_000);
+/// assert_eq!(dollars_to_microusd(0.25), 250_000);
+/// assert_eq!(dollars_to_microusd(-1.0), 0);
+/// ```
+#[must_use]
+pub fn dollars_to_microusd(dollars: f64) -> u64 {
     if !dollars.is_finite() || dollars <= 0.0 {
         return 0;
     }
@@ -47,6 +71,18 @@ pub fn dollars_per_mtok_to_microusd(dollars: f64) -> u64 {
     #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
     let micro = (dollars * MICRO_USD_PER_USD as f64).round() as u128;
     u64::try_from(micro).unwrap_or(u64::MAX)
+}
+
+/// Renders integer micro-USD as dollars, for display only.
+///
+/// Lossy by construction, exactly as [`CostBreakdown::total_usd`] is: render
+/// with it, never accumulate with it.
+#[must_use]
+pub(crate) fn microusd_to_usd(microusd: u64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    {
+        microusd as f64 / MICRO_USD_PER_USD as f64
+    }
 }
 
 /// What one model costs, in integer micro-USD per million tokens.

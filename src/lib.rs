@@ -117,12 +117,13 @@ pub mod __private;
 pub mod prelude {
     // High-level API (recommended for most use cases)
     pub use crate::accounting::{
-        CostBreakdown, GetUsage, ModelPricing, ModelUsage, PricingTable, ProviderUsage,
-        UsageSnapshot,
+        dollars_to_microusd, Budget, BudgetConfig, BudgetDecision, BudgetEvent, BudgetScope,
+        BudgetStatus, CheckBudget, CostBreakdown, GetUsage, ModelPricing, ModelUsage, PricingTable,
+        ProviderUsage, ScopeStatus, UsageSnapshot, DEFAULT_WARN_AT_PERCENT,
     };
     pub use crate::config::{
-        ActonAIConfig, ActonAIDefaults, McpServerConfig, NamedProviderConfig, PricingFileConfig,
-        RateLimitFileConfig,
+        ActonAIConfig, ActonAIDefaults, BudgetFileConfig, McpServerConfig, NamedProviderConfig,
+        PricingFileConfig, RateLimitFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,

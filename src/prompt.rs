@@ -38,6 +38,7 @@
 //!     .await?;
 //! ```
 
+use crate::accounting::{BudgetDecision, CheckBudget};
 use crate::conversation::StreamToken;
 use crate::error::ActonAIError;
 use crate::extract::{
@@ -1035,6 +1036,13 @@ impl PromptBuilder {
             runtime.provider_handle()
         };
 
+        // Pre-flight budget state, resolved once. `None` when nothing is
+        // capped, which is what keeps the unbudgeted loop free of an ask.
+        let budget_accountant = runtime.budget_accountant().cloned();
+        let billed_provider = provider_name
+            .clone()
+            .unwrap_or_else(|| runtime.default_provider_name().to_string());
+
         // Build the initial messages
         let mut messages = Vec::new();
         if let Some(ref system) = system_prompt {
@@ -1091,6 +1099,13 @@ impl PromptBuilder {
                 return Err(ActonAIError::prompt_failed(format!(
                     "exceeded maximum tool rounds ({max_tool_rounds})",
                 )));
+            }
+
+            // Every round is a request that costs money, so every round is
+            // checked — the initial one, each tool round, and each
+            // structured-output nudge alike.
+            if let Some(ref accountant) = budget_accountant {
+                check_budget(accountant, &billed_provider).await?;
             }
 
             // Generate new IDs for this round
@@ -1508,6 +1523,50 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
             completion,
             result_container,
         }),
+    }
+}
+
+/// Asks the accountant whether one more request to `provider` may go out.
+///
+/// Called before every provider dispatch, so a refusal costs nothing beyond
+/// the round trip to a local actor. A denial names the scope that has to
+/// change; unpriced usage is reported as the configuration problem it is,
+/// naming the providers to price and the flag that accepts the blind spot.
+async fn check_budget(accountant: &ActorHandle, provider: &str) -> Result<(), ActonAIError> {
+    let decision = accountant
+        .ask(CheckBudget::for_provider(provider))
+        .await
+        .map_err(|e| {
+            ActonAIError::provider_error(format!(
+                "could not reach the cost accountant to check the budget: {e}"
+            ))
+        })?;
+
+    match decision {
+        BudgetDecision::Allowed => Ok(()),
+        BudgetDecision::Denied {
+            scope,
+            limit_microusd,
+            spent_microusd,
+        } => Err(ActonAIError::budget_exceeded(
+            scope,
+            limit_microusd,
+            spent_microusd,
+        )),
+        BudgetDecision::Unpriced { providers } => Err(ActonAIError::configuration(
+            "budget",
+            format!(
+                "a budget is set but provider(s) {} reported usage with no configured pricing, \
+                 so the cap cannot be trusted; add [providers.<name>.pricing] for them, or \
+                 accept the blind spot with Budget::allow_unpriced() / `allow_unpriced = true` \
+                 under [budget]",
+                providers
+                    .iter()
+                    .map(|name| format!("`{name}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
     }
 }
 
