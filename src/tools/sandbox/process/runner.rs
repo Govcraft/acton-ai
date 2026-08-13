@@ -194,9 +194,14 @@ fn apply_rlimits(cfg: &ProcessSandboxConfig) -> Result<(), String> {
     use rlimit::{setrlimit, Resource};
 
     if let Some(bytes) = cfg.memory_limit {
-        // RLIMIT_AS covers the full virtual-memory footprint on Linux. macOS
-        // honors it for most allocation paths; RLIMIT_DATA is an extra belt
-        // there but RLIMIT_AS alone is the portable baseline.
+        // RLIMIT_AS covers the full virtual-memory footprint on Linux and is
+        // enforced there, so failure to apply it is fatal. macOS rejects any
+        // finite RLIMIT_AS with EINVAL; RLIMIT_DATA is the closest knob it
+        // has and is applied best-effort — the wall-clock deadline remains
+        // the hard backstop on that platform.
+        #[cfg(target_os = "macos")]
+        let _ = setrlimit(Resource::DATA, bytes, bytes);
+        #[cfg(not(target_os = "macos"))]
         set_limit(Resource::AS, bytes, "RLIMIT_AS")?;
     }
     if let Some(secs) = cfg.cpu_limit_secs {
