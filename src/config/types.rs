@@ -449,6 +449,64 @@ pub struct NamedProviderConfig {
     /// When `None`, the global default applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context_window_tokens: Option<usize>,
+
+    /// What this provider's model costs, for usage-cost reporting.
+    ///
+    /// Optional and unset by default: no price list ships with the framework,
+    /// so a provider without this block has its tokens counted and its cost
+    /// reported as unknown rather than as zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pricing: Option<PricingFileConfig>,
+}
+
+/// Per-provider pricing, from `[providers.<name>.pricing]` in TOML.
+///
+/// Rates are **dollars per million tokens** — the unit every vendor pricing
+/// page prints, so a value can be copied across without arithmetic:
+///
+/// ```toml
+/// [providers.claude.pricing]
+/// input_per_mtok = 3.0
+/// output_per_mtok = 15.0
+/// cache_read_per_mtok = 0.30      # optional
+/// cache_creation_per_mtok = 3.75  # optional
+/// ```
+///
+/// These `f64`s are converted once, at load, into the integer micro-USD the
+/// accounting module computes in — floating point never reaches the
+/// arithmetic. Omitted cache rates price cache traffic as free rather than
+/// guessing a multiple of the input rate.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct PricingFileConfig {
+    /// Dollars per million uncached input tokens.
+    pub input_per_mtok: f64,
+    /// Dollars per million output tokens.
+    pub output_per_mtok: f64,
+    /// Dollars per million cache-read input tokens. Defaults to free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_per_mtok: Option<f64>,
+    /// Dollars per million cache-written input tokens. Defaults to free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_per_mtok: Option<f64>,
+}
+
+impl PricingFileConfig {
+    /// Converts vendor-quoted dollars into the integer micro-USD rates the
+    /// accountant prices with. This is the one and only float boundary.
+    #[must_use]
+    pub fn to_model_pricing(&self) -> crate::accounting::ModelPricing {
+        let mut pricing = crate::accounting::ModelPricing::from_dollars_per_mtok(
+            self.input_per_mtok,
+            self.output_per_mtok,
+        );
+        if let Some(rate) = self.cache_read_per_mtok {
+            pricing = pricing.with_cache_read_per_mtok(rate);
+        }
+        if let Some(rate) = self.cache_creation_per_mtok {
+            pricing = pricing.with_cache_creation_per_mtok(rate);
+        }
+        pricing
+    }
 }
 
 impl NamedProviderConfig {
@@ -472,6 +530,7 @@ impl NamedProviderConfig {
             seed: None,
             stop_sequences: None,
             context_window_tokens: None,
+            pricing: None,
         }
     }
 
@@ -495,6 +554,7 @@ impl NamedProviderConfig {
             seed: None,
             stop_sequences: None,
             context_window_tokens: None,
+            pricing: None,
         }
     }
 
@@ -521,6 +581,7 @@ impl NamedProviderConfig {
             seed: None,
             stop_sequences: None,
             context_window_tokens: None,
+            pricing: None,
         }
     }
 
@@ -724,6 +785,7 @@ impl NamedProviderConfig {
 /// ```toml
 /// [defaults]
 /// max_tool_rounds = 20
+/// usage_tracking = true
 /// ```
 ///
 /// These values seed every `PromptBuilder` created through the runtime.
@@ -737,6 +799,15 @@ pub struct ActonAIDefaults {
     /// is used.
     #[serde(default)]
     pub max_tool_rounds: Option<usize>,
+
+    /// Whether to tally token usage. **On when unset.**
+    ///
+    /// Turning it off stops the runtime spawning the cost accountant, after
+    /// which [`ActonAI::usage`](crate::facade::ActonAI::usage) returns a
+    /// configuration error rather than an empty snapshot — zeros would read
+    /// as "spent nothing".
+    #[serde(default)]
+    pub usage_tracking: Option<bool>,
 }
 
 impl ActonAIDefaults {
@@ -750,6 +821,13 @@ impl ActonAIDefaults {
     #[must_use]
     pub fn with_max_tool_rounds(mut self, max: usize) -> Self {
         self.max_tool_rounds = Some(max);
+        self
+    }
+
+    /// Sets whether usage tracking is enabled.
+    #[must_use]
+    pub fn with_usage_tracking(mut self, enabled: bool) -> Self {
+        self.usage_tracking = Some(enabled);
         self
     }
 }
@@ -1454,6 +1532,118 @@ max_tool_rounds = 25
         let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
         let defaults = config.defaults.expect("defaults block should parse");
         assert!(defaults.max_tool_rounds.is_none());
+    }
+
+    #[test]
+    fn defaults_parses_usage_tracking() {
+        let toml = r#"
+usage_tracking = false
+"#;
+        let defaults: ActonAIDefaults = toml::from_str(toml).unwrap();
+
+        assert_eq!(defaults.usage_tracking, Some(false));
+    }
+
+    #[test]
+    fn defaults_leaves_usage_tracking_unset_when_absent() {
+        // `None` is not `Some(false)`: it means "this file has no opinion",
+        // which is what lets the framework default (on) and an explicit
+        // builder call both still apply.
+        let defaults: ActonAIDefaults = toml::from_str("max_tool_rounds = 5").unwrap();
+
+        assert!(defaults.usage_tracking.is_none());
+    }
+
+    #[test]
+    fn defaults_builder_sets_usage_tracking() {
+        assert_eq!(
+            ActonAIDefaults::new().with_usage_tracking(false).usage_tracking,
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn provider_pricing_parses_from_toml() {
+        let toml = r#"
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+
+[pricing]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+cache_read_per_mtok = 0.30
+cache_creation_per_mtok = 3.75
+"#;
+        let provider: NamedProviderConfig = toml::from_str(toml).unwrap();
+
+        let pricing = provider.pricing.expect("the pricing block must parse");
+        assert!((pricing.input_per_mtok - 3.0).abs() < f64::EPSILON);
+        assert!((pricing.output_per_mtok - 15.0).abs() < f64::EPSILON);
+        assert_eq!(pricing.cache_read_per_mtok, Some(0.30));
+        assert_eq!(pricing.cache_creation_per_mtok, Some(3.75));
+    }
+
+    #[test]
+    fn provider_pricing_is_optional() {
+        let toml = r#"
+type = "ollama"
+model = "qwen2.5:7b"
+"#;
+        let provider: NamedProviderConfig = toml::from_str(toml).unwrap();
+
+        assert!(
+            provider.pricing.is_none(),
+            "a provider without pricing is a supported configuration"
+        );
+    }
+
+    #[test]
+    fn provider_pricing_cache_rates_are_optional() {
+        let toml = r#"
+type = "openai"
+model = "gpt-4o"
+
+[pricing]
+input_per_mtok = 2.5
+output_per_mtok = 10.0
+"#;
+        let provider: NamedProviderConfig = toml::from_str(toml).unwrap();
+
+        let pricing = provider.pricing.unwrap();
+        assert!(pricing.cache_read_per_mtok.is_none());
+        assert!(pricing.cache_creation_per_mtok.is_none());
+    }
+
+    #[test]
+    fn provider_pricing_converts_dollars_to_integer_microusd() {
+        let pricing = PricingFileConfig {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: Some(0.30),
+            cache_creation_per_mtok: Some(3.75),
+        };
+
+        let model_pricing = pricing.to_model_pricing();
+
+        assert_eq!(model_pricing.input_per_mtok_microusd, 3_000_000);
+        assert_eq!(model_pricing.output_per_mtok_microusd, 15_000_000);
+        assert_eq!(model_pricing.cache_read_per_mtok_microusd, 300_000);
+        assert_eq!(model_pricing.cache_creation_per_mtok_microusd, 3_750_000);
+    }
+
+    #[test]
+    fn omitted_cache_rates_convert_to_free() {
+        let pricing = PricingFileConfig {
+            input_per_mtok: 3.0,
+            output_per_mtok: 15.0,
+            cache_read_per_mtok: None,
+            cache_creation_per_mtok: None,
+        };
+
+        let model_pricing = pricing.to_model_pricing();
+
+        assert_eq!(model_pricing.cache_read_per_mtok_microusd, 0);
+        assert_eq!(model_pricing.cache_creation_per_mtok_microusd, 0);
     }
 
     #[test]

@@ -77,6 +77,7 @@ use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::llm::{LLMProvider, ProviderConfig};
 use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::messages::Message;
+use crate::accounting::{GetUsage, PricingTable, UsageSnapshot};
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
 use crate::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
@@ -161,6 +162,12 @@ pub(crate) struct ActonAIInner {
     /// `None` means unbounded history (explicit opt-out via
     /// [`ActonAIBuilder::without_context_window`]).
     pub(crate) context_window: Option<crate::memory::ContextWindow>,
+    /// Handle to the cost accountant, when usage tracking is enabled.
+    ///
+    /// `None` means tracking was switched off, which
+    /// [`ActonAI::usage`] reports as a configuration error rather than as an
+    /// empty snapshot — zeros would read as "spent nothing".
+    pub(crate) accountant: Option<ActorHandle>,
     /// Tools contributed by configured MCP servers, and the supervised actors
     /// owning their connections.
     ///
@@ -200,6 +207,7 @@ impl std::fmt::Debug for ActonAI {
                 "default_max_tool_rounds",
                 &self.inner.default_max_tool_rounds,
             )
+            .field("usage_tracking", &self.inner.accountant.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -342,6 +350,51 @@ impl ActonAI {
     #[must_use]
     pub fn is_shutdown(&self) -> bool {
         self.inner.is_shutdown.load(Ordering::SeqCst)
+    }
+
+    /// Returns whether usage tracking is enabled for this runtime.
+    #[must_use]
+    pub fn is_usage_tracking(&self) -> bool {
+        self.inner.accountant.is_some()
+    }
+
+    /// Returns a snapshot of the tokens — and, where pricing is configured,
+    /// the cost — every provider in this runtime has accumulated.
+    ///
+    /// Taking a snapshot neither resets the totals nor pauses tallying.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when usage tracking was switched off
+    /// with [`ActonAIBuilder::usage_tracking`] or `usage_tracking = false`.
+    /// It is deliberately not an empty snapshot: a wall of zeros would be
+    /// indistinguishable from a runtime that genuinely spent nothing.
+    ///
+    /// Returns a provider error if the accountant cannot be reached, which
+    /// in practice means the runtime is shutting down.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let usage = ai.usage().await?;
+    /// println!("{} requests, {} tokens", usage.requests, usage.totals.total_tokens());
+    /// if let Some(usd) = usage.total_usd() {
+    ///     println!("about ${usd:.4}");
+    /// }
+    /// ```
+    pub async fn usage(&self) -> Result<UsageSnapshot, ActonAIError> {
+        let Some(accountant) = self.inner.accountant.as_ref() else {
+            return Err(ActonAIError::configuration(
+                "usage_tracking",
+                "usage tracking is disabled, so no usage was recorded; enable it with \
+                 ActonAIBuilder::usage_tracking(true) or `usage_tracking = true` under \
+                 [defaults] in your config file",
+            ));
+        };
+
+        accountant.ask(GetUsage).await.map_err(|e| {
+            ActonAIError::provider_error(format!("could not reach the cost accountant: {e}"))
+        })
     }
 
     /// Returns a reference to the built-in tools, if enabled.
@@ -644,6 +697,16 @@ pub struct ActonAIBuilder {
     /// and by `[mcp_servers.*]` in TOML. Each becomes one supervised
     /// connection actor at launch.
     mcp_servers: HashMap<String, crate::config::McpServerConfig>,
+    /// Whether to spawn the cost accountant at launch.
+    ///
+    /// `None` means "not decided here", which lets `[defaults]
+    /// usage_tracking` speak; the framework default when neither does is
+    /// **on**. Builder beats TOML beats default, matching `max_tool_rounds`.
+    usage_tracking: Option<bool>,
+    /// Pricing per configured provider, collected from
+    /// `[providers.<name>.pricing]` and converted to integer micro-USD at
+    /// load. Empty when nothing is priced, which is a supported state.
+    pricing: PricingTable,
 }
 
 impl ActonAIBuilder {
@@ -724,6 +787,32 @@ impl ActonAIBuilder {
     #[must_use]
     pub fn max_tool_rounds(mut self, max: usize) -> Self {
         self.default_max_tool_rounds = Some(max);
+        self
+    }
+
+    /// Enables or disables token-usage tracking. **Enabled by default.**
+    ///
+    /// When enabled the runtime spawns a cost accountant that tallies the
+    /// usage every provider broadcasts, readable through
+    /// [`ActonAI::usage`]. When disabled that actor is simply not spawned —
+    /// providers still broadcast, since with no subscriber a broadcast costs
+    /// nothing — and `usage()` returns a configuration error.
+    ///
+    /// Takes precedence over `usage_tracking` under `[defaults]` in a config
+    /// file.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .ollama("qwen2.5:7b")
+    ///     .usage_tracking(false)  // opt out
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn usage_tracking(mut self, enabled: bool) -> Self {
+        self.usage_tracking = Some(enabled);
         self
     }
 
@@ -829,6 +918,11 @@ impl ActonAIBuilder {
                 self.context_window_per_provider
                     .insert(name.clone(), tokens);
             }
+            // Dollars become integer micro-USD here, once, at the config
+            // boundary — every figure computed downstream is integer.
+            if let Some(ref pricing) = provider_config.pricing {
+                self.pricing.insert(name.clone(), pricing.to_model_pricing());
+            }
             let runtime_config = provider_config.to_provider_config();
             self.providers.insert(name, runtime_config);
         }
@@ -845,9 +939,12 @@ impl ActonAIBuilder {
 
         // Apply [defaults] block — only if the builder hasn't been given an
         // explicit override already. Builder > config, constant is the floor.
-        if self.default_max_tool_rounds.is_none() {
-            if let Some(defaults) = config.defaults {
+        if let Some(defaults) = config.defaults {
+            if self.default_max_tool_rounds.is_none() {
                 self.default_max_tool_rounds = defaults.max_tool_rounds;
+            }
+            if self.usage_tracking.is_none() {
+                self.usage_tracking = defaults.usage_tracking;
             }
         }
 
@@ -1416,6 +1513,19 @@ impl ActonAIBuilder {
             Some(tools)
         };
 
+        // Tracking is on unless something explicitly turned it off. The
+        // accountant is a plain top-level actor: no IO, no connection, so
+        // nothing for supervision to repair — and a restart would zero the
+        // very totals it exists to keep.
+        let accountant = if self.usage_tracking.unwrap_or(true) {
+            let handle = crate::accounting::CostAccountant::spawn(&mut runtime, self.pricing).await;
+            tracing::debug!("usage tracking enabled");
+            Some(handle)
+        } else {
+            tracing::debug!("usage tracking disabled; ActonAI::usage() will report as much");
+            None
+        };
+
         let context_window = resolve_context_window(
             self.context_window_override.take(),
             self.context_window_disabled,
@@ -1437,6 +1547,7 @@ impl ActonAIBuilder {
                 sandbox_factory,
                 default_max_tool_rounds,
                 context_window,
+                accountant,
                 mcp,
                 is_shutdown: AtomicBool::new(false),
             }),

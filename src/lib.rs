@@ -60,6 +60,7 @@
 //! }
 //! ```
 
+pub mod accounting;
 pub mod agent;
 pub mod cli;
 pub mod config;
@@ -115,8 +116,13 @@ pub mod __private;
 /// Prelude module for convenient imports
 pub mod prelude {
     // High-level API (recommended for most use cases)
+    pub use crate::accounting::{
+        CostBreakdown, GetUsage, ModelPricing, ModelUsage, PricingTable, ProviderUsage,
+        UsageSnapshot,
+    };
     pub use crate::config::{
-        ActonAIConfig, ActonAIDefaults, McpServerConfig, NamedProviderConfig, RateLimitFileConfig,
+        ActonAIConfig, ActonAIDefaults, McpServerConfig, NamedProviderConfig, PricingFileConfig,
+        RateLimitFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,

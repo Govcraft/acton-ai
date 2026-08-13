@@ -313,6 +313,19 @@ pub async fn runtime_pointed_at(server: &MockServer, app_name: &str) -> ActonAI 
         .expect("launching the runtime must succeed")
 }
 
+/// Renders a `[providers.<name>]` TOML block pointing at `server`.
+///
+/// Tests that need real TOML parsing — pricing especially, where the whole
+/// point is that dollars survive the round trip from a config file — build
+/// their config from these blocks rather than constructing config structs by
+/// hand.
+pub fn provider_toml(name: &str, server: &MockServer, model: &str) -> String {
+    format!(
+        "[providers.{name}]\ntype = \"openai\"\nmodel = \"{model}\"\nbase_url = \"{}\"\n",
+        server.base_url
+    )
+}
+
 /// Finds a named tool's entry in a recorded request body.
 pub fn tool_named<'a>(request: &'a Value, name: &str) -> Option<&'a Value> {
     request
@@ -369,6 +382,30 @@ fn scripted_rounds_render_the_wire_shape_the_client_parses() {
     let plain = Round::text("hi").with_usage(7, 8).to_sse();
     assert!(plain.contains(r#""prompt_tokens":7"#), "{plain}");
     assert!(plain.ends_with("data: [DONE]\n\n"), "the stream must terminate");
+}
+
+/// Pins the TOML this harness renders, and that it round-trips through the
+/// real config parser back to the address the server is actually listening on.
+///
+/// Suites that build a runtime from a config file depend on both halves; this
+/// is what notices if either drifts.
+#[tokio::test]
+async fn rendered_provider_toml_round_trips_through_the_config_parser() {
+    let server = MockServer::start(vec![Round::text("unused")]).await;
+
+    let toml = provider_toml("claude", &server, "sonnet-mock");
+    let config = acton_ai::config::from_str(&toml).expect("the rendered TOML must parse");
+
+    let provider = config
+        .providers
+        .get("claude")
+        .expect("the provider must be keyed by the name it was given");
+    assert_eq!(provider.model, "sonnet-mock");
+    assert_eq!(
+        provider.base_url.as_deref(),
+        Some(server.base_url.as_str()),
+        "the block must point at the port this server actually bound"
+    );
 }
 
 /// Recursively reports whether any `$ref` appears in a JSON value.

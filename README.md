@@ -37,6 +37,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Two API levels** — Simple facade for common cases, full actor access for advanced control
 - **TOML configuration** — Define providers and settings in config files
 - **Process sandboxing** — Portable subprocess isolation for tool execution with rlimits, timeouts, and optional Linux hardening (landlock + seccomp)
+- **Usage & cost tracking** — Token usage from every provider tallied per provider and model, priced from your own rate table; on by default
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -500,6 +501,8 @@ ActonAI (Facade)
     │       ├── ToolRegistry ───── Tool registration and execution
     │       │
     │       ├── MemoryStore ───── Persistent sessions, memories, embeddings
+    │       │
+    │       ├── CostAccountant ── Tallies broadcast usage reports, prices snapshots
     │       │
     │       └── McpSupervisor ─── One supervised actor per MCP server connection
     │
