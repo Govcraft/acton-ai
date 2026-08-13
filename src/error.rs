@@ -193,7 +193,12 @@ pub struct ActonAIError {
 }
 
 /// Specific high-level API error types.
+///
+/// Marked `#[non_exhaustive]`: new capabilities add new failure kinds (the
+/// `Mcp` variant arrived with MCP client support), so downstream `match`es
+/// must carry a wildcard arm rather than breaking on every addition.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum ActonAIErrorKind {
     /// Configuration error during builder setup
     Configuration {
