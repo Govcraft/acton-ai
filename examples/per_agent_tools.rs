@@ -170,7 +170,7 @@ async fn main() -> anyhow::Result<()> {
         .to_provider_config()
         .with_timeout(Duration::from_secs(120))
         .with_max_tokens(512);
-    let _provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
+    let _provider_handle = LLMProvider::spawn(&mut runtime, "default", provider_config).await;
 
     // Spawn the FileReader agent with its configured tools
     println!(

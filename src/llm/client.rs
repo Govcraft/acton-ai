@@ -6,7 +6,7 @@
 
 use crate::llm::config::SamplingParams;
 use crate::llm::error::LLMError;
-use crate::messages::{Message, StopReason, ToolCall, ToolChoice, ToolDefinition};
+use crate::messages::{Message, StopReason, ToolCall, ToolChoice, ToolDefinition, Usage};
 use async_trait::async_trait;
 use futures::Stream;
 use std::pin::Pin;
@@ -33,6 +33,12 @@ pub enum LLMStreamEvent {
     End {
         /// The reason the stream ended
         stop_reason: StopReason,
+        /// Token usage the provider reported for this stream.
+        ///
+        /// [`Usage::default()`] when the provider reported none — an
+        /// OpenAI-compatible server that ignores `stream_options`, for
+        /// instance. Absent usage degrades, it never errors.
+        usage: Usage,
     },
     /// An error occurred during streaming
     Error {
@@ -52,6 +58,10 @@ pub struct LLMClientResponse {
     pub tool_calls: Vec<ToolCall>,
     /// The reason the model stopped generating
     pub stop_reason: StopReason,
+    /// Token usage the provider reported for this request.
+    ///
+    /// [`Usage::default()`] when the provider reported none.
+    pub usage: Usage,
 }
 
 /// Type alias for boxed stream of LLM events.
@@ -160,6 +170,7 @@ mod tests {
             content: "Hello".to_string(),
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
         };
         let debug_str = format!("{:?}", response);
         assert!(debug_str.contains("Hello"));
@@ -172,10 +183,17 @@ mod tests {
             content: "Hello".to_string(),
             tool_calls: vec![],
             stop_reason: StopReason::EndTurn,
+            usage: Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+                ..Usage::default()
+            },
         };
         let cloned = response.clone();
         assert_eq!(cloned.content, "Hello");
         assert_eq!(cloned.stop_reason, StopReason::EndTurn);
+        assert_eq!(cloned.usage.input_tokens, 3);
+        assert_eq!(cloned.usage.output_tokens, 4);
     }
 
     #[test]
@@ -195,11 +213,15 @@ mod tests {
     fn llm_stream_event_end_variant() {
         let event = LLMStreamEvent::End {
             stop_reason: StopReason::ToolUse,
+            usage: Usage {
+                output_tokens: 12,
+                ..Usage::default()
+            },
         };
         assert!(matches!(
             event,
-            LLMStreamEvent::End { stop_reason }
-            if stop_reason == StopReason::ToolUse
+            LLMStreamEvent::End { stop_reason, usage }
+            if stop_reason == StopReason::ToolUse && usage.output_tokens == 12
         ));
     }
 

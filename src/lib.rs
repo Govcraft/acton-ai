@@ -50,7 +50,7 @@
 //! async fn main() {
 //!     let mut app = ActonApp::launch_async().await;
 //!
-//!     let provider = LLMProvider::spawn(&mut app, ProviderConfig::ollama("qwen2.5:7b")).await;
+//!     let provider = LLMProvider::spawn(&mut app, "default", ProviderConfig::ollama("qwen2.5:7b")).await;
 //!
 //!     let mut agent = Agent::create(&mut app);
 //!     let agent_handle = agent.start().await;

@@ -146,7 +146,7 @@ async fn main() -> anyhow::Result<()> {
     let _collector_handle = collector.start().await;
 
     // Create and start the LLM provider
-    let provider_handle = LLMProvider::spawn(&mut runtime, provider_config).await;
+    let provider_handle = LLMProvider::spawn(&mut runtime, "default", provider_config).await;
 
     tracing::info!("Sending prompt...");
 

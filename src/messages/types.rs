@@ -500,6 +500,112 @@ pub struct LLMStreamEnd {
     pub correlation_id: CorrelationId,
     /// The reason the stream ended
     pub stop_reason: StopReason,
+    /// Token usage the provider reported for this round.
+    ///
+    /// [`Usage::default()`] (all zeros) when the provider reported nothing —
+    /// absent usage is never an error, so a zeroed value means "not reported",
+    /// not "nothing was spent".
+    pub usage: Usage,
+}
+
+// =============================================================================
+// Token Usage
+// =============================================================================
+
+/// Token counts reported by a provider for one request.
+///
+/// This is the framework's single canonical usage type; each client converts
+/// its own wire shape into it. Fields a provider does not report stay `0` —
+/// a zeroed `Usage` means "the provider told us nothing", not "no tokens were
+/// spent", so never render it as a definitive figure.
+///
+/// `input_tokens` counts **uncached** input only, matching Anthropic's wire
+/// semantics. The OpenAI client subtracts `cached_tokens` from `prompt_tokens`
+/// so both providers agree, which keeps per-rate cost arithmetic uniform.
+///
+/// Deliberately not `#[non_exhaustive]`: tests and callers legitimately
+/// construct it. New fields may still arrive in a minor bump of this 0.x
+/// crate, so prefer `..Usage::default()` when constructing it literally.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Usage {
+    /// Uncached input (prompt) tokens.
+    pub input_tokens: u64,
+    /// Generated output (completion) tokens.
+    pub output_tokens: u64,
+    /// Input tokens served from a prompt cache. `0` when unreported.
+    pub cache_read_tokens: u64,
+    /// Input tokens written into a prompt cache. `0` when unreported.
+    pub cache_creation_tokens: u64,
+}
+
+impl Usage {
+    /// Returns true when every counter is zero, i.e. the provider reported
+    /// nothing usable.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.input_tokens == 0
+            && self.output_tokens == 0
+            && self.cache_read_tokens == 0
+            && self.cache_creation_tokens == 0
+    }
+
+    /// Total tokens across every counter.
+    #[must_use]
+    pub const fn total_tokens(&self) -> u64 {
+        self.input_tokens
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.cache_read_tokens)
+            .saturating_add(self.cache_creation_tokens)
+    }
+}
+
+impl core::ops::Add for Usage {
+    type Output = Self;
+
+    fn add(self, rhs: Self) -> Self {
+        Self {
+            input_tokens: self.input_tokens.saturating_add(rhs.input_tokens),
+            output_tokens: self.output_tokens.saturating_add(rhs.output_tokens),
+            cache_read_tokens: self.cache_read_tokens.saturating_add(rhs.cache_read_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_add(rhs.cache_creation_tokens),
+        }
+    }
+}
+
+impl core::ops::AddAssign for Usage {
+    fn add_assign(&mut self, rhs: Self) {
+        *self = *self + rhs;
+    }
+}
+
+impl core::iter::Sum for Usage {
+    fn sum<I: Iterator<Item = Self>>(iter: I) -> Self {
+        iter.fold(Self::default(), |acc, usage| acc + usage)
+    }
+}
+
+/// Broadcast whenever a provider finishes a request, successful or not.
+///
+/// Providers publish this unconditionally: it is a tiny message, and with no
+/// subscriber a broadcast is a no-op. Whether anything tallies it is decided
+/// by [`ActonAIBuilder::usage_tracking`](crate::facade::ActonAIBuilder::usage_tracking),
+/// which governs only whether the accountant actor exists.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct UsageReport {
+    /// The **configured** provider name — the key under which the runtime
+    /// registered it, not the vendor (`"claude"`, not `"anthropic"`).
+    pub provider: String,
+    /// The model that served the request.
+    pub model: String,
+    /// Correlation ID of the request this usage belongs to.
+    pub correlation_id: CorrelationId,
+    /// The agent that made the request.
+    pub agent_id: AgentId,
+    /// What the provider reported. May be [`Usage::default()`].
+    pub usage: Usage,
 }
 
 /// Result of executing a tool call, broadcast after `PromptBuilder::collect`
@@ -719,6 +825,79 @@ impl IncomingTask {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `Usage` with a distinct value in every field, so a fold that drops or
+    /// crosses a field is visible in the assertion.
+    fn usage(input: u64, output: u64, read: u64, creation: u64) -> Usage {
+        Usage {
+            input_tokens: input,
+            output_tokens: output,
+            cache_read_tokens: read,
+            cache_creation_tokens: creation,
+        }
+    }
+
+    #[test]
+    fn usage_default_is_all_zeros() {
+        assert_eq!(Usage::default(), usage(0, 0, 0, 0));
+        assert!(Usage::default().is_empty());
+    }
+
+    #[test]
+    fn usage_add_sums_each_field_independently() {
+        let total = usage(1, 2, 3, 4) + usage(10, 20, 30, 40);
+
+        assert_eq!(total, usage(11, 22, 33, 44));
+    }
+
+    #[test]
+    fn usage_add_assign_accumulates_in_place() {
+        let mut total = Usage::default();
+
+        total += usage(1, 2, 3, 4);
+        total += usage(10, 20, 30, 40);
+
+        assert_eq!(total, usage(11, 22, 33, 44));
+    }
+
+    #[test]
+    fn usage_add_saturates_instead_of_overflowing() {
+        let max = usage(u64::MAX, u64::MAX, u64::MAX, u64::MAX);
+
+        assert_eq!(max + usage(1, 1, 1, 1), max);
+    }
+
+    #[test]
+    fn usage_sums_over_an_iterator() {
+        let rounds = vec![usage(1, 2, 0, 0), usage(3, 4, 0, 0), usage(5, 6, 0, 0)];
+
+        let total: Usage = rounds.into_iter().sum();
+
+        assert_eq!(total, usage(9, 12, 0, 0));
+    }
+
+    #[test]
+    fn usage_total_tokens_counts_every_field() {
+        assert_eq!(usage(1, 2, 3, 4).total_tokens(), 10);
+    }
+
+    #[test]
+    fn usage_is_empty_only_when_every_field_is_zero() {
+        assert!(!usage(0, 0, 0, 1).is_empty());
+        assert!(!usage(0, 0, 1, 0).is_empty());
+        assert!(!usage(0, 1, 0, 0).is_empty());
+        assert!(!usage(1, 0, 0, 0).is_empty());
+    }
+
+    #[test]
+    fn usage_round_trips_through_json() {
+        let original = usage(7, 8, 9, 10);
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: Usage = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(original, parsed);
+    }
 
     #[test]
     fn user_prompt_creates_correlation_id() {

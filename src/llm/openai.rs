@@ -6,7 +6,9 @@
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
 use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
-use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition};
+use crate::messages::{
+    Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition, Usage,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -40,6 +42,12 @@ struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     tool_choice: Option<serde_json::Value>,
     stream: bool,
+    /// Only ever set on streaming requests, where it asks the server to send
+    /// a final usage chunk. Omitted entirely otherwise — non-streaming
+    /// responses carry `usage` unconditionally, and some OpenAI-compatible
+    /// servers reject the key on a non-streaming call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -52,6 +60,60 @@ struct ChatCompletionRequest {
     seed: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     stop: Option<Vec<String>>,
+}
+
+/// Streaming-only options block.
+///
+/// `include_usage` asks the server to append a final chunk carrying `usage`
+/// and an **empty** `choices` array. Servers that do not implement
+/// `stream_options` ignore the key, which is why absent usage has to degrade
+/// to [`Usage::default()`] rather than erroring.
+#[derive(Debug, Clone, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// Usage as it appears on the OpenAI wire.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct OpenAIUsage {
+    #[serde(default)]
+    prompt_tokens: u64,
+    #[serde(default)]
+    completion_tokens: u64,
+    #[serde(default)]
+    prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// Breakdown of `prompt_tokens`. Only OpenAI proper reports this; compatible
+/// servers usually omit it.
+#[derive(Debug, Clone, Default, Deserialize)]
+struct PromptTokensDetails {
+    #[serde(default)]
+    cached_tokens: u64,
+}
+
+impl OpenAIUsage {
+    /// Converts to the canonical [`Usage`].
+    ///
+    /// OpenAI's `prompt_tokens` is *inclusive* of cached tokens, whereas
+    /// Anthropic's `input_tokens` excludes them. The cached count is
+    /// subtracted here so `Usage::input_tokens` means the same thing for both
+    /// providers — which is what lets the pricing table apply one input rate
+    /// and one cache-read rate without knowing the vendor.
+    fn to_usage(&self) -> Usage {
+        let cache_read = self
+            .prompt_tokens_details
+            .as_ref()
+            .map_or(0, |details| details.cached_tokens);
+
+        Usage {
+            input_tokens: self.prompt_tokens.saturating_sub(cache_read),
+            output_tokens: self.completion_tokens,
+            cache_read_tokens: cache_read,
+            // OpenAI-compatible servers do not report cache writes.
+            cache_creation_tokens: 0,
+        }
+    }
 }
 
 /// A message in OpenAI format.
@@ -104,6 +166,8 @@ struct ChatCompletionResponse {
     #[allow(dead_code)]
     id: String,
     choices: Vec<ChatCompletionChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
 }
 
 /// A choice in the response.
@@ -119,7 +183,12 @@ struct ChatCompletionChoice {
 #[derive(Debug, Clone, Deserialize)]
 struct ChatCompletionChunk {
     id: String,
+    /// Empty on the final usage chunk when `stream_options.include_usage` is
+    /// set — the parser must tolerate that rather than index `choices[0]`.
+    #[serde(default)]
     choices: Vec<ChatCompletionChunkChoice>,
+    #[serde(default)]
+    usage: Option<OpenAIUsage>,
 }
 
 /// A choice in a streaming chunk.
@@ -442,6 +511,7 @@ impl LLMClient for OpenAIClient {
             tools: tools.map(|t| self.convert_tools(t)),
             tool_choice: tool_choice.map(Self::convert_tool_choice),
             stream: false,
+            stream_options: None,
             temperature: sampling.and_then(|s| s.temperature),
             top_p: sampling.and_then(|s| s.top_p),
             frequency_penalty: sampling.and_then(|s| s.frequency_penalty),
@@ -504,6 +574,7 @@ impl LLMClient for OpenAIClient {
             content,
             tool_calls,
             stop_reason,
+            usage: completion.usage.map(|u| u.to_usage()).unwrap_or_default(),
         })
     }
 
@@ -525,6 +596,9 @@ impl LLMClient for OpenAIClient {
             tools: tools.map(|t| self.convert_tools(t)),
             tool_choice: tool_choice.map(Self::convert_tool_choice),
             stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
             temperature: sampling.and_then(|s| s.temperature),
             top_p: sampling.and_then(|s| s.top_p),
             frequency_penalty: sampling.and_then(|s| s.frequency_penalty),
@@ -552,6 +626,18 @@ impl LLMClient for OpenAIClient {
             stream: S,
             tool_accumulators: HashMap<usize, ToolCallAccumulator>,
             pending_events: VecDeque<Result<LLMStreamEvent, LLMError>>,
+            /// Usage from the final `stream_options` chunk, if the server
+            /// sends one. Stays default when it does not.
+            usage: Usage,
+            /// The round's stop reason, held back until usage can ride with
+            /// it. OpenAI sends the usage chunk *after* the chunk carrying
+            /// `finish_reason`, so emitting `End` on sight of the finish
+            /// reason would publish a round whose usage had not arrived yet.
+            pending_end: Option<StopReason>,
+            /// Set by the `data: [DONE]` sentinel, which is the last thing on
+            /// the wire and therefore the cue to release `pending_end`
+            /// without waiting for the socket to close.
+            saw_done: bool,
         }
 
         let event_stream = futures::stream::unfold(
@@ -559,6 +645,9 @@ impl LLMClient for OpenAIClient {
                 stream,
                 tool_accumulators: HashMap::new(),
                 pending_events: VecDeque::new(),
+                usage: Usage::default(),
+                pending_end: None,
+                saw_done: false,
             },
             |mut state| async move {
                 loop {
@@ -567,8 +656,14 @@ impl LLMClient for OpenAIClient {
                         return Some((event, state));
                     }
 
-                    // Get next chunk from stream
-                    let result = state.stream.next().await?;
+                    // Get next chunk from stream. A stream that ends
+                    // without a `[DONE]` sentinel still has to close its
+                    // round, so flush any held terminal event first.
+                    let Some(result) = state.stream.next().await else {
+                        let stop_reason = state.pending_end.take()?;
+                        let usage = state.usage;
+                        return Some((Ok(LLMStreamEvent::End { stop_reason, usage }), state));
+                    };
 
                     match result {
                         Ok(bytes) => {
@@ -576,12 +671,23 @@ impl LLMClient for OpenAIClient {
                             let mut first_id = None;
 
                             for line in text.lines() {
+                                if line.trim() == "data: [DONE]" {
+                                    state.saw_done = true;
+                                }
                                 if let Some(chunk_result) = OpenAIClient::parse_sse_line(line) {
                                     match chunk_result {
                                         Ok(chunk) => {
                                             // Capture first ID for Start event
                                             if first_id.is_none() && !chunk.id.is_empty() {
                                                 first_id = Some(chunk.id.clone());
+                                            }
+
+                                            // The final `include_usage` chunk
+                                            // carries usage and an EMPTY
+                                            // `choices` array; the loop below
+                                            // simply runs zero times for it.
+                                            if let Some(usage) = chunk.usage {
+                                                state.usage = usage.to_usage();
                                             }
 
                                             for choice in chunk.choices {
@@ -655,9 +761,10 @@ impl LLMClient for OpenAIClient {
                                                         ))
                                                     };
 
-                                                    state.pending_events.push_back(Ok(
-                                                        LLMStreamEvent::End { stop_reason },
-                                                    ));
+                                                    // Held back until the
+                                                    // usage chunk (or the end
+                                                    // of the stream) arrives.
+                                                    state.pending_end = Some(stop_reason);
                                                 }
                                             }
                                         }
@@ -673,6 +780,17 @@ impl LLMClient for OpenAIClient {
                                 state
                                     .pending_events
                                     .push_front(Ok(LLMStreamEvent::Start { id }));
+                            }
+
+                            // `[DONE]` is the last thing the server sends, so
+                            // whatever usage was going to arrive has arrived.
+                            if state.saw_done {
+                                if let Some(stop_reason) = state.pending_end.take() {
+                                    let usage = state.usage;
+                                    state
+                                        .pending_events
+                                        .push_back(Ok(LLMStreamEvent::End { stop_reason, usage }));
+                                }
                             }
 
                             // Loop continues to return first pending event (or get next chunk if none)
@@ -708,6 +826,7 @@ mod tests {
             tools: None,
             tool_choice: choice.map(OpenAIClient::convert_tool_choice),
             stream: false,
+            stream_options: None,
             temperature: None,
             top_p: None,
             frequency_penalty: None,

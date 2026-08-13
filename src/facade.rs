@@ -1328,7 +1328,9 @@ impl ActonAIBuilder {
         // Spawn all LLM providers
         let mut providers = HashMap::new();
         for (name, config) in self.providers {
-            let handle = LLMProvider::spawn(&mut runtime, config).await;
+            // The provider is told its configured name so the usage reports
+            // it broadcasts are keyed by it rather than by vendor.
+            let handle = LLMProvider::spawn(&mut runtime, name.clone(), config).await;
             providers.insert(name, handle);
         }
 

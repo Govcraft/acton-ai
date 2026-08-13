@@ -47,7 +47,7 @@ use crate::extract::{
 use crate::facade::ActonAI;
 use crate::llm::SamplingParams;
 use crate::messages::{
-    LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
+    LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message, Usage,
     StopReason, ToolCall, ToolChoice, ToolDefinition,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall};
@@ -1070,6 +1070,10 @@ impl PromptBuilder {
         // Track executed tool calls and total tokens
         let mut executed_tool_calls = Vec::new();
         let mut total_token_count = 0;
+        // Usage is summed across every round of the tool loop: one `collect()`
+        // can drive several provider requests, and the caller is billed for
+        // all of them.
+        let mut total_usage = Usage::default();
         let mut final_text;
         let final_stop_reason;
         let mut rounds = 0;
@@ -1128,7 +1132,7 @@ impl PromptBuilder {
                 on_end: on_end.clone(),
                 token_target: token_target.clone(),
             };
-            let (text, stop_reason, token_count, tool_calls) = run_stream_round(
+            let (text, stop_reason, token_count, round_usage, tool_calls) = run_stream_round(
                 session,
                 &provider_handle,
                 &request,
@@ -1139,6 +1143,7 @@ impl PromptBuilder {
 
             final_text = text.clone();
             total_token_count += token_count;
+            total_usage += round_usage;
 
             if stop_reason == StopReason::Error {
                 return Err(ActonAIError::prompt_failed(
@@ -1274,7 +1279,8 @@ impl PromptBuilder {
                 final_stop_reason,
                 total_token_count,
                 executed_tool_calls,
-            ),
+            )
+            .with_usage(total_usage),
             captured,
         ))
     }
@@ -1451,6 +1457,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
             return Reply::ready();
         }
         actor.model.stop_reason = Some(envelope.message().stop_reason);
+        actor.model.usage = envelope.message().usage;
         if let Some(ref callback) = actor.model.round.on_end {
             if let Ok(mut f) = callback.lock() {
                 f(envelope.message().stop_reason);
@@ -1462,6 +1469,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
                 buffer: std::mem::take(&mut actor.model.buffer),
                 stop_reason: actor.model.stop_reason,
                 token_count: actor.model.token_count,
+                usage: actor.model.usage,
                 tool_calls: std::mem::take(&mut actor.model.tool_calls),
             });
         }
@@ -1484,6 +1492,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
         let msg = envelope.message();
         actor.model.buffer.clear();
         actor.model.token_count = 0;
+        actor.model.usage = Usage::default();
         actor.model.stop_reason = None;
         actor.model.tool_calls.clear();
         actor.model.expected_correlation_id = Some(msg.expected_id.clone());
@@ -1518,7 +1527,7 @@ pub(crate) async fn run_stream_round(
     request: &LLMRequest,
     correlation_id: CorrelationId,
     callbacks: StreamRoundCallbacks,
-) -> Result<(String, StopReason, usize, Vec<ToolCall>), ActonAIError> {
+) -> Result<(String, StopReason, usize, Usage, Vec<ToolCall>), ActonAIError> {
     // Resolve the collector's live actor handle. Returns an error if the
     // session was already shut down — defensive, but shouldn't happen on
     // any normal path.
@@ -1554,6 +1563,7 @@ pub(crate) async fn run_stream_round(
         result.buffer,
         result.stop_reason.unwrap_or(StopReason::EndTurn),
         result.token_count,
+        result.usage,
         result.tool_calls,
     ))
 }
@@ -1643,6 +1653,9 @@ struct StreamCollector {
     buffer: String,
     /// Count of tokens received in the current round
     token_count: usize,
+    /// Provider-reported usage for the current round, taken from the round's
+    /// terminal `LLMStreamEnd`.
+    usage: Usage,
     /// Stop reason when the current round's stream ends
     stop_reason: Option<StopReason>,
     /// Accumulated tool calls from the current round
@@ -1676,6 +1689,8 @@ struct CollectorResultData {
     stop_reason: Option<StopReason>,
     /// Number of tokens received
     token_count: usize,
+    /// Provider-reported usage for the round
+    usage: Usage,
     /// Tool calls received during streaming
     tool_calls: Vec<ToolCall>,
 }

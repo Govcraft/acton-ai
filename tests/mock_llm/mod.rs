@@ -60,11 +60,20 @@ impl ScriptedToolCall {
     }
 }
 
+/// Token counts a round should report in its final usage chunk.
+#[derive(Clone, Copy)]
+pub struct ScriptedUsage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cached_tokens: u64,
+}
+
 /// One complete scripted response: some text, some tool calls, then a finish.
 #[derive(Clone, Default)]
 pub struct Round {
     text: Option<String>,
     tool_calls: Vec<ScriptedToolCall>,
+    usage: Option<ScriptedUsage>,
 }
 
 impl Round {
@@ -73,6 +82,7 @@ impl Round {
         Self {
             text: Some(text.to_string()),
             tool_calls: Vec::new(),
+            usage: None,
         }
     }
 
@@ -81,7 +91,41 @@ impl Round {
         Self {
             text: None,
             tool_calls: vec![ScriptedToolCall::new(id, name, arguments)],
+            usage: None,
         }
+    }
+
+    /// Makes this round report token usage in a final `stream_options` chunk.
+    ///
+    /// Without this the round sends no usage at all, standing in for an
+    /// OpenAI-compatible server that ignores `stream_options`.
+    #[must_use]
+    pub fn with_usage(mut self, prompt_tokens: u64, completion_tokens: u64) -> Self {
+        self.usage = Some(ScriptedUsage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens: 0,
+        });
+        self
+    }
+
+    /// Same as [`Self::with_usage`], but also reports a cached-prompt split.
+    ///
+    /// `prompt_tokens` is inclusive of `cached_tokens`, matching the real
+    /// wire semantics — the client is responsible for splitting them.
+    #[must_use]
+    pub fn with_cached_usage(
+        mut self,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        cached_tokens: u64,
+    ) -> Self {
+        self.usage = Some(ScriptedUsage {
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+        });
+        self
     }
 
     /// Adds another tool call to the same round, as a model emitting
@@ -138,6 +182,22 @@ impl Round {
             "id": "chatcmpl-mock",
             "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
         }));
+
+        // The `stream_options` usage chunk: usage populated, `choices` EMPTY,
+        // and sent *after* the finish chunk. A client that closes the round on
+        // the finish chunk never sees it.
+        if let Some(usage) = self.usage {
+            push(json!({
+                "id": "chatcmpl-mock",
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": usage.prompt_tokens,
+                    "completion_tokens": usage.completion_tokens,
+                    "total_tokens": usage.prompt_tokens + usage.completion_tokens,
+                    "prompt_tokens_details": {"cached_tokens": usage.cached_tokens},
+                },
+            }));
+        }
 
         body.push_str("data: [DONE]\n\n");
         body
@@ -260,6 +320,55 @@ pub fn tool_named<'a>(request: &'a Value, name: &str) -> Option<&'a Value> {
         .as_array()?
         .iter()
         .find(|tool| tool["function"]["name"] == name)
+}
+
+// =============================================================================
+// Harness self-test
+// =============================================================================
+
+/// Pins the SSE shape this harness renders.
+///
+/// Every suite that uses the mock is really asserting against
+/// `src/llm/openai.rs`'s parser, so the bytes here have to keep matching the
+/// wire format that parser expects. This test is the thing that notices when
+/// they drift — and, because Cargo compiles this module into each test binary
+/// separately, it is also what keeps every builder below exercised no matter
+/// which subset a given suite happens to call.
+#[test]
+fn scripted_rounds_render_the_wire_shape_the_client_parses() {
+    let body = Round::text("hello")
+        .with_tool_call("call_1", "echo", json!({"value": "hi"}))
+        .with_cached_usage(100, 5, 40)
+        .to_sse();
+
+    let chunks: Vec<Value> = body
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+        .filter(|data| *data != "[DONE]")
+        .map(|data| serde_json::from_str(data).expect("every chunk must be valid JSON"))
+        .collect();
+
+    // Tool-call arguments ride as a JSON-encoded *string*, not an object.
+    let tool_call = &chunks[1]["choices"][0]["delta"]["tool_calls"][0];
+    assert_eq!(tool_call["function"]["arguments"], json!(r#"{"value":"hi"}"#));
+
+    // A round with tool calls must finish as `tool_calls`, or the client
+    // never flushes the accumulated call.
+    let finish = &chunks[2];
+    assert_eq!(finish["choices"][0]["finish_reason"], json!("tool_calls"));
+
+    // The usage chunk comes *after* the finish chunk and carries an EMPTY
+    // `choices` array — the case the parser has to tolerate.
+    let usage = chunks.last().expect("a usage chunk must be present");
+    assert_eq!(usage["choices"], json!([]));
+    assert_eq!(usage["usage"]["prompt_tokens"], json!(100));
+    assert_eq!(usage["usage"]["completion_tokens"], json!(5));
+    assert_eq!(usage["usage"]["prompt_tokens_details"]["cached_tokens"], json!(40));
+
+    // `Round::with_usage` is the same path with no cache split.
+    let plain = Round::text("hi").with_usage(7, 8).to_sse();
+    assert!(plain.contains(r#""prompt_tokens":7"#), "{plain}");
+    assert!(plain.ends_with("data: [DONE]\n\n"), "the stream must terminate");
 }
 
 /// Recursively reports whether any `$ref` appears in a JSON value.

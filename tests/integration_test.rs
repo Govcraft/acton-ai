@@ -284,6 +284,7 @@ fn test_streaming_messages() {
 
     // Stream end
     let end = LLMStreamEnd {
+        usage: Usage::default(),
         correlation_id: corr_id.clone(),
         stop_reason: StopReason::EndTurn,
     };

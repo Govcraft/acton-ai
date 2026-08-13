@@ -11,7 +11,7 @@ use crate::llm::openai::OpenAIClient;
 use crate::llm::streaming::StreamAccumulator;
 use crate::messages::{
     LLMRequest, LLMResponse, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall,
-    StopReason, SystemEvent,
+    StopReason, SystemEvent, Usage, UsageReport,
 };
 use acton_reactive::prelude::*;
 use futures::StreamExt;
@@ -22,6 +22,12 @@ use std::time::{Duration, Instant};
 /// Message to initialize the LLM Provider with configuration.
 #[acton_message]
 pub struct InitLLMProvider {
+    /// The name this provider is registered under in the runtime.
+    ///
+    /// This is the **configured** name (the `[providers.NAME]` key), not the
+    /// vendor — usage reports are keyed by it so a runtime with two Anthropic
+    /// providers can tell them apart.
+    pub name: String,
     /// Provider configuration
     pub config: ProviderConfig,
 }
@@ -168,6 +174,9 @@ const fn queue_has_room(queue_len: usize, max_queue_size: usize) -> bool {
 /// Manages API calls to language models with rate limiting and retries.
 #[acton_actor]
 pub struct LLMProvider {
+    /// The configured name this provider answers to, used to key usage
+    /// reports. Empty until [`InitLLMProvider`] lands.
+    pub name: String,
     /// Configuration
     pub config: Option<ProviderConfig>,
     /// The LLM client (trait object for provider abstraction)
@@ -215,15 +224,23 @@ impl LLMProvider {
     /// # Arguments
     ///
     /// * `runtime` - The ActorRuntime
+    /// * `name` - The name this provider is registered under. Usage reports
+    ///   are keyed by it, so pass the configured provider name (the
+    ///   `[providers.NAME]` key), not the vendor.
     /// * `config` - Provider configuration
     ///
     /// # Returns
     ///
     /// The ActorHandle for the started provider.
-    pub async fn spawn(runtime: &mut ActorRuntime, config: ProviderConfig) -> ActorHandle {
+    pub async fn spawn(
+        runtime: &mut ActorRuntime,
+        name: impl Into<String>,
+        config: ProviderConfig,
+    ) -> ActorHandle {
         let mut builder = runtime.new_actor_with_name::<LLMProvider>("llm_provider".to_string());
 
         // Store config for initialization
+        let provider_name = name.into();
         let provider_config = config.clone();
 
         // Set up lifecycle hooks
@@ -259,6 +276,7 @@ impl LLMProvider {
         // Initialize with config
         handle
             .send(InitLLMProvider {
+                name: provider_name,
                 config: provider_config,
             })
             .await;
@@ -272,6 +290,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
     // Handle initialization
     builder.mutate_on::<InitLLMProvider>(|actor, envelope| {
         let config = envelope.message().config.clone();
+        let name = envelope.message().name.clone();
 
         // Create the appropriate client based on provider type
         let client_result: Result<Arc<dyn LLMClient>, crate::llm::error::LLMError> =
@@ -287,6 +306,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             Ok(client) => {
                 let provider_name = client.provider_name();
                 actor.model.client = Some(client);
+                actor.model.name = name;
                 actor.model.config = Some(config);
                 actor.model.shutting_down = false;
                 tracing::info!(provider = %provider_name, "LLM Provider configured");
@@ -482,6 +502,8 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 .broadcast(LLMStreamEnd {
                     correlation_id,
                     stop_reason: StopReason::Error,
+                    // A request that never reached the API spent nothing.
+                    usage: Usage::default(),
                 })
                 .await;
         })
@@ -585,6 +607,13 @@ fn dispatch_request(
 
     let ctx = DispatchContext {
         provider_name: client.provider_name().to_string(),
+        configured_name: actor.model.name.clone(),
+        model: actor
+            .model
+            .config
+            .as_ref()
+            .map(|config| config.model.clone())
+            .unwrap_or_default(),
         client,
         broker: actor.broker().clone(),
         provider: actor.handle().clone(),
@@ -643,6 +672,25 @@ async fn report_failure(ctx: &DispatchContext, request: &LLMRequest, error: &LLM
         .await;
 }
 
+/// Broadcasts what a completed request cost.
+///
+/// Published unconditionally: the message is tiny, and with no subscriber a
+/// broadcast is a no-op. Whether anything tallies it is decided by the
+/// facade's `usage_tracking` toggle, which governs only whether the
+/// accountant actor exists — the provider has no opinion and holds no handle
+/// to it.
+async fn report_usage(ctx: &DispatchContext, request: &LLMRequest, usage: Usage) {
+    ctx.broker
+        .broadcast(UsageReport {
+            provider: ctx.configured_name.clone(),
+            model: ctx.model.clone(),
+            correlation_id: request.correlation_id.clone(),
+            agent_id: request.agent_id.clone(),
+            usage,
+        })
+        .await;
+}
+
 /// Everything a dispatched request needs to report back to the actor system.
 ///
 /// Bundled into one struct so the processing helpers stay within clippy's
@@ -654,8 +702,14 @@ struct DispatchContext {
     broker: ActorHandle,
     /// Handle to the provider actor that dispatched this request
     provider: ActorHandle,
-    /// Name of the provider, for logging and system events
+    /// Vendor name of the provider ("anthropic" / "openai"), for logging and
+    /// system events.
     provider_name: String,
+    /// The runtime-configured name this provider is registered under. Usage
+    /// reports are keyed by this, never by the vendor.
+    configured_name: String,
+    /// The model this provider serves, carried on usage reports.
+    model: String,
     /// Merged sampling parameters, if any apply
     sampling: Option<SamplingParams>,
     /// How many attempts this request has already used
@@ -687,6 +741,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
             let mut accumulated_text = String::new();
             let mut tool_calls = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
+            let mut usage = Usage::default();
 
             while let Some(result) = stream.next().await {
                 match result {
@@ -719,8 +774,10 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                             }
                             LLMStreamEvent::End {
                                 stop_reason: reason,
+                                usage: reported,
                             } => {
                                 stop_reason = reason;
+                                usage = reported;
                                 break;
                             }
                             LLMStreamEvent::Error {
@@ -753,8 +810,11 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                 .broadcast(LLMStreamEnd {
                     correlation_id: correlation_id.clone(),
                     stop_reason,
+                    usage,
                 })
                 .await;
+
+            report_usage(ctx, request, usage).await;
 
             // Also broadcast the complete response for non-streaming consumers
             broker
@@ -793,6 +853,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                     .broadcast(LLMStreamEnd {
                         correlation_id: correlation_id.clone(),
                         stop_reason: StopReason::Error,
+                        usage: Usage::default(),
                     })
                     .await;
             }
@@ -818,6 +879,8 @@ async fn process_non_streaming_request(ctx: &DispatchContext, request: &LLMReque
         .await
     {
         Ok(response) => {
+            let usage = response.usage;
+
             broker
                 .broadcast(LLMResponse {
                     correlation_id: correlation_id.clone(),
@@ -830,6 +893,8 @@ async fn process_non_streaming_request(ctx: &DispatchContext, request: &LLMReque
                     stop_reason: response.stop_reason,
                 })
                 .await;
+
+            report_usage(ctx, request, usage).await;
 
             ctx.provider.send(RequestOutcome { succeeded: true }).await;
         }
@@ -1083,6 +1148,7 @@ mod tests {
 
         let provider = LLMProvider::spawn(
             &mut runtime,
+            "test-provider",
             ProviderConfig::new("test-key").with_retry(RetryConfig::no_retries()),
         )
         .await;

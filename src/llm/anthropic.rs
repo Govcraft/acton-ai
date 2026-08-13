@@ -6,7 +6,9 @@
 use crate::llm::client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
 use crate::llm::config::{ProviderConfig, SamplingParams};
 use crate::llm::error::LLMError;
-use crate::messages::{Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition};
+use crate::messages::{
+    Message, MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition, Usage,
+};
 use async_trait::async_trait;
 use futures::StreamExt;
 use reqwest::Client;
@@ -124,7 +126,8 @@ pub struct MessagesResponse {
     /// The content blocks
     pub content: Vec<ResponseContentBlock>,
     /// Usage statistics
-    pub usage: Usage,
+    #[serde(default)]
+    pub usage: ApiUsage,
 }
 
 /// A content block in the response.
@@ -141,13 +144,61 @@ pub enum ResponseContentBlock {
     },
 }
 
-/// Usage statistics from the API.
-#[derive(Debug, Clone, Deserialize)]
-pub struct Usage {
-    /// Input tokens used
-    pub input_tokens: u32,
-    /// Output tokens generated
-    pub output_tokens: u32,
+/// Usage statistics as they appear on the Anthropic wire.
+///
+/// Every field is optional because the API reports different subsets in
+/// different places: `message_start` carries input and cache counts (plus a
+/// provisional `output_tokens`), while `message_delta` carries the final
+/// cumulative `output_tokens` and usually nothing else. Absent fields must
+/// never fail deserialization, so each is an `Option` that
+/// [`ApiUsage::apply_to`] simply skips.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct ApiUsage {
+    /// Uncached input tokens.
+    #[serde(default)]
+    pub input_tokens: Option<u64>,
+    /// Output tokens generated so far (cumulative within a stream).
+    #[serde(default)]
+    pub output_tokens: Option<u64>,
+    /// Input tokens served from the prompt cache.
+    #[serde(default)]
+    pub cache_read_input_tokens: Option<u64>,
+    /// Input tokens written into the prompt cache.
+    #[serde(default)]
+    pub cache_creation_input_tokens: Option<u64>,
+}
+
+impl ApiUsage {
+    /// Folds whatever this event reported onto `total`.
+    ///
+    /// Each field **overwrites** rather than adds, because Anthropic reports
+    /// cumulative figures within one stream: `message_delta` restates the
+    /// running `output_tokens` total, so adding would double-count. A field
+    /// the event omits leaves the running total untouched, which is what
+    /// keeps `message_start`'s input count alive through the final
+    /// `message_delta`.
+    pub fn apply_to(&self, total: &mut Usage) {
+        if let Some(input) = self.input_tokens {
+            total.input_tokens = input;
+        }
+        if let Some(output) = self.output_tokens {
+            total.output_tokens = output;
+        }
+        if let Some(read) = self.cache_read_input_tokens {
+            total.cache_read_tokens = read;
+        }
+        if let Some(creation) = self.cache_creation_input_tokens {
+            total.cache_creation_tokens = creation;
+        }
+    }
+
+    /// Converts a standalone (non-streaming) usage object.
+    #[must_use]
+    pub fn to_usage(&self) -> Usage {
+        let mut usage = Usage::default();
+        self.apply_to(&mut usage);
+        usage
+    }
 }
 
 /// Error response from the Anthropic API.
@@ -171,6 +222,9 @@ pub enum StreamEvent {
     MessageStart {
         /// Response ID
         id: String,
+        /// Usage reported alongside the opening message: input tokens and,
+        /// when prompt caching is in play, the cache counters.
+        usage: ApiUsage,
     },
     /// Content block started
     ContentBlockStart {
@@ -203,6 +257,10 @@ pub enum StreamEvent {
     MessageDelta {
         /// Stop reason
         stop_reason: Option<String>,
+        /// Final cumulative usage for the message. Note this rides on the
+        /// event itself, **not** inside `delta` — verified against the
+        /// Anthropic SSE reference.
+        usage: ApiUsage,
     },
     /// Stream ended
     MessageStop,
@@ -232,6 +290,10 @@ struct RawStreamEvent {
     delta: Option<serde_json::Value>,
     #[serde(default)]
     error: Option<serde_json::Value>,
+    /// Top-level usage. Present on `message_delta`; `message_start` instead
+    /// nests its usage inside `message`.
+    #[serde(default)]
+    usage: Option<ApiUsage>,
 }
 
 impl AnthropicClient {
@@ -545,11 +607,18 @@ impl AnthropicClient {
     fn convert_raw_event(raw: RawStreamEvent) -> Result<Option<StreamEvent>, LLMError> {
         match raw.event_type.as_str() {
             "message_start" => {
-                let id = raw
-                    .message
+                let message = raw.message;
+                let id = message
+                    .as_ref()
                     .and_then(|m| m.get("id").and_then(|v| v.as_str().map(String::from)))
                     .unwrap_or_default();
-                Ok(Some(StreamEvent::MessageStart { id }))
+                // A usage block that fails to parse is not worth failing the
+                // whole stream over — degrade to "reported nothing".
+                let usage = message
+                    .and_then(|m| m.get("usage").cloned())
+                    .and_then(|u| serde_json::from_value::<ApiUsage>(u).ok())
+                    .unwrap_or_default();
+                Ok(Some(StreamEvent::MessageStart { id, usage }))
             }
             "content_block_start" => {
                 let index = raw.index.unwrap_or(0);
@@ -608,7 +677,10 @@ impl AnthropicClient {
                     d.get("stop_reason")
                         .and_then(|v| v.as_str().map(String::from))
                 });
-                Ok(Some(StreamEvent::MessageDelta { stop_reason }))
+                Ok(Some(StreamEvent::MessageDelta {
+                    stop_reason,
+                    usage: raw.usage.unwrap_or_default(),
+                }))
             }
             "message_stop" => Ok(Some(StreamEvent::MessageStop)),
             "ping" => Ok(Some(StreamEvent::Ping)),
@@ -666,6 +738,7 @@ impl LLMClient for AnthropicClient {
                 .as_ref()
                 .map(|s| parse_stop_reason(s))
                 .unwrap_or(StopReason::EndTurn),
+            usage: response.usage.to_usage(),
         })
     }
 
@@ -688,38 +761,70 @@ impl LLMClient for AnthropicClient {
 }
 
 /// Converts Anthropic stream events to unified LLMStreamEvent.
+///
+/// Usage arrives split across two events — `message_start` carries the input
+/// and cache counts, `message_delta` the final output count — so the running
+/// total is threaded through the stream with `scan` and attached to whichever
+/// terminal event closes the round.
 fn convert_anthropic_stream(
     stream: impl futures::Stream<Item = Result<StreamEvent, LLMError>> + Send + 'static,
 ) -> impl futures::Stream<Item = Result<LLMStreamEvent, LLMError>> + Send {
-    stream.filter_map(|result| async move {
-        match result {
-            Ok(event) => match event {
-                StreamEvent::MessageStart { id } => Some(Ok(LLMStreamEvent::Start { id })),
-                StreamEvent::ContentBlockDelta { text, .. } => {
-                    text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
-                }
-                StreamEvent::MessageDelta { stop_reason } => stop_reason.map(|reason| {
-                    Ok(LLMStreamEvent::End {
-                        stop_reason: parse_stop_reason(&reason),
-                    })
-                }),
-                StreamEvent::MessageStop => Some(Ok(LLMStreamEvent::End {
-                    stop_reason: StopReason::EndTurn,
-                })),
-                StreamEvent::Error {
-                    error_type,
-                    message,
-                } => Some(Ok(LLMStreamEvent::Error {
-                    error_type,
-                    message,
-                })),
-                StreamEvent::Ping
-                | StreamEvent::ContentBlockStart { .. }
-                | StreamEvent::ContentBlockStop { .. } => None,
-            },
-            Err(e) => Some(Err(e)),
+    stream
+        .scan(Usage::default(), |total, result| {
+            // Never yields `None`: the stream ends when the source does, not
+            // when an event happens to carry nothing worth emitting.
+            futures::future::ready(Some(convert_one_event(total, result)))
+        })
+        .filter_map(futures::future::ready)
+}
+
+/// Folds one Anthropic event into the running usage total and maps it onto
+/// the unified event type. Returns `None` for events with no unified
+/// counterpart (pings, block boundaries).
+fn convert_one_event(
+    total: &mut Usage,
+    result: Result<StreamEvent, LLMError>,
+) -> Option<Result<LLMStreamEvent, LLMError>> {
+    let event = match result {
+        Ok(event) => event,
+        Err(e) => return Some(Err(e)),
+    };
+
+    match event {
+        StreamEvent::MessageStart { id, usage } => {
+            usage.apply_to(total);
+            Some(Ok(LLMStreamEvent::Start { id }))
         }
-    })
+        StreamEvent::ContentBlockDelta { text, .. } => {
+            text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
+        }
+        StreamEvent::MessageDelta {
+            stop_reason,
+            usage,
+        } => {
+            usage.apply_to(total);
+            stop_reason.map(|reason| {
+                Ok(LLMStreamEvent::End {
+                    stop_reason: parse_stop_reason(&reason),
+                    usage: *total,
+                })
+            })
+        }
+        StreamEvent::MessageStop => Some(Ok(LLMStreamEvent::End {
+            stop_reason: StopReason::EndTurn,
+            usage: *total,
+        })),
+        StreamEvent::Error {
+            error_type,
+            message,
+        } => Some(Ok(LLMStreamEvent::Error {
+            error_type,
+            message,
+        })),
+        StreamEvent::Ping
+        | StreamEvent::ContentBlockStart { .. }
+        | StreamEvent::ContentBlockStop { .. } => None,
+    }
 }
 
 /// Converts an API stop reason string to our `StopReason` enum.
@@ -935,6 +1040,132 @@ mod tests {
         assert!(matches!(events[0], StreamEvent::MessageStop));
     }
 
+    // -------------------------------------------------------------------
+    // Usage extraction
+    //
+    // Wire shapes below are the documented Anthropic SSE payloads. The one
+    // that is easy to get wrong: on `message_delta`, `usage` is a **sibling**
+    // of `delta`, not a field inside it.
+    // -------------------------------------------------------------------
+
+    /// Runs a scripted set of SSE lines through the same conversion the
+    /// client uses, returning the usage attached to the terminal event.
+    fn usage_from_sse(lines: &[&str]) -> Usage {
+        let mut total = Usage::default();
+        let mut ended = None;
+
+        for line in lines {
+            for event in AnthropicClient::parse_sse_events(line).unwrap() {
+                if let Some(Ok(LLMStreamEvent::End { usage, .. })) =
+                    convert_one_event(&mut total, Ok(event))
+                {
+                    ended = Some(usage);
+                }
+            }
+        }
+
+        ended.expect("the scripted stream must produce a terminal event")
+    }
+
+    #[test]
+    fn message_start_carries_input_and_cache_tokens() {
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":25,"output_tokens":1,"cache_read_input_tokens":100,"cache_creation_input_tokens":40}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#,
+        ]);
+
+        assert_eq!(usage.input_tokens, 25);
+        assert_eq!(usage.cache_read_tokens, 100);
+        assert_eq!(usage.cache_creation_tokens, 40);
+    }
+
+    #[test]
+    fn message_delta_output_tokens_replace_the_provisional_count() {
+        // message_start reports output_tokens=1 as a placeholder; the final
+        // figure on message_delta is cumulative, so it must overwrite rather
+        // than add — 15, never 16.
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":25,"output_tokens":1}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#,
+        ]);
+
+        assert_eq!(usage.output_tokens, 15);
+    }
+
+    #[test]
+    fn message_delta_usage_is_read_from_the_event_not_the_delta() {
+        // A parser that looked inside `delta` would report 0 here.
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":7}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":99}}"#,
+        ]);
+
+        assert_eq!(usage.output_tokens, 99);
+    }
+
+    #[test]
+    fn absent_cache_fields_default_to_zero() {
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":25,"output_tokens":1}}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":15}}"#,
+        ]);
+
+        assert_eq!(usage.cache_read_tokens, 0);
+        assert_eq!(usage.cache_creation_tokens, 0);
+    }
+
+    #[test]
+    fn a_stream_with_no_usage_at_all_degrades_to_default() {
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1"}}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn"}}"#,
+        ]);
+
+        assert_eq!(usage, Usage::default());
+    }
+
+    #[test]
+    fn unknown_usage_fields_do_not_fail_deserialization() {
+        // Forward compatibility: a new counter must not break the round.
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":5,"some_future_counter":123}}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+
+        assert_eq!(usage.input_tokens, 5);
+    }
+
+    #[test]
+    fn message_stop_closes_the_round_with_the_accumulated_usage() {
+        let usage = usage_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":11,"output_tokens":2}}}"#,
+            r#"data: {"type":"message_stop"}"#,
+        ]);
+
+        assert_eq!(usage.input_tokens, 11);
+        assert_eq!(usage.output_tokens, 2);
+    }
+
+    #[test]
+    fn non_streaming_usage_converts_from_the_wire_shape() {
+        let api = ApiUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(4),
+            cache_read_input_tokens: Some(5),
+            cache_creation_input_tokens: Some(6),
+        };
+
+        assert_eq!(
+            api.to_usage(),
+            Usage {
+                input_tokens: 3,
+                output_tokens: 4,
+                cache_read_tokens: 5,
+                cache_creation_tokens: 6,
+            }
+        );
+    }
+
     #[test]
     fn parse_sse_events_done_marker() {
         let text = "data: [DONE]";
@@ -968,9 +1199,10 @@ mod tests {
                     text: "World".to_string(),
                 },
             ],
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
+            usage: ApiUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..ApiUsage::default()
             },
         };
 
@@ -993,9 +1225,10 @@ mod tests {
                     input: serde_json::json!({"query": "rust"}),
                 },
             ],
-            usage: Usage {
-                input_tokens: 10,
-                output_tokens: 5,
+            usage: ApiUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(5),
+                ..ApiUsage::default()
             },
         };
 

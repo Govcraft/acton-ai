@@ -27,7 +27,7 @@
 //! }
 //! ```
 
-use crate::messages::StopReason;
+use crate::messages::{StopReason, Usage};
 use crate::types::CorrelationId;
 
 /// Action to take after processing a stream event.
@@ -232,8 +232,21 @@ pub struct CollectedResponse {
     /// Why the LLM stopped generating.
     pub stop_reason: StopReason,
 
-    /// Number of tokens in the response.
+    /// Number of **streamed token events** observed for this response.
+    ///
+    /// This counts `LLMStreamToken` broadcasts, which is a transport-level
+    /// figure, not a billed one: it is zero on non-streaming providers and
+    /// does not correspond to any provider's tokenizer. For anything to do
+    /// with cost or quota, read [`Self::usage`] instead.
     pub token_count: usize,
+
+    /// Token usage the provider reported, summed across every round of the
+    /// tool loop.
+    ///
+    /// Unlike [`Self::token_count`] these are the provider's own billed
+    /// figures. All zeros means the provider reported nothing — never that
+    /// nothing was spent.
+    pub usage: Usage,
 
     /// Tool calls that were executed during the conversation (if any).
     ///
@@ -250,8 +263,16 @@ impl CollectedResponse {
             text,
             stop_reason,
             token_count,
+            usage: Usage::default(),
             tool_calls: Vec::new(),
         }
+    }
+
+    /// Attaches provider-reported usage to this response.
+    #[must_use]
+    pub fn with_usage(mut self, usage: Usage) -> Self {
+        self.usage = usage;
+        self
     }
 
     /// Creates a new collected response with tool calls.
@@ -266,6 +287,7 @@ impl CollectedResponse {
             text,
             stop_reason,
             token_count,
+            usage: Usage::default(),
             tool_calls,
         }
     }
@@ -301,6 +323,7 @@ impl Default for CollectedResponse {
             text: String::new(),
             stop_reason: StopReason::EndTurn,
             token_count: 0,
+            usage: Usage::default(),
             tool_calls: Vec::new(),
         }
     }
@@ -379,6 +402,7 @@ mod tests {
         assert!(response.text.is_empty());
         assert_eq!(response.stop_reason, StopReason::EndTurn);
         assert_eq!(response.token_count, 0);
+        assert_eq!(response.usage, Usage::default());
         assert!(response.tool_calls.is_empty());
     }
 
@@ -408,6 +432,20 @@ mod tests {
         assert!(response.has_tool_calls());
         assert_eq!(response.tool_calls.len(), 1);
         assert_eq!(response.tool_calls[0].name, "calculator");
+    }
+
+    #[test]
+    fn collected_response_carries_usage() {
+        let usage = Usage {
+            input_tokens: 12,
+            output_tokens: 34,
+            ..Usage::default()
+        };
+
+        let response =
+            CollectedResponse::new("hi".to_string(), StopReason::EndTurn, 1).with_usage(usage);
+
+        assert_eq!(response.usage, usage);
     }
 
     #[test]
