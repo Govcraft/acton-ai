@@ -107,7 +107,8 @@ mod tests {
     fn new_rejects_invalid_config() {
         let mut bad = ProcessSandboxConfig::new();
         bad.env_allowlist.clear();
-        let err = ProcessSandboxFactory::with_exe(PathBuf::from("/bin/true"), bad).unwrap_err();
+        let exe = std::env::current_exe().expect("test binary path");
+        let err = ProcessSandboxFactory::with_exe(exe, bad).unwrap_err();
         assert!(err.to_string().contains("env_allowlist"));
     }
 
@@ -121,16 +122,21 @@ mod tests {
         assert!(err.to_string().contains("canonicalize"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn with_exe_canonicalizes_symlinks() {
-        // `/bin` is commonly a symlink to `/usr/bin` on modern Linux; pick a
-        // binary that is virtually always present.
-        let factory = ProcessSandboxFactory::with_exe(
-            PathBuf::from("/bin/true"),
-            ProcessSandboxConfig::new(),
-        )
-        .expect("/bin/true exists on supported Linux distributions");
+        // Build our own symlink to a binary guaranteed to exist (this test
+        // binary) instead of assuming a path like `/bin/true`, which does
+        // not exist on macOS.
+        let exe = std::env::current_exe().expect("test binary path");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let link = dir.path().join("sandbox-exe-link");
+        std::os::unix::fs::symlink(&exe, &link).expect("symlink to test binary");
+
+        let factory = ProcessSandboxFactory::with_exe(link.clone(), ProcessSandboxConfig::new())
+            .expect("symlinked executable canonicalizes");
         assert!(factory.exe().is_absolute());
+        assert_ne!(factory.exe(), link.as_path(), "symlink was not resolved");
         assert!(factory.is_available());
     }
 }
