@@ -3,7 +3,7 @@
 //! All messages implement Send + Sync + Debug + Clone + 'static as required by acton-reactive.
 
 use crate::llm::SamplingParams;
-use crate::types::{AgentId, CorrelationId, TaskId};
+use crate::types::{AgentId, CorrelationId, TaskId, TurnId};
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 
@@ -640,6 +640,67 @@ pub struct LLMStreamToolResult {
     /// one line and truncated to ~200 chars. Full payload is still
     /// available via `CollectedResponse::tool_calls`.
     pub summary: String,
+}
+
+/// The lifecycle bracket of one turn and of the tools it runs.
+///
+/// Broadcast by the prompt loop so an observer can answer "what is this
+/// process doing *right now*" without being on the turn's call path. The
+/// [`IntrospectionActor`](crate::introspection::IntrospectionActor) is the
+/// only subscriber in this crate.
+///
+/// # Why a bracket and not inference
+///
+/// In-flight state could almost be inferred from the existing stream events —
+/// [`LLMStreamStart`]/[`LLMStreamEnd`] per round, [`LLMStreamToolCall`] and
+/// [`LLMStreamToolResult`] per tool. Almost: a *turn* spans many rounds, so
+/// rounds cannot bound it; and the model can emit tool calls the loop
+/// deliberately never executes (the siblings of a `structured_output` call,
+/// or anything past the round limit), so a call-minus-result count leaks and
+/// the reported in-flight number drifts upward for the life of the process.
+/// An explicit bracket cannot drift.
+///
+/// Published unconditionally, like [`UsageReport`]: these are tiny messages
+/// and a broadcast with no subscriber is a no-op, so a runtime that never
+/// arms introspection pays nothing but the send.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub enum TurnLifecycle {
+    /// A turn was admitted and is now running.
+    TurnStarted {
+        /// Identifies this turn across its whole lifecycle.
+        turn_id: TurnId,
+    },
+    /// A turn ended, successfully or with an error.
+    ///
+    /// Always published for a turn that published [`Self::TurnStarted`],
+    /// whatever the outcome.
+    TurnFinished {
+        /// The turn that ended.
+        turn_id: TurnId,
+    },
+    /// A turn was never admitted, because admission was closed.
+    ///
+    /// Published *instead of* the [`Self::TurnStarted`]/[`Self::TurnFinished`]
+    /// pair, never alongside it: a refused turn never ran, so counting it as
+    /// in-flight even momentarily would make a drain look unfinished.
+    TurnRefused,
+    /// A tool call started executing inside a turn.
+    ToolStarted {
+        /// The turn running this tool.
+        turn_id: TurnId,
+        /// The provider-assigned call ID (matches [`ToolCall::id`]).
+        tool_call_id: String,
+        /// The tool being executed.
+        tool_name: String,
+    },
+    /// A tool call finished executing, successfully or not.
+    ToolFinished {
+        /// The turn that ran this tool.
+        turn_id: TurnId,
+        /// The call that finished.
+        tool_call_id: String,
+    },
 }
 
 // =============================================================================

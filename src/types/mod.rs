@@ -1,7 +1,7 @@
 //! Core type definitions for the Acton-AI framework.
 //!
 //! This module contains all domain-specific types including:
-//! - Identity types (AgentId, ConversationId, CorrelationId, MemoryId, MessageId, TaskId, ToolName)
+//! - Identity types (AgentId, ConversationId, CorrelationId, MemoryId, MessageId, TaskId, TurnId, ToolName)
 //! - Configuration types
 //! - State enumerations
 
@@ -12,6 +12,7 @@ mod memory_id;
 mod message_id;
 mod task_id;
 mod tool_name;
+mod turn_id;
 
 pub use agent_id::{AgentId, InvalidAgentId};
 pub use conversation_id::{ConversationId, InvalidConversationId};
@@ -20,3 +21,4 @@ pub use memory_id::{InvalidMemoryId, MemoryId};
 pub use message_id::{InvalidMessageId, MessageId};
 pub use task_id::{InvalidTaskId, TaskId};
 pub use tool_name::{InvalidToolName, ToolName};
+pub use turn_id::{InvalidTurnId, TurnId};

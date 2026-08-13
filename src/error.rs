@@ -282,6 +282,19 @@ pub enum ActonAIErrorKind {
         /// Each candidate in chain order, paired with why it did not serve.
         attempts: Vec<ProviderAttempt>,
     },
+    /// The runtime is paused or draining, so the turn was refused before it
+    /// started.
+    ///
+    /// Nothing was sent and nothing was spent. Turns already running are
+    /// unaffected — pausing closes the door, it does not empty the room — so
+    /// this is a transient condition a caller may retry after a `resume`.
+    ///
+    /// `Draining` is the terminal case: a draining runtime is on its way down
+    /// and will not start accepting again.
+    TurnsNotAdmitted {
+        /// What the gate was set to when the turn was refused.
+        state: crate::introspection::AdmissionState,
+    },
 }
 
 /// One provider's turn in a failover chain, and how it ended.
@@ -429,6 +442,23 @@ impl ActonAIError {
         Self::new(ActonAIErrorKind::AllProvidersFailed { attempts })
     }
 
+    /// Creates the error a paused or draining runtime refuses new turns with.
+    ///
+    /// ```rust
+    /// use acton_ai::introspection::AdmissionState;
+    /// use acton_ai::prelude::ActonAIError;
+    ///
+    /// let err = ActonAIError::turns_not_admitted(AdmissionState::Paused);
+    ///
+    /// assert!(err.is_turns_not_admitted());
+    /// // The way back out is in the message, both ways of saying it.
+    /// assert!(err.to_string().contains("acton-ai resume"));
+    /// ```
+    #[must_use]
+    pub fn turns_not_admitted(state: crate::introspection::AdmissionState) -> Self {
+        Self::new(ActonAIErrorKind::TurnsNotAdmitted { state })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -457,6 +487,15 @@ impl ActonAIError {
     #[must_use]
     pub fn is_all_providers_failed(&self) -> bool {
         matches!(self.kind, ActonAIErrorKind::AllProvidersFailed { .. })
+    }
+
+    /// Returns true if a paused or draining runtime refused this turn.
+    ///
+    /// Nothing was sent and nothing was spent, so a caller that retries after
+    /// a `resume` loses nothing by having tried.
+    #[must_use]
+    pub fn is_turns_not_admitted(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::TurnsNotAdmitted { .. })
     }
 
     /// The per-provider attempts behind an
@@ -513,6 +552,18 @@ impl fmt::Display for ActonAIError {
                      your config file",
                     crate::accounting::budget::usd(*spent_microusd),
                     crate::accounting::budget::usd(*limit_microusd),
+                )
+            }
+            ActonAIErrorKind::TurnsNotAdmitted { state } => {
+                // Both routes back out are named, because whoever reads this
+                // may be an operator at a shell or a developer in a debugger,
+                // and neither should have to go looking for the other's door.
+                write!(
+                    f,
+                    "the runtime is {state} and is not admitting new turns, so this one was \
+                     refused before anything was sent; turns already running are unaffected. \
+                     Resume with `acton-ai resume` against this process's introspection socket, \
+                     or ActonAI::resume() in-process",
                 )
             }
             ActonAIErrorKind::AllProvidersFailed { attempts } => {

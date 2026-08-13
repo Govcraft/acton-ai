@@ -197,8 +197,69 @@ pub(crate) struct ActonAIInner {
     /// `None` means no `[telemetry]` section and no builder call, which is
     /// the state in which nothing here costs anything.
     pub(crate) telemetry: Option<TelemetryRuntime>,
+    /// Whether new turns are admitted.
+    ///
+    /// Always present, and always `Running` at launch. Unlike the surfaces
+    /// that drive it, admission itself costs nothing when unused: the prompt
+    /// loop reads one relaxed atomic per turn.
+    pub(crate) admission: crate::introspection::AdmissionGate,
+    /// The control socket, when introspection was configured.
+    ///
+    /// `None` means nothing is listening, which is the default. Compiling the
+    /// `ipc` feature in does not create a socket; only `[introspection]` or
+    /// [`ActonAIBuilder::introspection`] does.
+    pub(crate) introspection: Option<IntrospectionRuntime>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
+}
+
+/// The introspection socket a launched runtime owns.
+///
+/// Holding one means a listener is accepting connections, so the socket file
+/// exists and must be taken down before the runtime is.
+pub(crate) struct IntrospectionRuntime {
+    /// Where the socket is bound. Kept so [`ActonAI::introspection_socket`]
+    /// can tell a caller the address the process actually resolved, which is
+    /// otherwise unknowable when the default PID-suffixed scheme was used.
+    pub(crate) socket_path: std::path::PathBuf,
+    /// Behind a `Mutex` because shutdown runs through a shared `Arc`, and
+    /// stopping the listener needs ownership of the handle.
+    #[cfg(feature = "ipc")]
+    listener: std::sync::Mutex<Option<acton_reactive::ipc::IpcListenerHandle>>,
+}
+
+impl IntrospectionRuntime {
+    /// Stops accepting connections and removes the socket file.
+    ///
+    /// Idempotent. Called first in [`ActonAI::shutdown`], before the actors:
+    /// a listener still accepting after the actor behind it has stopped would
+    /// answer `acton-ai status` with a connection that hangs or a routing
+    /// error, which is a worse answer than a closed socket.
+    pub(crate) fn shutdown(&self) {
+        #[cfg(feature = "ipc")]
+        {
+            let taken = self.listener.lock().ok().and_then(|mut slot| slot.take());
+            if let Some(listener) = taken {
+                listener.stop();
+            }
+            // acton-reactive's accept loop unlinks the socket too, but only
+            // after it notices the cancellation, from a spawned task — so
+            // "has the file gone?" immediately after `shutdown()` would be a
+            // race. Doing it here makes the answer deterministic. The two are
+            // not redundant: `stop()` ends the accept loop, this ends the
+            // filesystem entry, and each on its own leaves half a listener
+            // behind.
+            if let Err(error) = std::fs::remove_file(&self.socket_path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::debug!(
+                        path = %self.socket_path.display(),
+                        %error,
+                        "introspection socket file could not be removed"
+                    );
+                }
+            }
+        }
+    }
 }
 
 /// The telemetry a launched runtime owns.
@@ -685,8 +746,80 @@ impl ActonAI {
     /// # Errors
     ///
     /// Returns an error if the shutdown fails.
+    /// Whether this runtime is currently admitting new turns, and if not, why.
+    ///
+    /// Free to call: one relaxed atomic load.
+    #[must_use]
+    pub fn admission_state(&self) -> crate::introspection::AdmissionState {
+        self.inner.admission.state()
+    }
+
+    /// Stops admitting new turns. Turns already running are unaffected.
+    ///
+    /// The in-process twin of `acton-ai pause`, and available whether or not
+    /// the `ipc` feature is compiled in — an embedder with its own control
+    /// plane needs this lever without needing a socket.
+    ///
+    /// A turn refused while paused fails with
+    /// [`ActonAIError::is_turns_not_admitted`], which is a refusal rather than
+    /// a failure: nothing was sent and nothing was spent.
+    ///
+    /// Returns the state now in force.
+    pub fn pause(&self) -> crate::introspection::AdmissionState {
+        self.inner.admission.pause()
+    }
+
+    /// Admits new turns again after a [`pause`](Self::pause).
+    ///
+    /// Also lifts a [`drain`](Self::drain), for the operator who started one
+    /// and changed their mind before the process went down.
+    ///
+    /// Returns the state now in force.
+    pub fn resume(&self) -> crate::introspection::AdmissionState {
+        self.inner.admission.resume()
+    }
+
+    /// Stops admitting new turns, with the intent of shutting down.
+    ///
+    /// Identical to [`pause`](Self::pause) from a turn's point of view; the
+    /// difference is what it tells an operator reading `acton-ai status`. A
+    /// paused process is waiting for a human, a draining one is waiting for
+    /// its own in-flight work.
+    ///
+    /// This returns immediately — it closes the door, it does not wait for the
+    /// room to empty. `acton-ai drain --wait` polls the status surface for
+    /// that; in-process, a caller that needs the same thing awaits its own
+    /// outstanding calls, which it is holding anyway.
+    ///
+    /// Returns the state now in force.
+    pub fn drain(&self) -> crate::introspection::AdmissionState {
+        self.inner.admission.drain()
+    }
+
+    /// The path of this runtime's control socket, when one is listening.
+    ///
+    /// `None` when introspection was not configured. Worth asking for even
+    /// when it was: the default scheme suffixes the PID, so this is the only
+    /// way to learn the address from inside the process.
+    #[must_use]
+    pub fn introspection_socket(&self) -> Option<&std::path::Path> {
+        self.inner
+            .introspection
+            .as_ref()
+            .map(|introspection| introspection.socket_path.as_path())
+    }
+
     pub async fn shutdown(self) -> Result<(), ActonAIError> {
         self.inner.is_shutdown.store(true, Ordering::SeqCst);
+
+        // The socket goes first, before the actors it fronts. A listener that
+        // outlived its actor would accept a connection and then fail to route
+        // it, which reads to an operator as a broken process rather than a
+        // stopped one.
+        if let Some(introspection) = self.inner.introspection.as_ref() {
+            introspection.shutdown();
+        }
+
         // Get the runtime clone for shutdown. The Arc may still be shared,
         // so we clone the ActorRuntime (which is itself cheap to clone).
         let mut runtime = self.inner.runtime.clone();
@@ -847,6 +980,21 @@ pub struct ActonAIBuilder {
     /// Unconditional: a build without the `otel` feature still has to notice
     /// this section and refuse the launch rather than ignore it.
     telemetry_file: Option<crate::config::TelemetryFileConfig>,
+    /// Introspection set programmatically by
+    /// [`introspection`](Self::introspection) or
+    /// [`introspection_at`](Self::introspection_at).
+    ///
+    /// Present, this replaces `[introspection]` from the config file
+    /// **wholesale** — the same rule `budget` and `telemetry` follow.
+    introspection: Option<crate::introspection::IntrospectionConfig>,
+    /// The `[introspection]` section from a config file, used only when the
+    /// builder sets none of its own.
+    ///
+    /// Unconditional: a build without the `ipc` feature still has to notice
+    /// this section at launch and refuse, rather than ignore it.
+    introspection_file: Option<crate::config::IntrospectionFileConfig>,
+    /// Whether `SIGTERM` should start a drain.
+    drain_on_sigterm: bool,
 }
 
 /// How a runtime's telemetry providers come to exist.
@@ -1247,6 +1395,79 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Listens for `acton-ai status`, `pause`, `resume`, and `drain` on a
+    /// control socket.
+    ///
+    /// The socket goes at
+    /// `$XDG_RUNTIME_DIR/acton-ai/<app-name>-<pid>.sock`, owner-only. The PID
+    /// suffix keeps two processes for one user from colliding; use
+    /// [`introspection_at`](Self::introspection_at) when something outside the
+    /// process needs a predictable address, and
+    /// [`ActonAI::introspection_socket`] to learn the resolved one from
+    /// inside.
+    ///
+    /// Replaces any `[introspection]` section from a config file wholesale.
+    ///
+    /// ```rust,no_run
+    /// # use acton_ai::prelude::*;
+    /// # async fn run() -> Result<(), ActonAIError> {
+    /// let ai = ActonAI::builder()
+    ///     .app_name("my-agent")
+    ///     .ollama("llama3.2")
+    ///     .introspection()
+    ///     .drain_on_sigterm()
+    ///     .launch()
+    ///     .await?;
+    ///
+    /// println!("status socket: {}", ai.introspection_socket().unwrap().display());
+    /// # Ok(())
+    /// # }
+    /// ```
+    #[must_use]
+    pub fn introspection(mut self) -> Self {
+        self.introspection = Some(crate::introspection::IntrospectionConfig::default());
+        self
+    }
+
+    /// Listens for control commands on a socket at `path`.
+    ///
+    /// As [`introspection`](Self::introspection), but at an address chosen by
+    /// the caller — which is what a systemd unit or a deployment script needs,
+    /// since neither can guess a PID.
+    ///
+    /// The path must be absolute; a relative one fails the launch, because a
+    /// process that changes its working directory would otherwise leave its
+    /// control socket somewhere no client can find it.
+    #[must_use]
+    pub fn introspection_at(mut self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.introspection = Some(crate::introspection::IntrospectionConfig {
+            socket_path: Some(path.into()),
+            ..crate::introspection::IntrospectionConfig::default()
+        });
+        self
+    }
+
+    /// Starts a drain when the process receives `SIGTERM`.
+    ///
+    /// On the signal, the runtime stops admitting new turns and tells systemd
+    /// it is `STOPPING=1`. Turns already running are not interrupted — that is
+    /// the whole point, and it is what makes a rolling restart lose no work.
+    ///
+    /// This does **not** exit the process. Deciding when the process is done
+    /// belongs to whoever owns `main`: they know what else is outstanding, and
+    /// they are holding the turns this can only count. A typical `main` awaits
+    /// its work and then calls [`ActonAI::shutdown`].
+    ///
+    /// Independent of [`introspection`](Self::introspection): a process can
+    /// drain on `SIGTERM` without opening a socket, and vice versa. Unix only;
+    /// elsewhere it is accepted and does nothing, because there is no
+    /// `SIGTERM` to hear.
+    #[must_use]
+    pub fn drain_on_sigterm(mut self) -> Self {
+        self.drain_on_sigterm = true;
+        self
+    }
+
     /// Installs an explicit [`ContextWindow`](crate::memory::ContextWindow).
     ///
     /// Wins over the per-provider and config-file cascade at
@@ -1398,6 +1619,12 @@ impl ActonAIBuilder {
         // notice the section at launch and say so, rather than drop it.
         if let Some(telemetry) = config.telemetry {
             self.telemetry_file = Some(telemetry);
+        }
+
+        // And again for `[introspection]`: stashed unconditionally so a build
+        // without the `ipc` feature notices the section at launch and says so.
+        if let Some(introspection) = config.introspection {
+            self.introspection_file = Some(introspection);
         }
 
         // Stash `[context]` settings — resolved at launch after the default
@@ -1874,6 +2101,12 @@ impl ActonAIBuilder {
         // silently exports nothing.
         let telemetry = self.resolve_telemetry()?;
 
+        // Settled before anything is spawned, for the same reason budgets and
+        // routing are: a socket path that cannot be bound, or a section this
+        // build cannot honour, must stop the launch rather than produce a
+        // process an operator believes they can talk to.
+        let introspection_config = self.resolve_introspection()?;
+
         let app_name = self
             .app_name
             .take()
@@ -2042,6 +2275,39 @@ impl ActonAIBuilder {
             tracing::debug!("telemetry enabled");
         }
 
+        // The gate exists whether or not anything can drive it from outside:
+        // the prompt loop reads it unconditionally, and an embedder gets
+        // pause/resume/drain with no socket at all.
+        let admission = crate::introspection::AdmissionGate::new();
+
+        // Last of the actors, deliberately. Everything a status report reads —
+        // providers, MCP supervision, the accountant — is up by now, so the
+        // first `acton-ai status` to arrive describes a complete runtime
+        // rather than a half-built one.
+        let introspection = match introspection_config {
+            Some(config) => Some(
+                start_introspection(
+                    &mut runtime,
+                    &config,
+                    &app_name,
+                    admission.clone(),
+                    IntrospectionCollaborators {
+                        providers: &providers,
+                        provider_models: &provider_models,
+                        provider_failover: &provider_failover,
+                        accountant: accountant.as_ref(),
+                        mcp: mcp.as_ref(),
+                    },
+                )
+                .await?,
+            ),
+            None => None,
+        };
+
+        if self.drain_on_sigterm {
+            spawn_sigterm_drain(admission.clone());
+        }
+
         let context_window = resolve_context_window(
             self.context_window_override.take(),
             self.context_window_disabled,
@@ -2069,9 +2335,52 @@ impl ActonAIBuilder {
                 budget,
                 mcp,
                 telemetry,
+                admission,
+                introspection,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
+    }
+
+    /// Resolves the effective introspection: builder first, then
+    /// `[introspection]` TOML.
+    ///
+    /// Wholesale, never field-by-field — the same precedence `budget` and
+    /// `telemetry` follow. `None` means nothing listens, which is what a
+    /// runtime that configured neither gets.
+    ///
+    /// Without the `ipc` feature this is where a configured `[introspection]`
+    /// section becomes a launch failure. Ignoring it would leave an operator
+    /// debugging a socket that was never going to exist.
+    fn resolve_introspection(
+        &mut self,
+    ) -> Result<Option<crate::introspection::IntrospectionConfig>, ActonAIError> {
+        let resolved = match self.introspection.take() {
+            // The builder path is already a validated config in shape only —
+            // `introspection_at` takes any path — so it goes through the same
+            // resolution the TOML path does rather than a second dialect of
+            // "valid".
+            Some(config) => Some(crate::introspection::IntrospectionConfig::resolve(
+                config.socket_path,
+                Some(config.socket_mode),
+            )?),
+            None => match self.introspection_file.take() {
+                // `enabled = false` is a deployment switching the socket off
+                // without deleting the settings it will want back, so it is
+                // not an error and not a launch failure in a build without the
+                // feature either: nothing was going to listen anyway.
+                Some(file) if !file.is_enabled() => None,
+                Some(file) => Some(file.to_introspection()?),
+                None => None,
+            },
+        };
+
+        #[cfg(not(feature = "ipc"))]
+        if resolved.is_some() {
+            return Err(crate::introspection::unsupported_error());
+        }
+
+        Ok(resolved)
     }
 
     /// Resolves the effective telemetry: builder first, then `[telemetry]`
@@ -2361,6 +2670,127 @@ fn quoted(names: &[&str]) -> String {
         .map(|name| format!("`{name}`"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+/// The actors a status report reads from.
+///
+/// Borrowed as a group rather than passed one by one, because they are all the
+/// same thing — "everything already spawned that a status describes" — and a
+/// nine-argument function is a place for two of them to be swapped by mistake.
+struct IntrospectionCollaborators<'a> {
+    providers: &'a HashMap<String, ActorHandle>,
+    provider_models: &'a HashMap<String, String>,
+    provider_failover: &'a HashMap<String, Vec<String>>,
+    accountant: Option<&'a ActorHandle>,
+    mcp: Option<&'a crate::mcp::McpTools>,
+}
+
+/// Spawns the introspection actor and binds its control socket.
+///
+/// The socket path is resolved here rather than at config time because the
+/// default scheme needs the app name and the PID, neither of which the config
+/// layer knows.
+async fn start_introspection(
+    runtime: &mut ActorRuntime,
+    config: &crate::introspection::IntrospectionConfig,
+    app_name: &str,
+    admission: crate::introspection::AdmissionGate,
+    collaborators: IntrospectionCollaborators<'_>,
+) -> Result<IntrospectionRuntime, ActonAIError> {
+    let IntrospectionCollaborators {
+        providers,
+        provider_models,
+        provider_failover,
+        accountant,
+        mcp,
+    } = collaborators;
+
+    let socket_path = crate::introspection::resolve_socket_path(config, app_name);
+    crate::introspection::server::ensure_socket_dir(&socket_path)?;
+
+    #[cfg(feature = "ipc")]
+    {
+        let sources = crate::introspection::actor::StatusSources {
+            providers: providers.clone(),
+            provider_models: provider_models.clone(),
+            provider_failover: provider_failover.clone(),
+            accountant: accountant.cloned(),
+            mcp: mcp
+                .map(|mcp| {
+                    mcp.servers()
+                        .map(|(name, child)| (name.clone(), child.clone()))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            app_name: app_name.to_string(),
+        };
+
+        let handle =
+            crate::introspection::IntrospectionActor::spawn(runtime, admission, sources).await;
+
+        let listener = crate::introspection::server::start_listener(
+            runtime,
+            handle,
+            &socket_path,
+            config.socket_mode,
+        )
+        .await?;
+
+        Ok(IntrospectionRuntime {
+            socket_path,
+            listener: std::sync::Mutex::new(Some(listener)),
+        })
+    }
+
+    // Unreachable in practice: `resolve_introspection` refuses a configured
+    // section without the feature, so no config ever reaches here. Written out
+    // rather than `unreachable!()` so a future caller cannot turn a wiring
+    // mistake into a panic in someone's production process.
+    #[cfg(not(feature = "ipc"))]
+    {
+        let _ = (
+            runtime,
+            admission,
+            providers,
+            provider_models,
+            provider_failover,
+            accountant,
+            mcp,
+        );
+        Ok(IntrospectionRuntime { socket_path })
+    }
+}
+
+/// Flips the gate to draining when `SIGTERM` arrives.
+///
+/// Holds only the gate, never the runtime: a task holding an `ActonAI` would
+/// keep the `Arc` alive for the life of the process and quietly defeat every
+/// `shutdown()` the owner performed.
+fn spawn_sigterm_drain(admission: crate::introspection::AdmissionGate) {
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let mut term = match tokio::signal::unix::signal(
+            tokio::signal::unix::SignalKind::terminate(),
+        ) {
+            Ok(stream) => stream,
+            Err(error) => {
+                tracing::warn!(%error, "could not install the SIGTERM handler; drain_on_sigterm is inactive");
+                return;
+            }
+        };
+
+        // One shot: a second SIGTERM means the operator has stopped asking
+        // politely, and the default disposition — terminate — is the right
+        // answer to that. Staying installed would swallow it.
+        if term.recv().await.is_some() {
+            let state = admission.drain();
+            crate::introspection::sd_notify::notify_stopping();
+            tracing::info!(%state, "SIGTERM received; no longer admitting new turns");
+        }
+    });
+
+    #[cfg(not(unix))]
+    let _ = admission;
 }
 
 /// Resolves the runtime [`ContextWindow`] at [`ActonAIBuilder::launch`] time.
@@ -3074,6 +3504,330 @@ mod tests {
         assert!(err.is_configuration(), "err = {err}");
         let rendered = err.to_string();
         assert!(rendered.contains("otel"), "err = {rendered}");
+        assert!(
+            rendered.contains("built without"),
+            "the error must name the missing feature: {rendered}"
+        );
+    }
+
+    /// A config file with a provider and nothing else.
+    fn plain_config() -> crate::config::ActonAIConfig {
+        crate::config::from_str("[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n")
+            .expect("a minimal provider config parses")
+    }
+
+    #[tokio::test]
+    async fn a_runtime_admits_turns_until_something_says_otherwise() {
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        // The default has to be Running: a runtime that launched paused would
+        // be a library that silently does nothing.
+        assert_eq!(
+            ai.admission_state(),
+            crate::introspection::AdmissionState::Running
+        );
+        assert!(ai.admission_state().admits());
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn pause_and_resume_move_the_gate_without_a_socket() {
+        // No `.introspection()` call anywhere: admission control is in-process
+        // state, and an embedder with its own control plane must get it
+        // without opening a Unix socket.
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(ai.pause(), crate::introspection::AdmissionState::Paused);
+        assert!(!ai.admission_state().admits());
+
+        assert_eq!(ai.drain(), crate::introspection::AdmissionState::Draining);
+        assert!(!ai.admission_state().admits());
+
+        // Resume lifts a drain too, for the operator who changed their mind.
+        assert_eq!(ai.resume(), crate::introspection::AdmissionState::Running);
+        assert!(ai.admission_state().admits());
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_paused_runtime_refuses_a_turn_before_dispatching_it() {
+        // The provider is Ollama on its default port, which is not running in
+        // CI. That is the point: if the refusal did not happen first, this
+        // would fail with a connection error instead.
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        ai.pause();
+
+        let err = ai
+            .prompt("this must never be sent")
+            .collect()
+            .await
+            .expect_err("a paused runtime admits nothing");
+
+        assert!(err.is_turns_not_admitted(), "err = {err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("paused"), "err = {rendered}");
+        assert!(rendered.contains("acton-ai resume"), "err = {rendered}");
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_resumed_runtime_dispatches_again() {
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        ai.pause();
+        ai.resume();
+
+        let err = ai
+            .prompt("this is allowed to fail, but not by refusal")
+            .collect()
+            .await
+            .expect_err("no Ollama is listening in a test run");
+
+        // The distinction is the whole point: after a resume the turn is
+        // admitted and fails on its merits, rather than being turned away.
+        assert!(!err.is_turns_not_admitted(), "err = {err}");
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn no_socket_is_created_unless_introspection_is_configured() {
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("launch");
+
+        // Compiling the `ipc` feature in must not open a control socket. A
+        // library that listens by default is one nobody can safely embed.
+        assert!(ai.introspection_socket().is_none());
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(feature = "ipc")]
+    #[tokio::test]
+    async fn an_introspection_socket_is_bound_owner_only_and_removed_on_shutdown() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("control.sock");
+
+        let ai = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .introspection_at(&socket)
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(ai.introspection_socket(), Some(socket.as_path()));
+        assert!(
+            socket.exists(),
+            "the socket file must exist while listening"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&socket)
+                .expect("metadata")
+                .permissions()
+                .mode()
+                & 0o777;
+            // The permission bits are the access control, since the IPC layer
+            // exposes no peer-credential hook. A regression here is a real
+            // widening.
+            assert_eq!(mode, crate::introspection::SOCKET_MODE, "{mode:#o}");
+        }
+
+        ai.shutdown().await.expect("shutdown");
+
+        // A socket left behind would make the next launch treat a dead address
+        // as possibly-live.
+        assert!(!socket.exists(), "the socket must be gone after shutdown");
+
+        // The operator-facing consequence, and the reason the file matters:
+        // restarting in place at the same address has to work, immediately and
+        // without a manual `rm`.
+        let restarted = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .introspection_at(&socket)
+            .launch()
+            .await
+            .expect("the same socket path is free once the first runtime is down");
+
+        assert!(socket.exists());
+        restarted.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(feature = "ipc")]
+    #[tokio::test]
+    async fn a_second_runtime_cannot_take_over_a_live_socket() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("contested.sock");
+
+        let first = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .introspection_at(&socket)
+            .launch()
+            .await
+            .expect("the first runtime binds the socket");
+
+        let err = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .introspection_at(&socket)
+            .launch()
+            .await
+            .expect_err("two runtimes must not share one control address");
+
+        assert!(err.is_configuration(), "err = {err}");
+        // Naming the path is the difference between a five-second fix and a
+        // long afternoon: the operator has to know *which* socket.
+        assert!(
+            err.to_string().contains(&socket.display().to_string()),
+            "err = {err}"
+        );
+
+        first.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_relative_introspection_socket_path_fails_the_launch() {
+        let err = ActonAI::builder()
+            .apply_config(plain_config())
+            .expect("apply_config")
+            .introspection_at("control.sock")
+            .launch()
+            .await
+            .expect_err("a socket that moves with the cwd is unfindable");
+
+        assert!(err.is_configuration(), "err = {err}");
+        assert!(err.to_string().contains("absolute"), "err = {err}");
+    }
+
+    #[tokio::test]
+    async fn a_disabled_introspection_section_listens_and_fails_at_nothing() {
+        // `enabled = false` must be inert in *every* build, including one
+        // without the `ipc` feature: nothing was going to listen, so there is
+        // nothing to refuse over.
+        let config = crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [introspection]\nenabled = false\nsocket_path = \"/nonexistent/dir/x.sock\"\n",
+        )
+        .expect("the section parses");
+
+        let ai = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect("a disabled section is not a launch failure");
+
+        assert!(ai.introspection_socket().is_none());
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[cfg(feature = "ipc")]
+    #[tokio::test]
+    async fn a_builder_introspection_call_replaces_the_toml_section_wholesale() {
+        // The TOML section names a socket mode that would be refused. If the
+        // builder's call merged field-by-field instead of replacing, that mode
+        // would survive and the launch would fail — so a clean launch at the
+        // builder's own path is the proof.
+        let config = crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [introspection]\nsocket_mode = 0o666\nsocket_path = \"/nonexistent/dir/x.sock\"\n",
+        )
+        .expect("the section parses even when it cannot be honoured");
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let socket = dir.path().join("builder-wins.sock");
+
+        let ai = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .introspection_at(&socket)
+            .launch()
+            .await
+            .expect("the builder's introspection replaces the section entirely");
+
+        assert_eq!(ai.introspection_socket(), Some(socket.as_path()));
+
+        ai.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn a_world_writable_socket_mode_in_toml_fails_the_launch() {
+        let config = crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [introspection]\nsocket_mode = 0o666\n",
+        )
+        .expect("the section parses");
+
+        let err = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect_err("a control socket anyone can write to is refused");
+
+        assert!(err.is_configuration(), "err = {err}");
+        assert!(err.to_string().contains("pause"), "err = {err}");
+    }
+
+    /// Without the `ipc` feature, a configured `[introspection]` section must
+    /// stop the launch and say why.
+    ///
+    /// The mirror of the telemetry case, and for the same reason: an operator
+    /// whose `acton-ai status` finds nothing needs to be told the binary
+    /// cannot listen, not left debugging the socket.
+    #[cfg(not(feature = "ipc"))]
+    #[tokio::test]
+    async fn launch_fails_when_introspection_is_configured_without_the_ipc_feature() {
+        let config = crate::config::from_str(
+            "[providers.local]\ntype = \"ollama\"\nmodel = \"test\"\n\
+             [introspection]\nsocket_path = \"/run/agent.sock\"\n",
+        )
+        .expect("the section must parse even without the feature");
+
+        let err = ActonAI::builder()
+            .apply_config(config)
+            .expect("apply_config")
+            .launch()
+            .await
+            .expect_err("a socket that cannot be created must not be ignored");
+
+        assert!(err.is_configuration(), "err = {err}");
+        let rendered = err.to_string();
+        assert!(rendered.contains("ipc"), "err = {rendered}");
         assert!(
             rendered.contains("built without"),
             "the error must name the missing feature: {rendered}"

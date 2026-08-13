@@ -26,7 +26,7 @@ default-members = [".", "macros"]
 resolver = "2"
 
 [features]
-default = ["sandbox-hardening", "derive", "otel"]
+default = ["sandbox-hardening", "derive", "otel", "ipc"]
 # Enables Linux-specific OS hardening (landlock + seccomp) for the process
 # sandbox child. A no-op on non-Linux platforms.
 sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
@@ -43,6 +43,18 @@ derive = ["dep:acton-ai-macros"]
 # dedicated `std::thread` via `futures_executor::block_on`, where an async
 # client would have no reactor to drive its IO. No tonic, no gRPC stack.
 otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
+# Enables the live introspection server: an operator can ask a running process
+# for its status and pause/resume/drain turn admission over a Unix socket
+# (`acton-ai status`, `acton-ai pause`, ...). Part of the default set for the
+# same reason `otel` is — a released binary must be *able* to listen without a
+# rebuild — but nothing listens until `[introspection]` or the builder arms it.
+# A control socket is a security surface, so compile-time on is not runtime on.
+#
+# Only the socket, the wire types, and the server actor sit behind this flag.
+# Admission control itself (`ActonAI::pause`/`resume`/`drain`) is always
+# compiled: it is ordinary in-process state, not IPC, and an embedder that
+# builds without `ipc` still gets it.
+ipc = ["acton-reactive/ipc"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
@@ -133,4 +145,4 @@ libc = { version = "0.2.186", optional = true }
 seccompiler = { version = "0.5.0", optional = true }
 
 [target."cfg(unix)".dependencies]
-nix = { version = "0.31.2", features = ["signal"] }
+nix = { version = "0.31.2", features = ["signal", "user"] }

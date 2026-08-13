@@ -68,6 +68,7 @@ pub mod conversation;
 pub mod error;
 pub mod extract;
 pub mod facade;
+pub mod introspection;
 pub mod llm;
 pub mod logging;
 pub mod mcp;
@@ -124,7 +125,8 @@ pub mod prelude {
     };
     pub use crate::config::{
         ActonAIConfig, ActonAIDefaults, BudgetFileConfig, CircuitBreakerFileConfig,
-        McpServerConfig, NamedProviderConfig, PricingFileConfig, RateLimitFileConfig,
+        IntrospectionFileConfig, McpServerConfig, NamedProviderConfig, PricingFileConfig,
+        RateLimitFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
@@ -132,6 +134,7 @@ pub mod prelude {
     pub use crate::error::{ActonAIError, ActonAIErrorKind, ProviderAttempt};
     pub use crate::extract::STRUCTURED_OUTPUT_TOOL;
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
+    pub use crate::introspection::{AdmissionGate, AdmissionState, IntrospectionConfig};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
 
@@ -174,7 +177,7 @@ pub mod prelude {
     pub use crate::tool;
     pub use crate::types::{
         AgentId, ConversationId, CorrelationId, InvalidTaskId, MemoryId, MessageId, TaskId,
-        ToolName,
+        ToolName, TurnId,
     };
 
     // Re-export acton-reactive prelude

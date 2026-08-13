@@ -49,11 +49,11 @@ use crate::facade::ActonAI;
 use crate::llm::{CheckHealth, FailoverEvent, ProviderHealth, SamplingParams};
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, ToolCall, ToolChoice, ToolDefinition, Usage,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, Usage,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall};
 use crate::tools::ToolError;
-use crate::types::{AgentId, CorrelationId};
+use crate::types::{AgentId, CorrelationId, TurnId};
 use acton_reactive::prelude::*;
 use schemars::JsonSchema;
 use serde::de::DeserializeOwned;
@@ -1012,11 +1012,36 @@ impl PromptBuilder {
             .provider_name
             .clone()
             .unwrap_or_else(|| self.runtime.default_provider_name().to_string());
+
+        // Admission is checked exactly here: before the span opens, before a
+        // provider is resolved, before anything is sent. A refusal must cost
+        // nothing, or `pause` would be a way to spend money slowly.
+        let broker = self.runtime.runtime().broker();
+        let admission = self.runtime.admission_state();
+        if !admission.admits() {
+            broker.broadcast(TurnLifecycle::TurnRefused).await;
+            return Err(ActonAIError::turns_not_admitted(admission));
+        }
+
+        // From here the turn is admitted, and every exit path below must
+        // publish `TurnFinished` — a turn counted as started and never
+        // finished holds a drain open forever.
+        let turn_id = TurnId::new();
+        broker
+            .broadcast(TurnLifecycle::TurnStarted {
+                turn_id: turn_id.clone(),
+            })
+            .await;
+
         let turn =
             crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
 
         let mut stats = TurnStats::default();
-        let result = self.run_rounds(session, &turn, &mut stats).await;
+        let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
+
+        broker
+            .broadcast(TurnLifecycle::TurnFinished { turn_id })
+            .await;
 
         let outcome = match &result {
             Ok(_) => crate::telemetry::metrics::OUTCOME_OK,
@@ -1038,6 +1063,7 @@ impl PromptBuilder {
         session: &StreamCollectorSession,
         turn: &crate::telemetry::spans::TurnSpan,
         stats: &mut TurnStats,
+        turn_id: &TurnId,
     ) -> Result<(CollectedResponse, Option<serde_json::Value>), ActonAIError> {
         // Destructure self to take ownership of all fields
         let PromptBuilder {
@@ -1454,7 +1480,26 @@ impl PromptBuilder {
                         let tool_span = turn.tool(&tool_call.name);
                         let tool_started = std::time::Instant::now();
 
+                        // Bracketed for the same reason the turn is: a tool
+                        // is where a turn spends most of its wall-clock, so
+                        // "what is this process doing right now" is usually
+                        // answered by the name of a running tool.
+                        provider_handle
+                            .broadcast(TurnLifecycle::ToolStarted {
+                                turn_id: turn_id.clone(),
+                                tool_call_id: tool_call.id.clone(),
+                                tool_name: tool_call.name.clone(),
+                            })
+                            .await;
+
                         let result = execute_tool_with_callback(&mut tools, tool_call).await;
+
+                        provider_handle
+                            .broadcast(TurnLifecycle::ToolFinished {
+                                turn_id: turn_id.clone(),
+                                tool_call_id: tool_call.id.clone(),
+                            })
+                            .await;
 
                         let tool_outcome = if result.is_ok() {
                             crate::telemetry::metrics::OUTCOME_OK
@@ -1591,6 +1636,10 @@ fn outcome_for(error: &ActonAIError) -> &'static str {
         Kind::Mcp { .. } => "mcp",
         Kind::Extraction { .. } => "extraction",
         Kind::AllProvidersFailed { .. } => "all_providers_failed",
+        // Distinct from every failure above: nothing broke and nothing was
+        // spent. A team draining for a deploy needs these separable from real
+        // errors, or a clean rollout looks like an incident.
+        Kind::TurnsNotAdmitted { .. } => "turns_not_admitted",
     }
 }
 
@@ -2073,6 +2122,37 @@ struct CollectorResultData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_refused_turn_gets_its_own_span_outcome() {
+        let refused = outcome_for(&ActonAIError::turns_not_admitted(
+            crate::introspection::AdmissionState::Paused,
+        ));
+
+        // A team draining for a deploy filters on this label. Sharing one with
+        // a real failure would make every clean rollout look like an incident.
+        assert_eq!(refused, "turns_not_admitted");
+        assert_ne!(refused, outcome_for(&ActonAIError::prompt_failed("boom")));
+        assert_ne!(
+            refused,
+            outcome_for(&ActonAIError::provider_error("upstream 500"))
+        );
+    }
+
+    #[test]
+    fn a_draining_refusal_shares_the_paused_outcome() {
+        // The two differ for an operator reading `status`, not for a span:
+        // both mean "we chose not to start this", and splitting the label
+        // would fragment the very query the label exists for.
+        assert_eq!(
+            outcome_for(&ActonAIError::turns_not_admitted(
+                crate::introspection::AdmissionState::Draining
+            )),
+            outcome_for(&ActonAIError::turns_not_admitted(
+                crate::introspection::AdmissionState::Paused
+            ))
+        );
+    }
 
     #[test]
     fn tool_spec_debug_impl() {

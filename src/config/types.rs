@@ -126,6 +126,88 @@ pub struct ActonAIConfig {
     /// they would go looking for a broken collector rather than a lean build.
     #[serde(default)]
     pub telemetry: Option<TelemetryFileConfig>,
+
+    /// Live introspection over a Unix control socket.
+    ///
+    /// Corresponds to `[introspection]` in TOML. An
+    /// [`introspection`](crate::facade::ActonAIBuilder::introspection) call on
+    /// the builder replaces this section wholesale — there is no field-level
+    /// merging.
+    ///
+    /// The section parses even in a build without the `ipc` feature; the
+    /// launch is what refuses, naming the missing feature, for the same reason
+    /// `[telemetry]` does. An operator whose `acton-ai status` finds no socket
+    /// would otherwise debug the socket rather than the build.
+    #[serde(default)]
+    pub introspection: Option<IntrospectionFileConfig>,
+}
+
+/// Live introspection settings loaded from `[introspection]` in TOML.
+///
+/// ```toml
+/// [introspection]
+/// enabled = true                                  # optional, default true
+/// socket_path = "/run/user/1000/my-agent.sock"    # optional, default is PID-suffixed
+/// socket_mode = 0o600                             # optional, default 0o600
+/// ```
+///
+/// The section's **presence** is what arms introspection; `enabled = false` is
+/// there so a deployment can turn the socket off without deleting the settings
+/// it will want back. A socket accepts `pause` and `drain`, so
+/// `socket_mode` is refused if it grants any access beyond the owner.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IntrospectionFileConfig {
+    /// Whether to listen at all. Defaults to true, because writing the section
+    /// at all is a request for the socket.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Absolute path to bind the control socket at.
+    ///
+    /// Defaults to `$XDG_RUNTIME_DIR/acton-ai/<app-name>-<pid>.sock`. Set it
+    /// when something outside the process needs a predictable address.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_path: Option<PathBuf>,
+
+    /// Permission bits for the socket file. Defaults to `0o600`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub socket_mode: Option<u32>,
+}
+
+impl IntrospectionFileConfig {
+    /// Whether this section asks for a listener.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Validates the section and resolves defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when `socket_path` is relative, or when
+    /// `socket_mode` is not owner-only permission bits.
+    ///
+    /// ```rust
+    /// use acton_ai::config::IntrospectionFileConfig;
+    ///
+    /// let section: IntrospectionFileConfig =
+    ///     toml::from_str("socket_path = '/run/agent.sock'").unwrap();
+    /// let resolved = section.to_introspection().unwrap();
+    /// assert_eq!(resolved.socket_mode, 0o600);
+    ///
+    /// // A socket that accepts `pause` must not be group-writable.
+    /// let loose: IntrospectionFileConfig = toml::from_str("socket_mode = 0o660").unwrap();
+    /// assert!(loose.to_introspection().is_err());
+    /// ```
+    pub fn to_introspection(
+        &self,
+    ) -> Result<crate::introspection::IntrospectionConfig, ActonAIError> {
+        crate::introspection::IntrospectionConfig::resolve(
+            self.socket_path.clone(),
+            self.socket_mode,
+        )
+    }
 }
 
 /// OpenTelemetry export settings loaded from `[telemetry]` in TOML.
@@ -1770,6 +1852,7 @@ max_execution_ms = 60000
             telemetry: None,
             mcp_servers: HashMap::new(),
             budget: None,
+            introspection: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
