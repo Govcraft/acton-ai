@@ -235,6 +235,23 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
         }
     }
 
+    if let Some(budget) = &report.config.budget {
+        output.write_line("")?;
+        output.write_line("Budget:")?;
+        if let Some(total) = budget.total_usd {
+            output.write_line(&format!("  total_usd:        {total:.2}"))?;
+        }
+        if let Some(percent) = budget.warn_at_percent {
+            output.write_line(&format!("  warn_at_percent:  {percent}"))?;
+        }
+        if let Some(allow) = budget.allow_unpriced {
+            output.write_line(&format!("  allow_unpriced:   {allow}"))?;
+        }
+        for (name, cap) in &budget.providers {
+            output.write_line(&format!("  provider {name}: {cap:.2}"))?;
+        }
+    }
+
     if let Some(sb) = &report.config.sandbox {
         output.write_line("")?;
         output.write_line("Sandbox:")?;

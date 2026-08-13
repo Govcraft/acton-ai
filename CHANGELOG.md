@@ -3,6 +3,52 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Breaking changes
+
+- `CostAccountant::spawn` takes a third argument: the optional `BudgetConfig`
+  to enforce. Facade users are unaffected.
+- `UsageSnapshot` gains a `budget` field, so struct literals of it need
+  updating. Field access and the accessor methods are unchanged.
+
+### Added
+
+- Spending budgets. `Budget` sets a process-wide cap and/or per-provider caps;
+  the prompt loop asks the accountant before every provider dispatch and fails
+  with `ActonAIErrorKind::BudgetExceeded` once a ceiling is reached. The check
+  is pre-flight, so a refused request costs nothing — but a request already in
+  flight when the ceiling is crossed still completes. A cap is a circuit
+  breaker, not an exact meter.
+- `ActonAIBuilder::budget_usd(5.00)` for the common case,
+  `ActonAIBuilder::budget(Budget::usd(5.00).provider("claude", 2.00)
+  .warn_at_percent(50).allow_unpriced())` for the rest, and a `[budget]` TOML
+  section with the same shape. A builder-set budget replaces the TOML section
+  wholesale.
+- `ActonAIBuilder::on_budget_event` runs a callback for every `BudgetEvent`;
+  `ThresholdCrossed` (default 80%, configurable, 0 disables) and `Exceeded`
+  are broadcast on the broker, so low-level users can subscribe directly. Each
+  fires once per scope.
+- `UsageSnapshot::budget` carries a `BudgetStatus`: limit, spend, remaining
+  and percent used per scope, with `*_usd()` display helpers. `None` when no
+  budget is configured, never a budget with nothing spent against it.
+- `ActonAIBuilder::pricing(name, ModelPricing)` — the programmatic twin of
+  `[providers.<name>.pricing]`, and what makes a budget possible without a
+  config file.
+- `accounting::dollars_to_microusd`, the shared dollar boundary;
+  `dollars_per_mtok_to_microusd` now delegates to it so caps and prices round
+  identically.
+- `ActonAIError::budget_exceeded` and `ActonAIError::is_budget_exceeded`.
+
+### Changed
+
+- Budgets fail closed. A budget with `usage_tracking(false)`, a budget
+  alongside a configured provider with no pricing, or a cap naming a provider
+  that was never configured all fail the launch, naming the exact knob to
+  change. `Budget::allow_unpriced()` accepts the pricing blind spot
+  explicitly, counting that usage as $0. Unpriced usage that reaches the
+  accountant at runtime refuses the next request.
+
 ## 0.30.0 - 2026-08-12
 
 ### Breaking changes

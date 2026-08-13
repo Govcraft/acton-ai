@@ -858,6 +858,39 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Installs pricing for one configured provider.
+    ///
+    /// The programmatic twin of `[providers.<name>.pricing]`, and what makes
+    /// a budget possible without a config file: caps compare priced spend, so
+    /// a provider with no rates has no spend to compare.
+    ///
+    /// Repeatable, and last write wins — the same rule
+    /// [`apply_config`](Self::apply_config) already follows for providers, so
+    /// a call placed after `from_config()` overrides the file's rates and one
+    /// placed before is overridden by them.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::prelude::ModelPricing;
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .pricing(DEFAULT_PROVIDER_NAME, ModelPricing::from_dollars_per_mtok(3.0, 15.0))
+    ///     .budget_usd(5.00)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn pricing(
+        mut self,
+        provider: impl Into<String>,
+        pricing: crate::accounting::ModelPricing,
+    ) -> Self {
+        self.pricing.insert(provider, pricing);
+        self
+    }
+
     /// Caps process-wide spending at `dollars`, refusing requests past it.
     ///
     /// The one-liner form of [`budget`](Self::budget): a process-wide cap,
@@ -1837,8 +1870,10 @@ fn validate_budget_coverage(
         "budget",
         format!(
             "a budget is set but provider(s) {} have no pricing, so their spending would be \
-             invisible to the cap. Add:\n\n{tables}\n\nor accept the blind spot with \
-             Budget::allow_unpriced() / `allow_unpriced = true` under [budget]",
+             invisible to the cap. Add:\n\n{tables}\n\nor call \
+             ActonAIBuilder::pricing(name, ModelPricing::from_dollars_per_mtok(..)), or accept \
+             the blind spot with Budget::allow_unpriced() / `allow_unpriced = true` under \
+             [budget]",
             quoted(&unpriced),
         ),
     ))
@@ -2366,6 +2401,26 @@ mod tests {
             message.contains("allow_unpriced"),
             "the error must name the opt-out: {message}"
         );
+    }
+
+    #[tokio::test]
+    async fn builder_pricing_is_enough_to_launch_a_budget_without_a_config_file() {
+        // The all-in-code path: without `pricing()` there would be no way to
+        // price a provider outside TOML, and every programmatic budget would
+        // fail the launch.
+        let ai = ActonAI::builder()
+            .ollama("test")
+            .pricing(
+                DEFAULT_PROVIDER_NAME,
+                crate::accounting::ModelPricing::from_dollars_per_mtok(3.0, 15.0),
+            )
+            .budget_usd(5.00)
+            .launch()
+            .await
+            .expect("a builder-priced provider satisfies the budget's pricing requirement");
+
+        assert!(ai.is_budget_enforced());
+        ai.shutdown().await.expect("clean shutdown");
     }
 
     #[tokio::test]

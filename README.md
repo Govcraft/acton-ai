@@ -38,6 +38,7 @@ Five lines to an interactive chat with file access and command execution.
 - **TOML configuration** — Define providers and settings in config files
 - **Process sandboxing** — Portable subprocess isolation for tool execution with rlimits, timeouts, and optional Linux hardening (landlock + seccomp)
 - **Usage & cost tracking** — Token usage from every provider tallied per provider and model, priced from your own rate table; on by default
+- **Spending budgets** — Hard process-wide and per-provider caps checked before every request, with warnings on the way up and a typed refusal at the ceiling
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -262,6 +263,20 @@ hardening = "besteffort"    # "off" | "besteffort" | "enforce"
 [sandbox.limits]
 max_execution_ms = 30000
 max_memory_mb = 256
+
+# Optional: rates for usage costs. Dollars per million tokens, copied
+# straight off a vendor pricing page. Required for budgets.
+[providers.claude.pricing]
+input_per_mtok = 3.0
+output_per_mtok = 15.0
+
+# Optional: spending caps, checked before every request.
+[budget]
+total_usd = 5.00
+warn_at_percent = 80        # default 80; 0 disables warnings
+
+[budget.providers]
+claude = 2.00               # per configured provider name
 ```
 
 Load the configuration:
@@ -292,6 +307,39 @@ let runtime = ActonAI::builder()
     .launch()
     .await?;
 ```
+
+### Spending Budgets
+
+A budget refuses requests once a ceiling is reached. The check is pre-flight,
+so a refusal costs nothing:
+
+```rust
+use acton_ai::prelude::*;
+
+let runtime = ActonAI::builder()
+    .anthropic_from_env()
+    .pricing(DEFAULT_PROVIDER_NAME, ModelPricing::from_dollars_per_mtok(3.0, 15.0))
+    .budget_usd(5.00)                                 // or .budget(Budget::usd(5.00)
+    .on_budget_event(|e| eprintln!("budget: {e}"))    //      .provider("claude", 2.00)
+    .launch()                                         //      .warn_at_percent(50))
+    .await?;
+
+match runtime.prompt("hello").collect().await {
+    Err(e) if e.is_budget_exceeded() => println!("{e}"),
+    other => { other?; }
+}
+
+// Where the caps stand, alongside the usual token tallies.
+let usage = runtime.usage().await?;
+if let Some(budget) = &usage.budget {
+    println!("{:?} left", budget.remaining_usd());
+}
+```
+
+Budgets need pricing: a provider whose tokens cannot be priced spends
+invisibly, so it fails the launch unless `Budget::allow_unpriced()` says the
+blind spot is acceptable. A cap is a circuit breaker, not an exact meter — a
+request already in flight when the ceiling is crossed still completes.
 
 ## Built-in Tools
 
@@ -538,6 +586,9 @@ cargo run --example per_agent_tools
 
 # Typed structured output
 cargo run --example structured_output
+
+# Spending caps and budget events
+cargo run --example budget
 
 # Deriving tools from functions with #[tool]
 cargo run --example tool_macro
