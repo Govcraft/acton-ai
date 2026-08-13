@@ -287,8 +287,13 @@ fn test_streaming_messages() {
         usage: Usage::default(),
         correlation_id: corr_id.clone(),
         stop_reason: StopReason::EndTurn,
+        model: "mock-model".to_string(),
     };
     assert_eq!(end.stop_reason, StopReason::EndTurn);
+    assert_eq!(
+        end.model, "mock-model",
+        "the round's terminal event names the model that actually served"
+    );
 }
 
 /// Test stream accumulator functionality.

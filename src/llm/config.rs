@@ -226,11 +226,99 @@ pub struct ProviderConfig {
     /// single complete response is preferable to incremental tokens.
     #[serde(default = "default_streaming")]
     pub streaming: bool,
+    /// Circuit breaker settings for this provider.
+    ///
+    /// Enabled by default: a provider that fails five times in a row is
+    /// tripped open for thirty seconds rather than hammered. See
+    /// [`CircuitBreakerConfig`].
+    #[serde(default)]
+    pub circuit_breaker: CircuitBreakerConfig,
+    /// Other configured providers to try, in order, when this one fails.
+    ///
+    /// Empty by default, because a chain changes where requests are routed
+    /// and therefore who is billed. Names must be other providers configured
+    /// in the same runtime; the chains of those fallbacks are *not* followed,
+    /// so this list is the whole candidate set.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failover: Vec<String>,
+    /// A cheaper model to fall back to while this provider is rate limited.
+    ///
+    /// `None` by default. When set, a request that would otherwise be queued
+    /// behind an API-reported rate limit is dispatched immediately against
+    /// this model instead. Self-healing: once the rate limit clears, traffic
+    /// returns to [`model`](Self::model) with no operator action.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_model: Option<String>,
 }
 
 /// Serde default for [`ProviderConfig::streaming`].
 const fn default_streaming() -> bool {
     true
+}
+
+/// Per-provider circuit breaker settings.
+///
+/// The breaker counts *consecutive* failures. Reaching
+/// [`failure_threshold`](Self::failure_threshold) trips the circuit open for
+/// [`cooldown`](Self::cooldown); the first request after the cooldown expires
+/// is a half-open probe made of real traffic, and its outcome either closes
+/// the circuit or opens it again.
+///
+/// Enabled by default with a threshold of 5 and a 30-second cooldown. Opt out
+/// with [`ProviderConfig::without_circuit_breaker`] or `enabled = false`.
+///
+/// ```
+/// use acton_ai::llm::CircuitBreakerConfig;
+/// use std::time::Duration;
+///
+/// let breaker = CircuitBreakerConfig::new(3, Duration::from_secs(10));
+///
+/// assert!(breaker.enabled);
+/// assert_eq!(breaker.failure_threshold, 3);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CircuitBreakerConfig {
+    /// Whether the breaker may trip at all. `false` means failures are still
+    /// counted but the circuit never opens.
+    pub enabled: bool,
+    /// Consecutive failures that trip the circuit open.
+    pub failure_threshold: u32,
+    /// How long the circuit stays open before the next request probes.
+    pub cooldown: Duration,
+}
+
+/// Consecutive failures that trip a circuit open by default.
+pub const DEFAULT_FAILURE_THRESHOLD: u32 = 5;
+
+/// How long a tripped circuit stays open by default.
+pub const DEFAULT_COOLDOWN: Duration = Duration::from_secs(30);
+
+impl CircuitBreakerConfig {
+    /// Creates an enabled breaker with the given threshold and cooldown.
+    #[must_use]
+    pub const fn new(failure_threshold: u32, cooldown: Duration) -> Self {
+        Self {
+            enabled: true,
+            failure_threshold,
+            cooldown,
+        }
+    }
+
+    /// A breaker that never trips, whatever the failure count.
+    #[must_use]
+    pub const fn disabled() -> Self {
+        Self {
+            enabled: false,
+            failure_threshold: DEFAULT_FAILURE_THRESHOLD,
+            cooldown: DEFAULT_COOLDOWN,
+        }
+    }
+}
+
+impl Default for CircuitBreakerConfig {
+    fn default() -> Self {
+        Self::new(DEFAULT_FAILURE_THRESHOLD, DEFAULT_COOLDOWN)
+    }
 }
 
 impl ProviderConfig {
@@ -284,6 +372,9 @@ impl ProviderConfig {
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
             streaming: default_streaming(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -317,6 +408,9 @@ impl ProviderConfig {
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
             streaming: default_streaming(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -348,6 +442,9 @@ impl ProviderConfig {
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
             streaming: default_streaming(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -381,6 +478,9 @@ impl ProviderConfig {
             retry: RetryConfig::default(),
             sampling: SamplingParams::default(),
             streaming: default_streaming(),
+            circuit_breaker: CircuitBreakerConfig::default(),
+            failover: Vec::new(),
+            fallback_model: None,
         }
     }
 
@@ -454,6 +554,81 @@ impl ProviderConfig {
     #[must_use]
     pub fn with_retry(mut self, retry: RetryConfig) -> Self {
         self.retry = retry;
+        self
+    }
+
+    /// Sets the circuit breaker configuration.
+    ///
+    /// ```
+    /// use acton_ai::llm::{CircuitBreakerConfig, ProviderConfig};
+    /// use std::time::Duration;
+    ///
+    /// let config = ProviderConfig::new("key")
+    ///     .with_circuit_breaker(CircuitBreakerConfig::new(3, Duration::from_secs(10)));
+    ///
+    /// assert_eq!(config.circuit_breaker.failure_threshold, 3);
+    /// ```
+    #[must_use]
+    pub fn with_circuit_breaker(mut self, circuit_breaker: CircuitBreakerConfig) -> Self {
+        self.circuit_breaker = circuit_breaker;
+        self
+    }
+
+    /// Turns the circuit breaker off, so consecutive failures never trip it.
+    ///
+    /// ```
+    /// use acton_ai::llm::ProviderConfig;
+    ///
+    /// let config = ProviderConfig::new("key").without_circuit_breaker();
+    ///
+    /// assert!(!config.circuit_breaker.enabled);
+    /// ```
+    #[must_use]
+    pub fn without_circuit_breaker(mut self) -> Self {
+        self.circuit_breaker.enabled = false;
+        self
+    }
+
+    /// Sets the providers to fall back to, in order, when this one fails.
+    ///
+    /// Every name must be another provider configured in the same runtime;
+    /// [`launch`](crate::facade::ActonAIBuilder::launch) refuses a chain that
+    /// names an unknown provider, this provider itself, or the same fallback
+    /// twice.
+    ///
+    /// ```
+    /// use acton_ai::llm::ProviderConfig;
+    ///
+    /// let config = ProviderConfig::new("key").with_failover(["backup", "local"]);
+    ///
+    /// assert_eq!(config.failover, vec!["backup".to_string(), "local".to_string()]);
+    /// ```
+    #[must_use]
+    pub fn with_failover<I, S>(mut self, providers: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.failover = providers.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets a cheaper model to serve from while this provider is rate limited.
+    ///
+    /// Must differ from [`model`](Self::model); launch refuses a fallback that
+    /// names the primary model, because degrading to the same model would do
+    /// nothing but hide the rate limit.
+    ///
+    /// ```
+    /// use acton_ai::llm::ProviderConfig;
+    ///
+    /// let config = ProviderConfig::new("key").with_fallback_model("claude-haiku-4-5");
+    ///
+    /// assert_eq!(config.fallback_model.as_deref(), Some("claude-haiku-4-5"));
+    /// ```
+    #[must_use]
+    pub fn with_fallback_model(mut self, model: impl Into<String>) -> Self {
+        self.fallback_model = Some(model.into());
         self
     }
 

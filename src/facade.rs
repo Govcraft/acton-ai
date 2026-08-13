@@ -75,7 +75,7 @@ use crate::accounting::{Budget, BudgetConfig, BudgetEvent, GetUsage, PricingTabl
 use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
-use crate::llm::{LLMProvider, ProviderConfig};
+use crate::llm::{FailoverEvent, LLMProvider, ProviderConfig};
 use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
@@ -138,6 +138,12 @@ pub(crate) struct ActonAIInner {
     ///
     /// Read by the prompt loop to label round spans and latency metrics.
     pub(crate) provider_models: HashMap<String, String>,
+    /// Failover chain configured for each provider, keyed by provider name.
+    ///
+    /// Only providers with a non-empty `failover` list appear. Absence is
+    /// what lets the prompt loop skip health asks entirely: a runtime that
+    /// configured no chains performs no extra round trips per round.
+    pub(crate) provider_failover: HashMap<String, Vec<String>>,
     /// Built-in tools (if enabled)
     pub(crate) builtins: Option<BuiltinTools>,
     /// Whether to automatically enable builtins on each prompt
@@ -371,6 +377,16 @@ impl ActonAI {
     #[must_use]
     pub fn provider_model(&self, name: &str) -> Option<&str> {
         self.inner.provider_models.get(name).map(String::as_str)
+    }
+
+    /// The failover chain configured for a provider, if it has one.
+    ///
+    /// The returned slice is the list of *fallbacks*, in order; the provider
+    /// itself is not in it. `None` means no chain was configured, which is
+    /// the state in which the prompt loop asks nothing extra per round.
+    #[must_use]
+    pub fn provider_failover(&self, name: &str) -> Option<&[String]> {
+        self.inner.provider_failover.get(name).map(Vec::as_slice)
     }
 
     /// Returns the default `max_tool_rounds` seeded into every new prompt.
@@ -813,6 +829,8 @@ pub struct ActonAIBuilder {
     budget_file: Option<crate::config::BudgetFileConfig>,
     /// Callback registered with [`on_budget_event`](Self::on_budget_event).
     budget_event_callback: Option<Arc<dyn Fn(BudgetEvent) + Send + Sync>>,
+    /// Callback registered with [`on_failover_event`](Self::on_failover_event).
+    failover_event_callback: Option<Arc<dyn Fn(FailoverEvent) + Send + Sync>>,
     /// Telemetry set programmatically with [`telemetry`](Self::telemetry),
     /// [`telemetry_otlp`](Self::telemetry_otlp), or
     /// [`telemetry_from_globals`](Self::telemetry_from_globals).
@@ -1066,6 +1084,33 @@ impl ActonAIBuilder {
         callback: impl Fn(BudgetEvent) + Send + Sync + 'static,
     ) -> Self {
         self.budget_event_callback = Some(Arc::new(callback));
+        self
+    }
+
+    /// Runs `callback` for every [`FailoverEvent`] broadcast on the broker.
+    ///
+    /// This is how an operator finds out that a provider tripped open, that a
+    /// round was served by a fallback, or that a rate-limited provider
+    /// quietly switched to a cheaper model. Same discipline as
+    /// [`on_budget_event`](Self::on_budget_event): the callback runs inside a
+    /// small subscriber actor's message loop, so it must be cheap and must
+    /// not block.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .on_failover_event(|event| eprintln!("failover: {event}"))
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn on_failover_event(
+        mut self,
+        callback: impl Fn(FailoverEvent) + Send + Sync + 'static,
+    ) -> Self {
+        self.failover_event_callback = Some(Arc::new(callback));
         self
     }
 
@@ -1816,6 +1861,12 @@ impl ActonAIBuilder {
             validate_budget_coverage(budget, &self.providers, &self.pricing)?;
         }
 
+        // Routing is settled before anything is spawned, for the same reason
+        // budgets are: a chain that names a provider nobody configured would
+        // otherwise surface as an unexplained failure on the day the primary
+        // dies, which is the worst possible day to discover it.
+        validate_failover(&self.providers)?;
+
         // Telemetry is resolved and installed before anything is spawned, so
         // spans and metrics from the launch itself have somewhere to land.
         // Resolution can fail (bad endpoint, missing feature), and a failure
@@ -1855,8 +1906,14 @@ impl ActonAIBuilder {
         // latency metrics — the provider actor knows it, but by then the
         // telemetry has already been recorded.
         let mut provider_models = HashMap::new();
+        // Only providers that actually configured a chain go in here: the
+        // prompt loop treats absence as "dispatch exactly as before".
+        let mut provider_failover = HashMap::new();
         for (name, config) in std::mem::take(&mut self.providers) {
             provider_models.insert(name.clone(), config.model.clone());
+            if !config.failover.is_empty() {
+                provider_failover.insert(name.clone(), config.failover.clone());
+            }
             // The provider is told its configured name so the usage reports
             // it broadcasts are keyed by it rather than by vendor.
             let handle = LLMProvider::spawn(&mut runtime, name.clone(), config).await;
@@ -1970,6 +2027,12 @@ impl ActonAIBuilder {
             crate::accounting::BudgetEventListener::spawn(&mut runtime, callback).await;
         }
 
+        // Same shape, different broadcast. Only when a callback was
+        // registered — an actor whose closure is `None` is pure overhead.
+        if let Some(callback) = self.failover_event_callback.take() {
+            crate::llm::failover::FailoverEventListener::spawn(&mut runtime, callback).await;
+        }
+
         // Only when telemetry is configured: with no providers installed the
         // actor would subscribe to three broadcasts and record every one of
         // them into a no-op instrument.
@@ -1995,6 +2058,7 @@ impl ActonAIBuilder {
                 providers,
                 default_provider: default_provider_name,
                 provider_models,
+                provider_failover,
                 builtins,
                 auto_builtins: self.auto_builtins,
                 skills,
@@ -2200,6 +2264,96 @@ fn validate_budget_coverage(
     ))
 }
 
+/// Rejects failover and circuit-breaker settings that could not do what they
+/// claim, before a single actor is spawned.
+///
+/// Every rule here catches a misconfiguration whose only other symptom is
+/// silence on the day the primary provider dies — a chain pointing at a
+/// provider nobody configured, a breaker that can never trip, a fallback model
+/// identical to the one that just failed. Fail-closed at launch, exactly as
+/// [`validate_budget_coverage`] does.
+///
+/// Pure: takes the configured providers and returns a verdict.
+fn validate_failover(providers: &HashMap<String, ProviderConfig>) -> Result<(), ActonAIError> {
+    // Deterministic order: a HashMap walk would report a different offender
+    // each run for a config with several problems.
+    let mut names: Vec<&str> = providers.keys().map(String::as_str).collect();
+    names.sort_unstable();
+
+    for name in names {
+        let config = &providers[name];
+        let field = format!("providers.{name}");
+
+        let breaker = &config.circuit_breaker;
+        if breaker.enabled && breaker.failure_threshold == 0 {
+            return Err(ActonAIError::configuration(
+                format!("{field}.circuit_breaker.failure_threshold"),
+                "a threshold of 0 would open the circuit before any request had failed; \
+                 use at least 1, or set `enabled = false` to switch the breaker off"
+                    .to_string(),
+            ));
+        }
+        if breaker.enabled && breaker.cooldown.is_zero() {
+            return Err(ActonAIError::configuration(
+                format!("{field}.circuit_breaker.cooldown_secs"),
+                "a cooldown of 0 would reopen the circuit for probing immediately, which is \
+                 the same as having no breaker at all; use at least 1 second, or set \
+                 `enabled = false`"
+                    .to_string(),
+            ));
+        }
+
+        if config.fallback_model.as_deref() == Some(config.model.as_str()) {
+            let fallback = &config.model;
+            return Err(ActonAIError::configuration(
+                format!("{field}.fallback_model"),
+                format!(
+                    "`{fallback}` is already this provider's model, so degrading to it on a \
+                     rate limit would retry the model that was just throttled; name a \
+                     different, cheaper model or drop the setting"
+                ),
+            ));
+        }
+
+        let mut seen: Vec<&str> = Vec::new();
+        for target in &config.failover {
+            if target == name {
+                return Err(ActonAIError::configuration(
+                    format!("{field}.failover"),
+                    format!(
+                        "the chain names `{name}` itself, which would re-dispatch to the \
+                         provider that just failed; list only other providers"
+                    ),
+                ));
+            }
+            if seen.contains(&target.as_str()) {
+                return Err(ActonAIError::configuration(
+                    format!("{field}.failover"),
+                    format!(
+                        "`{target}` appears twice in the chain; a second attempt on the same \
+                         provider would meet the same open circuit, so remove the duplicate"
+                    ),
+                ));
+            }
+            if !providers.contains_key(target.as_str()) {
+                let mut configured: Vec<&str> = providers.keys().map(String::as_str).collect();
+                configured.sort_unstable();
+                return Err(ActonAIError::configuration(
+                    format!("{field}.failover"),
+                    format!(
+                        "`{target}` is not a configured provider, so failing over to it would \
+                         be impossible; configured providers: {}",
+                        quoted(&configured),
+                    ),
+                ));
+            }
+            seen.push(target.as_str());
+        }
+    }
+
+    Ok(())
+}
+
 /// Renders names as a comma-separated, backtick-quoted list.
 fn quoted(names: &[&str]) -> String {
     names
@@ -2278,6 +2432,169 @@ fn resolve_context_window(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::llm::CircuitBreakerConfig;
+
+    /// Builds a provider map from `(name, config)` pairs.
+    fn provider_map(entries: Vec<(&str, ProviderConfig)>) -> HashMap<String, ProviderConfig> {
+        entries
+            .into_iter()
+            .map(|(name, config)| (name.to_string(), config))
+            .collect()
+    }
+
+    /// The validator's message for a config it should reject.
+    fn failover_rejection(providers: &HashMap<String, ProviderConfig>) -> String {
+        let err = validate_failover(providers)
+            .expect_err("validate_failover accepted a configuration it should have rejected");
+        err.to_string()
+    }
+
+    #[test]
+    fn validate_failover_accepts_providers_with_no_chains() {
+        let providers = provider_map(vec![
+            ("primary", ProviderConfig::ollama("llama3.2")),
+            ("backup", ProviderConfig::ollama("qwen3")),
+        ]);
+        assert!(validate_failover(&providers).is_ok());
+    }
+
+    #[test]
+    fn validate_failover_accepts_a_chain_naming_configured_providers() {
+        let providers = provider_map(vec![
+            (
+                "primary",
+                ProviderConfig::ollama("llama3.2").with_failover(["backup", "last-resort"]),
+            ),
+            ("backup", ProviderConfig::ollama("qwen3")),
+            ("last-resort", ProviderConfig::ollama("phi4")),
+        ]);
+        assert!(validate_failover(&providers).is_ok());
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_chain_naming_an_unconfigured_provider() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2").with_failover(["typo"]),
+        )]);
+        let message = failover_rejection(&providers);
+        assert!(message.contains("providers.primary.failover"), "{message}");
+        assert!(message.contains("`typo`"), "{message}");
+        // The remedy is only actionable if it says what *is* configured.
+        assert!(message.contains("`primary`"), "{message}");
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_chain_naming_itself() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2").with_failover(["primary"]),
+        )]);
+        let message = failover_rejection(&providers);
+        assert!(message.contains("providers.primary.failover"), "{message}");
+        assert!(message.contains("itself"), "{message}");
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_duplicated_chain_entry() {
+        let providers = provider_map(vec![
+            (
+                "primary",
+                ProviderConfig::ollama("llama3.2").with_failover(["backup", "backup"]),
+            ),
+            ("backup", ProviderConfig::ollama("qwen3")),
+        ]);
+        let message = failover_rejection(&providers);
+        assert!(message.contains("twice"), "{message}");
+        assert!(message.contains("`backup`"), "{message}");
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_zero_failure_threshold() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2").with_circuit_breaker(CircuitBreakerConfig::new(
+                0,
+                std::time::Duration::from_secs(30),
+            )),
+        )]);
+        let message = failover_rejection(&providers);
+        assert!(
+            message.contains("providers.primary.circuit_breaker.failure_threshold"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_zero_cooldown() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2")
+                .with_circuit_breaker(CircuitBreakerConfig::new(3, std::time::Duration::ZERO)),
+        )]);
+        let message = failover_rejection(&providers);
+        assert!(
+            message.contains("providers.primary.circuit_breaker.cooldown_secs"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn validate_failover_ignores_breaker_numbers_when_the_breaker_is_off() {
+        // A disabled breaker never consults either number, so nonsense in them
+        // is inert rather than a launch failure.
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2")
+                .with_circuit_breaker(CircuitBreakerConfig::new(0, std::time::Duration::ZERO))
+                .without_circuit_breaker(),
+        )]);
+        assert!(validate_failover(&providers).is_ok());
+    }
+
+    #[test]
+    fn validate_failover_rejects_a_fallback_model_equal_to_the_primary_model() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2").with_fallback_model("llama3.2"),
+        )]);
+        let message = failover_rejection(&providers);
+        assert!(
+            message.contains("providers.primary.fallback_model"),
+            "{message}"
+        );
+        assert!(message.contains("`llama3.2`"), "{message}");
+    }
+
+    #[test]
+    fn validate_failover_accepts_a_distinct_fallback_model() {
+        let providers = provider_map(vec![(
+            "primary",
+            ProviderConfig::ollama("llama3.2").with_fallback_model("llama3.2:1b"),
+        )]);
+        assert!(validate_failover(&providers).is_ok());
+    }
+
+    #[test]
+    fn validate_failover_reports_the_same_offender_across_runs() {
+        // Two broken providers, one HashMap: without a sorted walk the reported
+        // offender would depend on hash order and the error would flap.
+        let providers = provider_map(vec![
+            (
+                "alpha",
+                ProviderConfig::ollama("llama3.2").with_failover(["nope"]),
+            ),
+            (
+                "zulu",
+                ProviderConfig::ollama("qwen3").with_failover(["nope"]),
+            ),
+        ]);
+        let first = failover_rejection(&providers);
+        assert!(first.contains("providers.alpha.failover"), "{first}");
+        for _ in 0..8 {
+            assert_eq!(failover_rejection(&providers), first);
+        }
+    }
 
     #[test]
     fn builder_default_has_no_provider() {

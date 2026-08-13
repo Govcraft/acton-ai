@@ -33,6 +33,8 @@ pub(crate) mod names {
     pub const RATE_LIMITS: &str = "acton_ai.llm.rate_limits";
     /// Budget threshold crossings and denials.
     pub const BUDGET_EVENTS: &str = "acton_ai.budget.events";
+    /// Circuit-breaker transitions, chain failovers, and model degradations.
+    pub const FAILOVER_EVENTS: &str = "acton_ai.failover.events";
     /// Wall time of one provider round.
     pub const REQUEST_DURATION: &str = "acton_ai.llm.request.duration";
     /// Stream start to first token.
@@ -74,6 +76,7 @@ mod imp {
         requests: Counter<u64>,
         rate_limits: Counter<u64>,
         budget_events: Counter<u64>,
+        failover_events: Counter<u64>,
         request_duration: Histogram<f64>,
         time_to_first_token: Histogram<f64>,
         tool_duration: Histogram<f64>,
@@ -107,6 +110,13 @@ mod imp {
                 budget_events: meter
                     .u64_counter(names::BUDGET_EVENTS)
                     .with_description("Budget thresholds crossed and caps exceeded")
+                    .with_unit("{event}")
+                    .build(),
+                failover_events: meter
+                    .u64_counter(names::FAILOVER_EVENTS)
+                    .with_description(
+                        "Circuit breaker transitions, chain failovers, and model degradations",
+                    )
                     .with_unit("{event}")
                     .build(),
                 request_duration: meter
@@ -178,6 +188,16 @@ mod imp {
         instruments().budget_events.add(
             1,
             &[KeyValue::new("kind", kind), KeyValue::new("scope", scope)],
+        );
+    }
+
+    pub(super) fn record_failover_event(kind: &'static str, provider: &str) {
+        instruments().failover_events.add(
+            1,
+            &[
+                KeyValue::new("kind", kind),
+                KeyValue::new("provider", provider.to_string()),
+            ],
         );
     }
 
@@ -272,6 +292,26 @@ pub(crate) fn record_budget_event(kind: &'static str, scope: &'static str) {
     #[cfg(not(feature = "otel"))]
     {
         let _ = (kind, scope);
+    }
+}
+
+/// Counts one failover event. `kind` is one of `circuit_opened`,
+/// `circuit_closed`, `failed_over`, or `model_degraded`.
+///
+/// Unlike the budget counter, this one *is* labelled with the provider name:
+/// which provider is failing is the whole question an operator brings to this
+/// metric, and the cardinality is bounded by the number of configured
+/// providers.
+///
+/// Recorded only by the telemetry actor, which exists only with the
+/// `otel` feature, so this is gated alongside it.
+#[cfg(feature = "otel")]
+pub(crate) fn record_failover_event(kind: &'static str, provider: &str) {
+    #[cfg(feature = "otel")]
+    imp::record_failover_event(kind, provider);
+    #[cfg(not(feature = "otel"))]
+    {
+        let _ = (kind, provider);
     }
 }
 

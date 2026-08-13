@@ -506,6 +506,14 @@ pub struct LLMStreamEnd {
     /// absent usage is never an error, so a zeroed value means "not reported",
     /// not "nothing was spent".
     pub usage: Usage,
+    /// The model that actually served this round.
+    ///
+    /// Per-dispatch, not per-provider: a provider that degraded to its
+    /// `fallback_model` because it was rate limited reports the model that
+    /// really answered, which is what the round span and the latency
+    /// histogram are then labelled with. Empty when no dispatch reached a
+    /// client at all.
+    pub model: String,
 }
 
 // =============================================================================

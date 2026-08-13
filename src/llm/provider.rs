@@ -7,6 +7,9 @@ use crate::llm::anthropic::AnthropicClient;
 use crate::llm::client::{LLMClient, LLMStreamEvent};
 use crate::llm::config::{ProviderConfig, ProviderType, SamplingParams};
 use crate::llm::error::LLMError;
+use crate::llm::failover::{
+    next_state, phase, BreakerPhase, BreakerState, CheckHealth, FailoverEvent, ProviderHealth,
+};
 use crate::llm::openai::OpenAIClient;
 use crate::llm::streaming::StreamAccumulator;
 use crate::messages::{
@@ -181,6 +184,18 @@ pub struct LLMProvider {
     pub config: Option<ProviderConfig>,
     /// The LLM client (trait object for provider abstraction)
     client: Option<Arc<dyn LLMClient>>,
+    /// A second client bound to `config.fallback_model`, built at init.
+    ///
+    /// The model is fixed when a client is constructed, so degrading to a
+    /// cheaper model means having a second client rather than threading a
+    /// per-request model override through the whole `LLMClient` trait and
+    /// both of its implementations. `None` unless `fallback_model` is set.
+    fallback_client: Option<Arc<dyn LLMClient>>,
+    /// This provider's circuit breaker.
+    ///
+    /// State per actor, never a shared registry behind a lock: the actor that
+    /// observes the failures is the one that owns the consequence.
+    breaker: BreakerState,
     /// Request queue
     queue: VecDeque<PendingRequest>,
     /// Rate limiter state
@@ -285,6 +300,22 @@ impl LLMProvider {
     }
 }
 
+/// Builds the API client a provider config asks for.
+///
+/// Split out because a provider with a `fallback_model` builds two of them —
+/// the same config with a different model — and they must be constructed the
+/// same way or the degraded path would silently differ from the primary one.
+fn build_client(config: &ProviderConfig) -> Result<Arc<dyn LLMClient>, LLMError> {
+    match &config.provider_type {
+        ProviderType::Anthropic => {
+            AnthropicClient::new(config.clone()).map(|c| Arc::new(c) as Arc<dyn LLMClient>)
+        }
+        ProviderType::OpenAI { base_url } => {
+            OpenAIClient::new(base_url.clone(), config).map(|c| Arc::new(c) as Arc<dyn LLMClient>)
+        }
+    }
+}
+
 /// Configures message handlers for the LLM Provider actor.
 fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
     // Handle initialization
@@ -292,23 +323,34 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         let config = envelope.message().config.clone();
         let name = envelope.message().name.clone();
 
-        // Create the appropriate client based on provider type
-        let client_result: Result<Arc<dyn LLMClient>, crate::llm::error::LLMError> =
-            match &config.provider_type {
-                ProviderType::Anthropic => {
-                    AnthropicClient::new(config.clone()).map(|c| Arc::new(c) as Arc<dyn LLMClient>)
+        // A second client for the degraded model, built here so the rate-limit
+        // path can switch to it without doing any construction work while a
+        // request is waiting.
+        let fallback_client = config.fallback_model.as_ref().and_then(|model| {
+            let degraded = config.clone().with_model(model);
+            match build_client(&degraded) {
+                Ok(client) => Some(client),
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        fallback_model = %model,
+                        "Failed to create the fallback-model client; rate limits will queue \
+                         instead of degrading"
+                    );
+                    None
                 }
-                ProviderType::OpenAI { base_url } => OpenAIClient::new(base_url.clone(), &config)
-                    .map(|c| Arc::new(c) as Arc<dyn LLMClient>),
-            };
+            }
+        });
 
-        match client_result {
+        match build_client(&config) {
             Ok(client) => {
                 let provider_name = client.provider_name();
                 actor.model.client = Some(client);
+                actor.model.fallback_client = fallback_client;
                 actor.model.name = name;
                 actor.model.config = Some(config);
                 actor.model.shutting_down = false;
+                actor.model.breaker = BreakerState::default();
                 tracing::info!(provider = %provider_name, "LLM Provider configured");
             }
             Err(e) => {
@@ -333,22 +375,65 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                 return Reply::try_err(crate::llm::error::LLMError::shutting_down());
             }
 
-            let Some(ref config) = actor.model.config else {
+            let Some(config) = actor.model.config.clone() else {
                 return Reply::try_err(crate::llm::error::LLMError::invalid_config(
                     "provider",
                     "Provider not configured",
                 ));
             };
 
-            // Check rate limits
-            if let Some(available_at) = actor
-                .model
-                .rate_limiter
-                .next_available_at(config, Instant::now())
+            let now = Instant::now();
+
+            // A tripped circuit refuses without touching the wire. This is
+            // the whole point of the breaker: five failures in a row means
+            // the next request is very unlikely to be the one that works, and
+            // sending it anyway costs latency the caller pays for.
+            //
+            // `consecutive_failures` is reported as the threshold because
+            // that is what the circuit tripped at — the open state does not
+            // carry a running count, since nothing is counting while it is
+            // open.
+            if let ProviderHealth::Open { remaining } =
+                ProviderHealth::from_state(actor.model.breaker, now)
             {
+                tracing::warn!(
+                    correlation_id = %correlation_id,
+                    provider = %actor.model.name,
+                    remaining_secs = remaining.as_secs_f64(),
+                    "Refusing request - circuit breaker is open"
+                );
+                return Reply::try_err(crate::llm::error::LLMError::circuit_open(
+                    remaining,
+                    config.circuit_breaker.failure_threshold,
+                ));
+            }
+
+            // Check rate limits
+            if let Some(available_at) = actor.model.rate_limiter.next_available_at(&config, now) {
+                // Degrading to a cheaper model is tried before queueing:
+                // waiting out a rate limit costs the caller the whole window,
+                // and a configured fallback model is an explicit statement
+                // that a lesser answer now beats a better one later.
+                if let Some(retry_after) = degradation_window(
+                    actor.model.rate_limiter.rate_limited_until,
+                    actor.model.fallback_client.as_ref(),
+                    now,
+                ) {
+                    let sampling = merge_sampling(&config.sampling, request.sampling.as_ref());
+                    let estimated = estimate_tokens(&request);
+
+                    actor.model.rate_limiter.record_request(estimated);
+                    actor.model.metrics.requests_total += 1;
+                    actor.model.metrics.tokens_estimated += u64::from(estimated);
+
+                    dispatch_request(actor, request, sampling, 0, Some(retry_after));
+
+                    return Reply::try_ok(());
+                }
+
                 if !config.rate_limit.queue_when_limited {
                     return Reply::try_err(crate::llm::error::LLMError::rate_limited(
-                        available_at.saturating_duration_since(Instant::now()),
+                        available_at.saturating_duration_since(now),
                     ));
                 }
 
@@ -391,12 +476,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             actor.model.metrics.requests_total += 1;
             actor.model.metrics.tokens_estimated += u64::from(estimated);
 
-            dispatch_request(actor, request, sampling, 0);
+            dispatch_request(actor, request, sampling, 0, None);
 
             Reply::try_ok(())
         })
         .on_error::<LLMRequest, crate::llm::error::LLMError>(|actor, envelope, error| {
-            let correlation_id = &envelope.message().correlation_id;
+            let correlation_id = envelope.message().correlation_id.clone();
 
             tracing::error!(
                 correlation_id = %correlation_id,
@@ -407,26 +492,48 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
             // Update metrics
             actor.model.metrics.requests_failed += 1;
 
-            // Broadcast rate limit event if applicable
-            if let Some(retry_after) = error.retry_after() {
-                let broker = actor.broker().clone();
-                let provider_name = actor
-                    .model
-                    .client
-                    .as_ref()
-                    .map(|c| c.provider_name().to_string())
-                    .unwrap_or_else(|| "unknown".to_string());
-                return Box::pin(async move {
+            let broker = actor.broker().clone();
+            let model = actor
+                .model
+                .config
+                .as_ref()
+                .map(|config| config.model.clone())
+                .unwrap_or_default();
+            let rate_limit = error.retry_after().map(|retry_after| {
+                (
+                    actor
+                        .model
+                        .client
+                        .as_ref()
+                        .map(|c| c.provider_name().to_string())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    retry_after,
+                )
+            });
+
+            Box::pin(async move {
+                if let Some((provider_name, retry_after)) = rate_limit {
                     broker
                         .broadcast(SystemEvent::RateLimitHit {
                             provider: provider_name,
                             retry_after_secs: retry_after.as_secs(),
                         })
                         .await;
-                });
-            }
+                }
 
-            Box::pin(async {})
+                // Nothing was dispatched, so nothing else will ever close
+                // this round — and its caller is blocked on the terminal
+                // event. Refusing a request is only fail-fast if the caller
+                // finds out fast.
+                broker
+                    .broadcast(LLMStreamEnd {
+                        correlation_id,
+                        stop_reason: StopReason::Error,
+                        usage: Usage::default(),
+                        model,
+                    })
+                    .await;
+            })
         });
 
     // Handle queue processing
@@ -450,32 +557,50 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         actor.model.metrics.rate_limits_hit += 1;
         actor.model.rate_limiter.record_rate_limit(msg.retry_after);
 
+        let now = Instant::now();
         let drop_reason = match actor.model.config.clone() {
             None => Some("provider not configured"),
             Some(config) if attempts >= config.retry.max_retries => Some("max retries exceeded"),
-            Some(config)
-                if !queue_has_room(actor.model.queue.len(), config.rate_limit.max_queue_size) =>
-            {
-                Some("request queue full")
-            }
             Some(config) => {
-                // Ahead of newer work: this request was accepted first.
-                actor.model.queue.push_front(PendingRequest {
-                    request: request.clone(),
-                    attempts: attempts + 1,
-                    queued_at: Instant::now(),
-                });
+                // Degrading beats queueing for the same reason as on the
+                // inbound path: the caller asked for an answer, and a
+                // configured fallback model says a cheaper one now is worth
+                // more than the good one after the window clears.
+                if let Some(retry_after) = degradation_window(
+                    actor.model.rate_limiter.rate_limited_until,
+                    actor.model.fallback_client.as_ref(),
+                    now,
+                ) {
+                    let sampling = merge_sampling(&config.sampling, request.sampling.as_ref());
 
-                match actor
-                    .model
-                    .rate_limiter
-                    .next_available_at(&config, Instant::now())
+                    actor.model.metrics.requests_total += 1;
+                    dispatch_request(
+                        actor,
+                        request.clone(),
+                        sampling,
+                        attempts + 1,
+                        Some(retry_after),
+                    );
+
+                    None
+                } else if !queue_has_room(actor.model.queue.len(), config.rate_limit.max_queue_size)
                 {
-                    Some(available_at) => arm_drain_timer(actor, available_at),
-                    None => drain_queue(actor),
-                }
+                    Some("request queue full")
+                } else {
+                    // Ahead of newer work: this request was accepted first.
+                    actor.model.queue.push_front(PendingRequest {
+                        request: request.clone(),
+                        attempts: attempts + 1,
+                        queued_at: now,
+                    });
 
-                None
+                    match actor.model.rate_limiter.next_available_at(&config, now) {
+                        Some(available_at) => arm_drain_timer(actor, available_at),
+                        None => drain_queue(actor),
+                    }
+
+                    None
+                }
             }
         };
 
@@ -497,6 +622,12 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
         // caller waits forever.
         let broker = actor.broker().clone();
         let correlation_id = request.correlation_id;
+        let model = actor
+            .model
+            .config
+            .as_ref()
+            .map(|config| config.model.clone())
+            .unwrap_or_default();
         Reply::pending(async move {
             broker
                 .broadcast(LLMStreamEnd {
@@ -504,6 +635,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                     stop_reason: StopReason::Error,
                     // A request that never reached the API spent nothing.
                     usage: Usage::default(),
+                    model,
                 })
                 .await;
         })
@@ -511,13 +643,69 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
 
     // Handle request outcome reports from the processing helpers
     builder.mutate_on::<RequestOutcome>(|actor, envelope| {
-        if envelope.message().succeeded {
+        let succeeded = envelope.message().succeeded;
+        if succeeded {
             actor.model.metrics.requests_success += 1;
         } else {
             actor.model.metrics.requests_failed += 1;
         }
 
-        Reply::ready()
+        let config = actor
+            .model
+            .config
+            .as_ref()
+            .map(|config| config.circuit_breaker)
+            .unwrap_or_default();
+
+        // One `now` for the transition and both phase readings. Three separate
+        // clock reads would let a short cooldown expire *between* them, and
+        // the edge would be computed against a state nobody was ever in.
+        let now = Instant::now();
+        let before = actor.model.breaker;
+        let after = next_state(before, &config, succeeded, now);
+        actor.model.breaker = after;
+
+        // Only the edges are worth telling anyone about: a circuit that stays
+        // closed through a successful request is the ordinary case, and an
+        // event per request would drown the two that matter.
+        let event = match (phase(before, now), phase(after, now)) {
+            (BreakerPhase::Closed, BreakerPhase::Open) => Some(FailoverEvent::CircuitOpened {
+                provider: actor.model.name.clone(),
+                consecutive_failures: config.failure_threshold,
+                cooldown_secs: config.cooldown.as_secs(),
+            }),
+            (BreakerPhase::HalfOpen | BreakerPhase::Open, BreakerPhase::Closed) => {
+                Some(FailoverEvent::CircuitClosed {
+                    provider: actor.model.name.clone(),
+                })
+            }
+            _ => None,
+        };
+
+        let Some(event) = event else {
+            return Reply::ready();
+        };
+
+        tracing::info!(event = %event, "Circuit breaker state changed");
+
+        let broker = actor.broker().clone();
+        Reply::pending(async move {
+            broker.broadcast(event).await;
+        })
+    });
+
+    // Answer health queries from the prompt loop's failover walk.
+    //
+    // `act_on`, not `mutate_on`: reading the breaker changes nothing, and
+    // several candidates can be asked at once. Mailboxes are FIFO, so an
+    // answer here also proves every outcome reported before the ask has
+    // already been folded in.
+    builder.act_on::<CheckHealth>(|actor, envelope| {
+        let health = ProviderHealth::from_state(actor.model.breaker, Instant::now());
+        let reply_to = envelope.reply_envelope();
+        Reply::pending(async move {
+            reply_to.send(health).await;
+        })
     });
 }
 
@@ -554,7 +742,7 @@ fn drain_queue(actor: &mut ManagedActor<Started, LLMProvider>) {
             "Dispatching queued request"
         );
 
-        dispatch_request(actor, pending.request, sampling, pending.attempts);
+        dispatch_request(actor, pending.request, sampling, pending.attempts, None);
     }
 
     // Still rate limited with work outstanding: come back when it clears.
@@ -590,13 +778,52 @@ fn dispatch_request(
     request: LLMRequest,
     sampling: Option<SamplingParams>,
     attempts: u32,
+    degraded_for: Option<Duration>,
 ) {
-    let Some(client) = actor.model.client.clone() else {
-        tracing::error!(
-            correlation_id = %request.correlation_id,
-            "Cannot dispatch request: provider has no client"
-        );
-        return;
+    let primary_model = actor
+        .model
+        .config
+        .as_ref()
+        .map(|config| config.model.clone())
+        .unwrap_or_default();
+
+    // `degraded_for` is only ever `Some` where a fallback client was proved
+    // to exist, so falling back to the primary here is belt and braces
+    // rather than a routing decision.
+    let degraded = match (
+        degraded_for,
+        actor.model.fallback_client.clone(),
+        actor
+            .model
+            .config
+            .as_ref()
+            .and_then(|config| config.fallback_model.clone()),
+    ) {
+        (Some(retry_after), Some(client), Some(model)) => Some((client, model, retry_after)),
+        _ => None,
+    };
+
+    let (client, model, pending_event) = match degraded {
+        Some((client, model, retry_after)) => {
+            let event = FailoverEvent::ModelDegraded {
+                provider: actor.model.name.clone(),
+                from_model: primary_model,
+                to_model: model.clone(),
+                retry_after_secs: retry_after.as_secs(),
+            };
+            tracing::warn!(event = %event, "Degrading to the fallback model");
+            (client, model, Some(event))
+        }
+        None => {
+            let Some(client) = actor.model.client.clone() else {
+                tracing::error!(
+                    correlation_id = %request.correlation_id,
+                    "Cannot dispatch request: provider has no client"
+                );
+                return;
+            };
+            (client, primary_model, None)
+        }
     };
 
     let streaming = actor
@@ -608,26 +835,49 @@ fn dispatch_request(
     let ctx = DispatchContext {
         provider_name: client.provider_name().to_string(),
         configured_name: actor.model.name.clone(),
-        model: actor
-            .model
-            .config
-            .as_ref()
-            .map(|config| config.model.clone())
-            .unwrap_or_default(),
+        model,
         client,
         broker: actor.broker().clone(),
         provider: actor.handle().clone(),
         sampling,
         attempts,
+        pending_event,
     };
 
     tokio::spawn(async move {
+        // Published from inside the dispatch task, before the request goes
+        // out, so it is on the broker strictly before this round's terminal
+        // event — a subscriber that sees the round finish has necessarily
+        // already been sent the degradation notice.
+        if let Some(event) = ctx.pending_event.clone() {
+            ctx.broker.broadcast(event).await;
+        }
+
         if streaming {
             process_streaming_request(&ctx, &request).await;
         } else {
             process_non_streaming_request(&ctx, &request).await;
         }
     });
+}
+
+/// How long the API-reported rate limit still has to run, when degrading to
+/// the fallback model is possible right now.
+///
+/// Pure, and deliberately narrow. `None` means dispatch normally:
+///
+/// - no fallback client was built, so there is nothing to degrade to;
+/// - or the provider is not under an API-reported rate limit. A spent *local*
+///   per-minute budget is our own bookkeeping, not the API refusing us, and
+///   switching models would not make it go away.
+fn degradation_window(
+    rate_limited_until: Option<Instant>,
+    fallback_client: Option<&Arc<dyn LLMClient>>,
+    now: Instant,
+) -> Option<Duration> {
+    fallback_client?;
+    let until = rate_limited_until?;
+    (until > now).then(|| until.saturating_duration_since(now))
 }
 
 /// Merges provider-level sampling defaults with per-request overrides.
@@ -708,12 +958,18 @@ struct DispatchContext {
     /// The runtime-configured name this provider is registered under. Usage
     /// reports are keyed by this, never by the vendor.
     configured_name: String,
-    /// The model this provider serves, carried on usage reports.
+    /// The model serving **this dispatch**, which is the fallback model when
+    /// the provider degraded. Carried on usage reports and on the round's
+    /// terminal event, so what gets billed and what gets charted are the same
+    /// model that actually answered.
     model: String,
     /// Merged sampling parameters, if any apply
     sampling: Option<SamplingParams>,
     /// How many attempts this request has already used
     attempts: u32,
+    /// An event to publish before the request goes out, if this dispatch is
+    /// itself news — currently only model degradation.
+    pending_event: Option<FailoverEvent>,
 }
 
 /// Processes a streaming request using the unified LLMClient trait.
@@ -833,6 +1089,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                     correlation_id: correlation_id.clone(),
                     stop_reason,
                     usage,
+                    model: ctx.model.clone(),
                 })
                 .await;
 
@@ -876,6 +1133,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                         correlation_id: correlation_id.clone(),
                         stop_reason: StopReason::Error,
                         usage: Usage::default(),
+                        model: ctx.model.clone(),
                     })
                     .await;
             }
@@ -1071,6 +1329,66 @@ mod tests {
         assert!(queue_has_room(1, 2));
         assert!(!queue_has_room(2, 2));
         assert!(!queue_has_room(3, 2));
+    }
+
+    /// A stand-in client, only ever used to prove `degradation_window` looks
+    /// at whether a fallback client *exists*.
+    fn some_client() -> Arc<dyn LLMClient> {
+        Arc::new(
+            OpenAIClient::new(
+                "http://localhost:1/v1".to_string(),
+                &ProviderConfig::openai_compatible("http://localhost:1/v1", "fallback-model"),
+            )
+            .expect("constructing a client against a local URL must succeed"),
+        )
+    }
+
+    #[test]
+    fn without_a_fallback_client_nothing_degrades() {
+        let now = Instant::now();
+
+        assert_eq!(
+            degradation_window(Some(now + Duration::from_secs(30)), None, now),
+            None,
+            "a provider with no fallback model must queue as it always has"
+        );
+    }
+
+    #[test]
+    fn a_live_api_rate_limit_opens_the_degradation_window() {
+        let now = Instant::now();
+        let client = some_client();
+
+        assert_eq!(
+            degradation_window(Some(now + Duration::from_secs(30)), Some(&client), now),
+            Some(Duration::from_secs(30))
+        );
+    }
+
+    #[test]
+    fn a_spent_local_budget_is_not_a_reason_to_change_models() {
+        let now = Instant::now();
+        let client = some_client();
+
+        // `rate_limited_until` is only ever set from an API-reported 429. A
+        // provider blocked purely by its own per-minute budget has none.
+        assert_eq!(degradation_window(None, Some(&client), now), None);
+    }
+
+    #[test]
+    fn an_expired_rate_limit_closes_the_degradation_window() {
+        let now = Instant::now();
+        let client = some_client();
+
+        assert_eq!(
+            degradation_window(Some(now), Some(&client), now),
+            None,
+            "degradation is self-healing: once the window passes, the primary model serves again"
+        );
+        assert_eq!(
+            degradation_window(Some(now - Duration::from_secs(1)), Some(&client), now),
+            None
+        );
     }
 
     #[test]

@@ -142,9 +142,10 @@ pub mod prelude {
     };
     pub use crate::error::AgentError;
     pub use crate::llm::{
-        AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,
-        LLMEventStream, LLMProvider, LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderType,
-        RateLimitConfig, SamplingParams,
+        AnthropicClient, CheckHealth, CircuitBreakerConfig, FailoverEvent, InitLLMProvider,
+        LLMClient, LLMClientResponse, LLMError, LLMErrorKind, LLMEventStream, LLMProvider,
+        LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderHealth, ProviderType,
+        RateLimitConfig, RetryConfig, SamplingParams, DEFAULT_COOLDOWN, DEFAULT_FAILURE_THRESHOLD,
     };
     pub use crate::logging::{
         init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,

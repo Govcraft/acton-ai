@@ -78,6 +78,19 @@ pub enum LLMErrorKind {
         /// The timeout duration that was exceeded
         duration: Duration,
     },
+    /// The provider's circuit breaker is open, so the request was refused
+    /// without reaching the API.
+    ///
+    /// Deliberately *not* retriable and deliberately not carrying a
+    /// `retry_after`: retrying immediately is the exact behavior the breaker
+    /// exists to prevent, and the provider's own retry machinery keys off
+    /// [`LLMError::retry_after`] to decide what to re-queue.
+    CircuitOpen {
+        /// How much of the cooldown is left.
+        remaining: Duration,
+        /// Consecutive failures that tripped the circuit.
+        consecutive_failures: u32,
+    },
 }
 
 impl LLMError {
@@ -176,6 +189,25 @@ impl LLMError {
         Self::new(LLMErrorKind::Timeout { duration })
     }
 
+    /// Creates a circuit-open error.
+    ///
+    /// ```
+    /// use acton_ai::llm::LLMError;
+    /// use std::time::Duration;
+    ///
+    /// let err = LLMError::circuit_open(Duration::from_secs(30), 5);
+    ///
+    /// assert!(!err.is_retriable(), "retrying is what the breaker exists to stop");
+    /// assert_eq!(err.retry_after(), None);
+    /// ```
+    #[must_use]
+    pub fn circuit_open(remaining: Duration, consecutive_failures: u32) -> Self {
+        Self::new(LLMErrorKind::CircuitOpen {
+            remaining,
+            consecutive_failures,
+        })
+    }
+
     /// Returns true if this error is retriable.
     #[must_use]
     pub fn is_retriable(&self) -> bool {
@@ -268,6 +300,19 @@ impl fmt::Display for LLMError {
             }
             LLMErrorKind::Timeout { duration } => {
                 write!(f, "request timed out after {} seconds", duration.as_secs())
+            }
+            LLMErrorKind::CircuitOpen {
+                remaining,
+                consecutive_failures,
+            } => {
+                write!(
+                    f,
+                    "circuit breaker is open after {consecutive_failures} consecutive failures; \
+                     refusing requests for another {:.1}s. Configure a failover chain, widen the \
+                     breaker, or turn it off with `enabled = false` under \
+                     [providers.<name>.circuit_breaker]",
+                    remaining.as_secs_f64()
+                )
             }
         }
     }

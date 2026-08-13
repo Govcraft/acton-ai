@@ -8,14 +8,19 @@ mod anthropic;
 mod client;
 mod config;
 mod error;
+pub(crate) mod failover;
 mod openai;
 mod provider;
 mod streaming;
 
 pub use anthropic::AnthropicClient;
 pub use client::{LLMClient, LLMClientResponse, LLMEventStream, LLMStreamEvent};
-pub use config::{ProviderConfig, ProviderType, RateLimitConfig, SamplingParams};
+pub use config::{
+    CircuitBreakerConfig, ProviderConfig, ProviderType, RateLimitConfig, RetryConfig,
+    SamplingParams, DEFAULT_COOLDOWN, DEFAULT_FAILURE_THRESHOLD,
+};
 pub use error::{LLMError, LLMErrorKind};
+pub use failover::{CheckHealth, FailoverEvent, ProviderHealth};
 pub use openai::OpenAIClient;
 pub use provider::{InitLLMProvider, LLMProvider};
 pub use streaming::{ActiveStream, StreamAccumulator};

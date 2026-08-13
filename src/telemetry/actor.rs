@@ -19,6 +19,7 @@
 //! recording call returns immediately and the SDK batches on its own thread.
 
 use crate::accounting::{BudgetEvent, BudgetScope};
+use crate::llm::FailoverEvent;
 use crate::messages::{SystemEvent, UsageReport};
 use crate::telemetry::metrics;
 use acton_reactive::prelude::*;
@@ -77,9 +78,20 @@ impl TelemetryActor {
             Reply::ready()
         });
 
+        // Where requests went, and why. The provider name *is* an attribute
+        // here — unlike the budget counter, "which provider is failing" is
+        // the entire question this metric answers, and the series count is
+        // bounded by however many providers are configured.
+        builder.act_on::<FailoverEvent>(|_actor, envelope| {
+            let event = envelope.message();
+            metrics::record_failover_event(event.kind(), event.provider());
+            Reply::ready()
+        });
+
         builder.handle().subscribe::<UsageReport>().await;
         builder.handle().subscribe::<SystemEvent>().await;
         builder.handle().subscribe::<BudgetEvent>().await;
+        builder.handle().subscribe::<FailoverEvent>().await;
 
         builder.start().await
     }
