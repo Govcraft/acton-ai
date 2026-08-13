@@ -124,12 +124,20 @@ trybuild = "1.0.120"
 # `--all-targets --no-default-features` fails on code that legitimately cannot
 # build in that configuration, which hides real findings behind noise.
 [[example]]
+name = "introspection"
+required-features = ["ipc"]
+
+[[example]]
 name = "tool_macro"
 required-features = ["derive"]
 
 [[example]]
 name = "telemetry"
 required-features = ["otel"]
+
+[[test]]
+name = "introspection"
+required-features = ["ipc"]
 
 [[test]]
 name = "tool_macro"

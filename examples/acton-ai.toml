@@ -74,3 +74,32 @@ tokens_per_minute = 1000000
 # # printed by `acton-ai config`, which shows key names only.
 # [telemetry.headers]
 # authorization = "Bearer ..."
+
+# Live introspection (optional)
+# Uncomment to let `acton-ai status`, `pause`, `resume`, and `drain` talk to
+# this process over a Unix socket while it runs. Nothing listens until this
+# section is present: compiling the `ipc` feature in is not enough on its own.
+#
+#   acton-ai status --socket /run/my-agent/control.sock
+#   acton-ai drain  --socket /run/my-agent/control.sock --wait
+#
+# Requires the `ipc` feature, which is on by default. A binary built without
+# it fails to launch with this section present rather than silently never
+# creating the socket.
+
+# [introspection]
+# # Default true when the section exists. Set false to switch the socket off
+# # without deleting the settings below — inert in every build, feature or no.
+# enabled = true
+#
+# # Default: $XDG_RUNTIME_DIR/acton-ai/<app-name>-<pid>.sock, which no outside
+# # process can guess. Set an absolute path when a systemd ExecStop or a deploy
+# # script needs a predictable address. Relative paths are refused: a process
+# # that changes its working directory would leave its socket somewhere no
+# # client can find.
+# socket_path = "/run/my-agent/control.sock"
+#
+# # Default 0o600. `pause` and `drain` are levers over this process and the
+# # permission bits are the whole of the access control, so anything granting
+# # group or other access fails the launch rather than warning.
+# socket_mode = 0o600

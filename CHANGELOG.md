@@ -30,6 +30,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Live introspection** over a Unix control socket, behind the new `ipc`
+  feature, which joins the default set. `acton-ai status` asks a running
+  process what it is doing — uptime, PID, each provider's model, health,
+  circuit and failover chain, each MCP server's incarnation and restart count,
+  turns started, turns refused, turns and tool calls in flight, spend against
+  budget, and the current admission state — and `acton-ai pause`, `resume`,
+  and `drain`
+  change whether it takes new turns. Answering never goes through the prompt
+  loop, so a wedged provider or an exhausted budget does not stop you finding
+  out what is wrong.
+- Admission control is compiled in whether or not `ipc` is: `ActonAI::pause`,
+  `resume`, `drain`, and `admission_state()` are ordinary in-process state.
+  A refused turn fails with `ActonAIErrorKind::TurnsNotAdmitted`, distinct from
+  a provider failure, so a caller can tell "you paused me" from "it broke".
+  Closing admission never interrupts a turn already running.
+- `ActonAIBuilder::introspection()` / `introspection_at(path)` and an
+  `[introspection]` TOML section arm the listener. Compile-time on is not
+  runtime on: a control socket is a security surface, so nothing binds until
+  one of these says so. The socket is created `0o600` under a `0700`
+  directory, and a `socket_mode` granting anything beyond the owner is refused
+  at launch.
+- `ActonAIBuilder::drain_on_sigterm()` closes admission on `SIGTERM` and lets
+  the turn in flight finish, and `introspection::sd_notify::notify_ready()`
+  reports readiness to systemd under `Type=notify` — a hand-rolled datagram,
+  no new dependency. `acton-ai heartbeat` reports how many due entries it left
+  untouched in a new `entries_deferred` field rather than failing them.
 - Named **failover chains**: `ProviderConfig::with_failover(["backup", "local"])`
   and `failover = [...]` in TOML. When a provider cannot serve a round the
   prompt loop re-dispatches the same round to the next candidate — new

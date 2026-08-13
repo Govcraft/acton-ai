@@ -1446,6 +1446,7 @@ pub struct JobConfig {
 mod tests {
     use super::*;
     use crate::tools::sandbox::process::config::{DEFAULT_MEMORY_LIMIT, DEFAULT_TIMEOUT_SECS};
+    use std::path::Path;
 
     #[test]
     fn acton_ai_config_default_is_empty() {
@@ -1952,6 +1953,74 @@ x-tenant = "acme"
             crate::telemetry::DEFAULT_METRICS_INTERVAL_SECS
         );
         assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn the_documented_introspection_section_parses_in_full() {
+        // The exact shape shipped in `examples/acton-ai.toml` and the README,
+        // octal literals included: if TOML ever stopped accepting `0o600` the
+        // sample config would be a trap rather than a template.
+        let toml_str = r#"
+[introspection]
+enabled = true
+socket_path = "/run/user/1000/my-agent.sock"
+socket_mode = 0o600
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let section = config
+            .introspection
+            .expect("the [introspection] section must parse");
+
+        assert!(section.is_enabled());
+        assert_eq!(
+            section.socket_path.as_deref(),
+            Some(Path::new("/run/user/1000/my-agent.sock"))
+        );
+        assert_eq!(section.socket_mode, Some(0o600));
+
+        let resolved = section
+            .to_introspection()
+            .expect("the documented section must be valid");
+        assert_eq!(
+            resolved.socket_path.as_deref(),
+            Some(Path::new("/run/user/1000/my-agent.sock"))
+        );
+        assert_eq!(resolved.socket_mode, 0o600);
+    }
+
+    #[test]
+    fn an_empty_introspection_section_is_still_a_request_for_the_socket() {
+        // Presence arms it: every field is optional, so the bare header has to
+        // mean something, and the only useful meaning is "listen with defaults".
+        let config: ActonAIConfig = toml::from_str("[introspection]\n").unwrap();
+        let section = config.introspection.expect("the bare header must parse");
+
+        assert!(section.is_enabled());
+        assert_eq!(section.socket_path, None);
+        assert_eq!(section.socket_mode, None);
+    }
+
+    #[test]
+    fn introspection_disabled_keeps_the_settings_it_switches_off() {
+        // `enabled = false` exists so a deployment can stop listening without
+        // losing the path it will want back, so the path must survive the flag.
+        let config: ActonAIConfig =
+            toml::from_str("[introspection]\nenabled = false\nsocket_path = \"/run/a.sock\"\n")
+                .unwrap();
+        let section = config.introspection.expect("the section must parse");
+
+        assert!(!section.is_enabled());
+        assert_eq!(
+            section.socket_path.as_deref(),
+            Some(Path::new("/run/a.sock"))
+        );
+    }
+
+    #[test]
+    fn no_introspection_section_means_no_socket() {
+        let config: ActonAIConfig = toml::from_str("").unwrap();
+        assert!(config.introspection.is_none());
     }
 
     #[test]

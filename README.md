@@ -442,6 +442,71 @@ is OTLP over HTTP/protobuf; no gRPC stack is pulled in.
 Already running OpenTelemetry in your application? `.telemetry_from_globals()`
 emits into the providers you installed instead of installing competing ones.
 
+### Live introspection
+
+Traces and metrics tell you what happened. Introspection answers a different
+question: what is this process doing *right now*, and can I safely restart it?
+
+```rust
+use acton_ai::prelude::*;
+
+let runtime = ActonAI::builder()
+    .anthropic_from_env()
+    .introspection_at("/run/my-agent/control.sock")
+    .drain_on_sigterm()
+    .launch()
+    .await?;
+```
+
+From another terminal:
+
+```bash
+acton-ai status --socket /run/my-agent/control.sock          # what is running
+acton-ai status --socket /run/my-agent/control.sock --json   # the same, for jq
+acton-ai pause  --socket /run/my-agent/control.sock          # refuse new turns
+acton-ai resume --socket /run/my-agent/control.sock          # take them again
+acton-ai drain  --socket /run/my-agent/control.sock --wait   # and wait for the last one
+```
+
+`status` reports admission state, turns and tool calls in flight, per-provider
+circuit-breaker health, MCP server generations and restart counts, and token
+and cost totals. It is assembled on demand from the live actors, so nothing in
+it can be stale, and it keeps answering when a provider is wedged — which is
+when you need it.
+
+**Pausing never interrupts a turn that has started.** A half-finished turn has
+usually already been paid for, and a tool it launched may have already changed
+the world. `drain` is therefore "finish what you started, take nothing new",
+which is what makes it safe to wire to `SIGTERM` and to an `ExecStop`. Callers
+that try to start a turn get a distinguishable error
+(`ActonAIError::is_turns_not_admitted`), not a generic failure.
+
+The TOML twin:
+
+```toml
+[introspection]
+enabled = true                          # default true when the section exists
+socket_path = "/run/my-agent/ctl.sock"  # default $XDG_RUNTIME_DIR/acton-ai/<app>-<pid>.sock
+socket_mode = 0o600                     # default 0o600; wider than owner-only is refused
+```
+
+Access control is the socket's permission bits, so they are owner-only and
+anything laxer fails the launch: `pause` and `drain` are levers over your
+process. Leave `socket_path` unset and each process gets its own PID-suffixed
+address, which the CLI discovers by scanning; set it when something outside the
+process — a systemd `ExecStop`, a deploy script — needs a predictable one.
+
+Under systemd, `Type=notify` works out of the box: the runtime sends `READY=1`
+once providers, tools, and MCP servers are up, so "started" means "serving",
+and `STOPPING=1` when a drain begins. See `examples/introspection.rs` for a
+complete unit file.
+
+The socket server lives behind the `ipc` feature (on by default) but never
+listens unless configured. Pause, resume, and drain are *not* behind it —
+`--no-default-features` builds keep `ActonAI::pause()` and friends, since an
+embedder driving the library from its own control plane needs them just as
+much.
+
 ## Built-in Tools
 
 Available when you call `.with_builtins()`:
@@ -615,6 +680,30 @@ acton-ai heartbeat --session main
 ```
 
 Output is a JSON activity report to stdout, suitable for monitoring pipelines.
+
+### Status, Pause, Resume, Drain
+
+The only commands that do not start a runtime: they talk to one that is already
+running, over its introspection socket.
+
+```bash
+acton-ai status                        # what a running process is doing
+acton-ai status --json                 # the same, machine-readable
+acton-ai pause                         # stop admitting new turns
+acton-ai resume                        # admit them again
+acton-ai drain                         # stop admitting, report what is left
+acton-ai drain --wait --timeout 0      # and block until the last turn finishes
+```
+
+The socket is found from `--socket`, then `[introspection] socket_path` in the
+config file, then a scan of the default runtime directory. The scan is what
+makes a bare `acton-ai status` work, since the default socket name carries a
+PID nobody can guess; it refuses to choose when it finds more than one, because
+draining the wrong process is worse than being asked which one you meant.
+
+`drain --wait` is what belongs in an `ExecStop` or a deploy script. It returns
+as soon as the last in-flight turn finishes, and `--timeout 0` waits
+indefinitely so systemd's `TimeoutStopSec` is the only deadline in play.
 
 ### Session Management
 
