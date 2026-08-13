@@ -74,8 +74,8 @@
 use crate::config::{self, ActonAIConfig, SandboxFileConfig};
 use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
-use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::llm::{LLMProvider, ProviderConfig};
+use crate::logging::{init_and_store_logging, LoggingConfig};
 use crate::messages::Message;
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
@@ -161,6 +161,14 @@ pub(crate) struct ActonAIInner {
     /// `None` means unbounded history (explicit opt-out via
     /// [`ActonAIBuilder::without_context_window`]).
     pub(crate) context_window: Option<crate::memory::ContextWindow>,
+    /// Tools contributed by configured MCP servers, and the supervised actors
+    /// owning their connections.
+    ///
+    /// `None` when no `[mcp_servers.*]` entry and no
+    /// [`with_mcp_server`](ActonAIBuilder::with_mcp_server) call was made.
+    /// When present, these tools are injected into every prompt: configuring
+    /// a server *is* the request to use it, so there is no separate opt-in.
+    pub(crate) mcp: Option<crate::mcp::McpTools>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -237,6 +245,7 @@ impl ActonAI {
             builder = builder.use_builtins();
         }
         builder = self.inject_skill_tools(builder);
+        builder = self.inject_mcp_tools(builder);
         builder
     }
 
@@ -376,6 +385,15 @@ impl ActonAI {
         self.inner.sandbox_factory.as_ref()
     }
 
+    /// Returns the MCP tools discovered at launch, if any server is configured.
+    ///
+    /// `None` means no `[mcp_servers.*]` entry and no
+    /// [`with_mcp_server`](ActonAIBuilder::with_mcp_server) call.
+    #[must_use]
+    pub fn mcp(&self) -> Option<&crate::mcp::McpTools> {
+        self.inner.mcp.as_ref()
+    }
+
     /// Returns whether built-in tools are enabled.
     #[must_use]
     pub fn has_builtins(&self) -> bool {
@@ -426,6 +444,34 @@ impl ActonAI {
             builder = builder.use_builtins();
         }
         builder = self.inject_skill_tools(builder);
+        builder = self.inject_mcp_tools(builder);
+        builder
+    }
+
+    /// Registers every discovered MCP tool on `builder`. No-op when no MCP
+    /// server is configured.
+    ///
+    /// There is no opt-out: configuring a server is the request to use it.
+    /// Each executor holds a
+    /// [`SupervisedChild`](acton_reactive::prelude::SupervisedChild), so a
+    /// server that reconnects mid-conversation keeps working without the
+    /// prompt being rebuilt.
+    #[inline]
+    fn inject_mcp_tools(&self, mut builder: PromptBuilder) -> PromptBuilder {
+        let Some(mcp) = &self.inner.mcp else {
+            return builder;
+        };
+
+        for (name, config) in mcp.configs() {
+            let Some(executor) = mcp.get_executor(name) else {
+                continue;
+            };
+            builder = builder.with_tool(config.definition.clone(), move |args| {
+                let executor = Arc::clone(&executor);
+                async move { executor.execute(args).await }
+            });
+        }
+
         builder
     }
 
@@ -594,6 +640,10 @@ pub struct ActonAIBuilder {
     /// during [`apply_config`](Self::apply_config). At launch the entry for the
     /// resolved default provider wins over the global `[context] max_tokens`.
     context_window_per_provider: HashMap<String, usize>,
+    /// External MCP servers staged by [`with_mcp_server`](Self::with_mcp_server)
+    /// and by `[mcp_servers.*]` in TOML. Each becomes one supervised
+    /// connection actor at launch.
+    mcp_servers: HashMap<String, crate::config::McpServerConfig>,
 }
 
 impl ActonAIBuilder {
@@ -776,7 +826,8 @@ impl ActonAIBuilder {
         // Convert and add each provider
         for (name, provider_config) in config.providers {
             if let Some(tokens) = provider_config.context_window_tokens {
-                self.context_window_per_provider.insert(name.clone(), tokens);
+                self.context_window_per_provider
+                    .insert(name.clone(), tokens);
             }
             let runtime_config = provider_config.to_provider_config();
             self.providers.insert(name, runtime_config);
@@ -813,7 +864,45 @@ impl ActonAIBuilder {
             self.context_config = Some(context_cfg);
         }
 
+        // Merge `[mcp_servers.*]`. A builder entry with the same name wins:
+        // an explicit `with_mcp_server` call is a deliberate override of what
+        // the file says, not a duplicate of it.
+        for (name, server) in config.mcp_servers {
+            self.mcp_servers.entry(name).or_insert(server);
+        }
+
         Ok(self)
+    }
+
+    /// Registers an external MCP server whose tools become available to every
+    /// prompt.
+    ///
+    /// Repeatable; the name is the `{server}` segment in the tool names the
+    /// LLM sees (`mcp__{server}__{tool}`). Calling this with a name that also
+    /// appears in `[mcp_servers.*]` overrides the file entry.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-app")
+    ///     .ollama("qwen2.5:7b")
+    ///     .with_mcp_server(
+    ///         "filesystem",
+    ///         McpServerConfig::stdio("npx")
+    ///             .with_args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
+    ///     )
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn with_mcp_server(
+        mut self,
+        name: impl Into<String>,
+        config: crate::config::McpServerConfig,
+    ) -> Self {
+        self.mcp_servers.insert(name.into(), config);
+        self
     }
 
     /// Applies sandbox configuration from file to this builder.
@@ -1305,11 +1394,33 @@ impl ActonAIBuilder {
             Some(Arc::new(registry))
         };
 
+        // Bring MCP servers up under supervision before handing the runtime
+        // out. A server that cannot connect is a launch failure naming it:
+        // silently starting without the tools the caller configured would
+        // surface later as an unexplained "no such tool".
+        let mcp_specs =
+            crate::mcp::launch::specs_from_config(&self.mcp_servers).map_err(ActonAIError::from)?;
+        let mcp = if mcp_specs.is_empty() {
+            None
+        } else {
+            let tools = crate::mcp::launch::launch_mcp_servers(&mut runtime, &mcp_specs)
+                .await
+                .map_err(ActonAIError::from)?;
+            tracing::info!(
+                servers = mcp_specs.len(),
+                tools = tools.len(),
+                "MCP servers connected"
+            );
+            Some(tools)
+        };
+
         let context_window = resolve_context_window(
             self.context_window_override.take(),
             self.context_window_disabled,
             self.context_config.as_ref(),
-            self.context_window_per_provider.get(&default_provider_name).copied(),
+            self.context_window_per_provider
+                .get(&default_provider_name)
+                .copied(),
             &default_provider_model,
         );
 
@@ -1324,6 +1435,7 @@ impl ActonAIBuilder {
                 sandbox_factory,
                 default_max_tool_rounds,
                 context_window,
+                mcp,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
@@ -1399,8 +1511,7 @@ fn resolve_context_window(
     default_provider_model: &str,
 ) -> Option<crate::memory::ContextWindow> {
     use crate::memory::{
-        ContextWindow, ContextWindowConfig, TiktokenEstimator, TokenEstimator,
-        TruncationStrategy,
+        ContextWindow, ContextWindowConfig, TiktokenEstimator, TokenEstimator, TruncationStrategy,
     };
 
     if let Some(window) = override_window {
@@ -1681,10 +1792,7 @@ mod tests {
     #[tokio::test]
     async fn toml_defaults_max_tool_rounds_is_applied() {
         let config = crate::config::ActonAIConfig::new()
-            .with_provider(
-                "ollama",
-                crate::config::NamedProviderConfig::ollama("test"),
-            )
+            .with_provider("ollama", crate::config::NamedProviderConfig::ollama("test"))
             .with_default_provider("ollama");
         // Inject the [defaults] block manually.
         let config = crate::config::ActonAIConfig {
@@ -1706,10 +1814,7 @@ mod tests {
     async fn builder_max_tool_rounds_overrides_toml_defaults() {
         // Builder wins: user explicitly set 7 in code, config says 33.
         let config = crate::config::ActonAIConfig::new()
-            .with_provider(
-                "ollama",
-                crate::config::NamedProviderConfig::ollama("test"),
-            )
+            .with_provider("ollama", crate::config::NamedProviderConfig::ollama("test"))
             .with_default_provider("ollama");
         let config = crate::config::ActonAIConfig {
             defaults: Some(crate::config::ActonAIDefaults::new().with_max_tool_rounds(33)),
@@ -1762,6 +1867,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_builder_mcp_server_overrides_the_config_file_entry() {
+        use crate::config::McpServerConfig;
+
+        let mut file_config = ActonAIConfig::default();
+        file_config
+            .mcp_servers
+            .insert("fs".to_string(), McpServerConfig::stdio("from-file"));
+        file_config
+            .mcp_servers
+            .insert("other".to_string(), McpServerConfig::stdio("only-in-file"));
+
+        let builder = ActonAI::builder()
+            .with_mcp_server("fs", McpServerConfig::stdio("from-builder"))
+            .apply_config(file_config)
+            .expect("apply_config");
+
+        assert_eq!(builder.mcp_servers.len(), 2);
+        assert_eq!(
+            builder.mcp_servers["fs"].command.as_deref(),
+            Some("from-builder"),
+            "an explicit with_mcp_server call must win over the file"
+        );
+        assert_eq!(
+            builder.mcp_servers["other"].command.as_deref(),
+            Some("only-in-file")
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_fails_when_an_mcp_server_names_no_transport() {
+        use crate::config::McpServerConfig;
+
+        let err = ActonAI::builder()
+            .ollama("test")
+            .with_mcp_server("broken", McpServerConfig::default())
+            .launch()
+            .await
+            .expect_err("a server with neither command nor url must fail the launch");
+
+        assert!(err.to_string().contains("broken"), "error = {err}");
+    }
+
+    #[tokio::test]
+    async fn launch_without_mcp_servers_has_no_mcp_tools() {
+        let runtime = ActonAI::builder()
+            .ollama("test")
+            .launch()
+            .await
+            .expect("launch");
+
+        assert!(runtime.mcp().is_none());
+    }
+
     #[tokio::test]
     async fn launch_with_skills_exposes_registry() {
         // Stage a temp dir containing one minimal skill file, launch with it,
@@ -1808,10 +1967,7 @@ mod tests {
         .expect("write skill");
 
         let config = crate::config::ActonAIConfig::new()
-            .with_provider(
-                "ollama",
-                crate::config::NamedProviderConfig::ollama("test"),
-            )
+            .with_provider("ollama", crate::config::NamedProviderConfig::ollama("test"))
             .with_default_provider("ollama");
         let config = crate::config::ActonAIConfig {
             skills: Some(crate::config::SkillsFileConfig {

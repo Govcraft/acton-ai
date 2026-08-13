@@ -94,6 +94,14 @@ pub struct ActonAIConfig {
     /// global `max_tokens` here.
     #[serde(default)]
     pub context: Option<ContextFileConfig>,
+
+    /// External MCP servers whose tools are exposed to every prompt.
+    ///
+    /// Corresponds to `[mcp_servers.<name>]` in TOML. Each entry becomes a
+    /// supervised connection actor at launch; its tools are registered under
+    /// `mcp__{server}__{tool}`.
+    #[serde(default)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 /// Skills configuration loaded from `[skills]` in TOML.
@@ -197,6 +205,165 @@ impl ActonAIConfig {
     #[must_use]
     pub fn provider_count(&self) -> usize {
         self.providers.len()
+    }
+}
+
+/// Configuration for a single external MCP server.
+///
+/// Exactly one transport must be selected: `command` (stdio child process) or
+/// `url` (streamable HTTP). Setting both, or neither, is rejected at launch
+/// with an error naming the server.
+///
+/// # TOML
+///
+/// ```toml
+/// [mcp_servers.filesystem]
+/// command = "npx"
+/// args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+/// env = { RUST_LOG = "info" }
+/// tool_timeout_secs = 60
+/// enabled_tools = ["read_file", "list_directory"]
+///
+/// [mcp_servers.linear]
+/// url = "https://mcp.linear.app/mcp"
+/// auth_token_env = "LINEAR_MCP_TOKEN"
+/// ```
+///
+/// # Programmatic
+///
+/// ```rust
+/// use acton_ai::config::McpServerConfig;
+///
+/// let fs = McpServerConfig::stdio("npx")
+///     .with_args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"])
+///     .with_tool_timeout_secs(60);
+///
+/// let linear = McpServerConfig::http("https://mcp.linear.app/mcp")
+///     .with_auth_token_env("LINEAR_MCP_TOKEN");
+/// # assert_eq!(fs.command.as_deref(), Some("npx"));
+/// # assert_eq!(linear.auth_token_env.as_deref(), Some("LINEAR_MCP_TOKEN"));
+/// ```
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct McpServerConfig {
+    /// Program to spawn for a stdio server. Mutually exclusive with `url`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+
+    /// Arguments passed to `command`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+
+    /// Extra environment variables for the spawned child process.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
+
+    /// Working directory for the spawned child process.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<PathBuf>,
+
+    /// Streamable-HTTP endpoint. Mutually exclusive with `command`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+
+    /// Name of an environment variable holding a bearer token for `url`.
+    ///
+    /// When set, the variable must resolve to a non-empty value; the
+    /// connection fails rather than silently proceeding unauthenticated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token_env: Option<String>,
+
+    /// Per-call timeout in seconds. Defaults to
+    /// [`DEFAULT_MCP_TOOL_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_timeout_secs: Option<u64>,
+
+    /// Allowlist of remote (unprefixed) tool names to expose.
+    ///
+    /// `None` exposes every discovered tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+}
+
+/// Default per-call timeout applied when a server sets no `tool_timeout_secs`.
+pub const DEFAULT_MCP_TOOL_TIMEOUT_SECS: u64 = 60;
+
+impl McpServerConfig {
+    /// Creates a stdio (child process) server configuration.
+    #[must_use]
+    pub fn stdio(command: impl Into<String>) -> Self {
+        Self {
+            command: Some(command.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Creates a streamable-HTTP server configuration.
+    #[must_use]
+    pub fn http(url: impl Into<String>) -> Self {
+        Self {
+            url: Some(url.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Appends command-line arguments for a stdio server.
+    #[must_use]
+    pub fn with_args<I, S>(mut self, args: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.args.extend(args.into_iter().map(Into::into));
+        self
+    }
+
+    /// Sets one environment variable for a stdio server.
+    #[must_use]
+    pub fn with_env_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
+        self.env.insert(key.into(), value.into());
+        self
+    }
+
+    /// Sets the working directory for a stdio server.
+    #[must_use]
+    pub fn with_cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
+        self.cwd = Some(cwd.into());
+        self
+    }
+
+    /// Sets the environment variable holding the bearer token for an HTTP server.
+    #[must_use]
+    pub fn with_auth_token_env(mut self, var: impl Into<String>) -> Self {
+        self.auth_token_env = Some(var.into());
+        self
+    }
+
+    /// Sets the per-call timeout in seconds.
+    #[must_use]
+    pub fn with_tool_timeout_secs(mut self, secs: u64) -> Self {
+        self.tool_timeout_secs = Some(secs);
+        self
+    }
+
+    /// Restricts the exposed tools to the given remote names.
+    #[must_use]
+    pub fn with_enabled_tools<I, S>(mut self, tools: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.enabled_tools = Some(tools.into_iter().map(Into::into).collect());
+        self
+    }
+
+    /// The resolved per-call timeout.
+    #[must_use]
+    pub fn tool_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.tool_timeout_secs
+                .unwrap_or(DEFAULT_MCP_TOOL_TIMEOUT_SECS),
+        )
     }
 }
 
@@ -1222,6 +1389,7 @@ max_execution_ms = 60000
             defaults: None,
             skills: None,
             context: None,
+            mcp_servers: HashMap::new(),
         };
 
         let toml_str = toml::to_string(&config).unwrap();

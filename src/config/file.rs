@@ -294,6 +294,68 @@ api_key_env = "OPENAI_API_KEY"
     }
 
     #[test]
+    fn parses_stdio_and_http_mcp_servers() {
+        let config = from_str(
+            r#"
+            [providers.test]
+            type = "ollama"
+            model = "qwen2.5:7b"
+
+            [mcp_servers.filesystem]
+            command = "npx"
+            args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+            env = { RUST_LOG = "info" }
+            cwd = "/srv"
+            tool_timeout_secs = 45
+            enabled_tools = ["read_file"]
+
+            [mcp_servers.linear]
+            url = "https://mcp.linear.app/mcp"
+            auth_token_env = "LINEAR_MCP_TOKEN"
+            "#,
+        )
+        .unwrap();
+
+        assert_eq!(config.mcp_servers.len(), 2);
+
+        let fs = &config.mcp_servers["filesystem"];
+        assert_eq!(fs.command.as_deref(), Some("npx"));
+        assert_eq!(fs.args.len(), 3);
+        assert_eq!(fs.env.get("RUST_LOG").map(String::as_str), Some("info"));
+        assert_eq!(fs.cwd.as_deref(), Some(Path::new("/srv")));
+        assert_eq!(fs.tool_timeout(), std::time::Duration::from_secs(45));
+        assert_eq!(
+            fs.enabled_tools.as_deref(),
+            Some(["read_file".to_string()].as_slice())
+        );
+        assert!(fs.url.is_none());
+
+        let linear = &config.mcp_servers["linear"];
+        assert_eq!(linear.url.as_deref(), Some("https://mcp.linear.app/mcp"));
+        assert_eq!(linear.auth_token_env.as_deref(), Some("LINEAR_MCP_TOKEN"));
+        assert!(linear.command.is_none());
+        // No explicit timeout falls back to the documented default.
+        assert_eq!(
+            linear.tool_timeout(),
+            std::time::Duration::from_secs(crate::config::DEFAULT_MCP_TOOL_TIMEOUT_SECS)
+        );
+    }
+
+    #[test]
+    fn a_config_without_mcp_servers_has_none() {
+        let config = from_str(
+            r#"
+            [providers.test]
+            type = "ollama"
+            model = "qwen2.5:7b"
+            "#,
+        )
+        .unwrap();
+
+        assert!(config.mcp_servers.is_empty());
+    }
+
+    #[test]
     fn search_paths_includes_local() {
         let paths = search_paths();
 

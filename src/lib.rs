@@ -8,6 +8,8 @@
 //! - **Agent**: Individual AI agents with reasoning loops
 //! - **LLM Provider**: Manages streaming LLM API calls with rate limiting
 //! - **Tool Registry**: Registers and executes tools via supervised child actors
+//! - **MCP Client**: Consumes tools from external Model Context Protocol servers,
+//!   one supervised actor per connection (see [`mcp`])
 //! - **Memory Store**: Persistence via Turso/libSQL
 //!
 //! ## Quick Start (High-Level API)
@@ -66,6 +68,7 @@ pub mod error;
 pub mod facade;
 pub mod llm;
 pub mod logging;
+pub mod mcp;
 pub mod memory;
 pub mod messages;
 pub mod prompt;
@@ -79,13 +82,14 @@ pub mod skills;
 pub mod prelude {
     // High-level API (recommended for most use cases)
     pub use crate::config::{
-        ActonAIConfig, ActonAIDefaults, NamedProviderConfig, RateLimitFileConfig,
+        ActonAIConfig, ActonAIDefaults, McpServerConfig, NamedProviderConfig, RateLimitFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
     };
     pub use crate::error::{ActonAIError, ActonAIErrorKind};
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
+    pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
 
     // Low-level API (for advanced use cases)
@@ -94,14 +98,14 @@ pub mod prelude {
         IncomingTaskInfo, InitAgent,
     };
     pub use crate::error::AgentError;
-    pub use crate::logging::{
-        init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,
-        LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
-    };
     pub use crate::llm::{
         AnthropicClient, InitLLMProvider, LLMClient, LLMClientResponse, LLMError, LLMErrorKind,
         LLMEventStream, LLMProvider, LLMStreamEvent, OpenAIClient, ProviderConfig, ProviderType,
         RateLimitConfig, SamplingParams,
+    };
+    pub use crate::logging::{
+        init_and_store_logging, init_journald_logging, journald_layer, mark_subscriber_installed,
+        LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
     };
     pub use crate::memory::{
         AgentStateSnapshot, ContextStats, ContextWindow, ContextWindowConfig, ContextWindowData,

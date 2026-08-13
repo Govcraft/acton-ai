@@ -46,6 +46,16 @@
 //! [sandbox.limits]
 //! max_execution_ms = 30000
 //! max_memory_mb = 64
+//!
+//! # External MCP servers. Use `command` (stdio) or `url` (streamable HTTP),
+//! # never both. Their tools reach the LLM as `mcp__{server}__{tool}`.
+//! [mcp_servers.filesystem]
+//! command = "npx"
+//! args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+//!
+//! [mcp_servers.linear]
+//! url = "https://mcp.linear.app/mcp"
+//! auth_token_env = "LINEAR_MCP_TOKEN"
 //! ```
 //!
 //! # Usage
@@ -72,6 +82,6 @@ pub use file::{from_path, from_str, load, search_paths, xdg_config_dir};
 // Re-export types
 pub use types::{
     parse_truncation_strategy, ActonAIConfig, ActonAIDefaults, CliFileConfig, ContextFileConfig,
-    JobConfig, NamedProviderConfig, PersistenceFileConfig, RateLimitFileConfig, SandboxFileConfig,
-    SandboxLimitsConfig, SkillsFileConfig,
+    JobConfig, McpServerConfig, NamedProviderConfig, PersistenceFileConfig, RateLimitFileConfig,
+    SandboxFileConfig, SandboxLimitsConfig, SkillsFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
 };

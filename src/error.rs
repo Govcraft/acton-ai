@@ -224,6 +224,16 @@ pub enum ActonAIErrorKind {
     },
     /// Runtime was shut down
     RuntimeShutdown,
+    /// An MCP server failed to connect, discover tools, or answer a call.
+    ///
+    /// Produced by converting a [`McpError`](crate::mcp::McpError); `reason`
+    /// carries that error's rendered message.
+    Mcp {
+        /// The configured name of the MCP server.
+        server: String,
+        /// Rendered description of the underlying MCP failure.
+        reason: String,
+    },
 }
 
 impl ActonAIError {
@@ -280,6 +290,15 @@ impl ActonAIError {
         Self::new(ActonAIErrorKind::RuntimeShutdown)
     }
 
+    /// Creates an MCP error naming the server it concerns.
+    #[must_use]
+    pub fn mcp(server: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::Mcp {
+            server: server.into(),
+            reason: reason.into(),
+        })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -313,6 +332,9 @@ impl fmt::Display for ActonAIError {
             }
             ActonAIErrorKind::RuntimeShutdown => {
                 write!(f, "runtime has been shut down")
+            }
+            ActonAIErrorKind::Mcp { server, reason } => {
+                write!(f, "MCP server '{server}': {reason}")
             }
         }
     }

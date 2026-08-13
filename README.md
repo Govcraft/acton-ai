@@ -30,6 +30,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Multi-provider support** — Anthropic Claude, OpenAI, Ollama, and any OpenAI-compatible API
 - **Streaming responses** — Token-by-token callbacks for real-time output
 - **Built-in tools** — File operations, bash, grep, glob, web fetch, and calculations
+- **MCP client** — Consume tools from external Model Context Protocol servers (stdio or streamable HTTP) under supervised, self-reconnecting connections
 - **Tool execution loop** — Automatic tool calling and result handling until completion
 - **Two API levels** — Simple facade for common cases, full actor access for advanced control
 - **TOML configuration** — Define providers and settings in config files
@@ -260,6 +261,61 @@ Available when you call `.with_builtins()`:
 
 Select specific tools with `.with_builtin_tools(&["read_file", "glob", "bash"])`.
 
+## MCP Servers
+
+Acton-ai is an MCP **client**: tools exposed by external Model Context Protocol
+servers become available to the LLM alongside the built-ins, under the name
+`mcp__{server}__{tool}`.
+
+Declare servers in `acton-ai.toml`. A server uses either `command` (a stdio
+child process) or `url` (a streamable-HTTP endpoint) — setting both, or
+neither, is a launch error naming the server.
+
+```toml
+[mcp_servers.filesystem]
+command = "npx"
+args = ["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]
+env = { RUST_LOG = "info" }     # optional
+cwd = "/srv"                    # optional
+tool_timeout_secs = 60          # optional, default 60
+enabled_tools = ["read_file"]   # optional allowlist of remote tool names
+
+[mcp_servers.linear]
+url = "https://mcp.linear.app/mcp"
+auth_token_env = "LINEAR_MCP_TOKEN"   # optional bearer token, read from the environment
+```
+
+Or configure them programmatically — builder entries win over same-named TOML
+entries:
+
+```rust,ignore
+use acton_ai::prelude::*;
+
+let runtime = ActonAI::builder()
+    .app_name("my-app")
+    .ollama("qwen2.5:7b")
+    .with_mcp_server(
+        "filesystem",
+        McpServerConfig::stdio("npx")
+            .with_args(["-y", "@modelcontextprotocol/server-filesystem", "/tmp"]),
+    )
+    .launch()
+    .await?;
+
+// MCP tools are injected into every prompt automatically.
+let response = runtime.prompt("List the files in /tmp").collect().await?;
+```
+
+Every server connection is owned by a supervised actor. If a connection dies —
+the child process exits, the HTTP transport drops — the in-flight tool call
+returns an error the model can retry, the supervisor restarts the actor, and
+the restarted actor reconnects. Tool executors resolve the live actor per call,
+so nothing downstream has to notice.
+
+`ActonAI::shutdown()` stops those actors, which closes the sessions and kills
+any stdio child processes. Dropping the runtime without calling `shutdown()`
+leaves that cleanup to a best-effort drop guard — call `shutdown()`.
+
 ## CLI
 
 Acton-ai ships a scriptable CLI with persistent sessions, autonomous task execution, and stdin/stdout piping.
@@ -350,7 +406,9 @@ ActonAI (Facade)
     │       │
     │       ├── ToolRegistry ───── Tool registration and execution
     │       │
-    │       └── MemoryStore ───── Persistent sessions, memories, embeddings
+    │       ├── MemoryStore ───── Persistent sessions, memories, embeddings
+    │       │
+    │       └── McpSupervisor ─── One supervised actor per MCP server connection
     │
     └── BuiltinTools ──────────── File ops, bash, web fetch, etc.
 ```
