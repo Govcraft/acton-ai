@@ -3,10 +3,53 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased
+## 0.31.0 - 2026-08-16
+
+### Fixed
+
+- **A malformed model response no longer wedges a conversation.** Several
+  shapes a response can produce were rejected by the provider on *every*
+  later turn rather than only the one that introduced them, because the bad
+  message was replayed each round: a `tool_use` with no matching
+  `tool_result`, a tool result answering no call, an empty assistant turn, a
+  history that no longer opened on a user turn. A new provider-agnostic
+  repair pass runs before serialization and returns a well-formed history
+  unchanged. Recovering previously meant discarding the whole history.
+- **Streaming tool calls work on the Anthropic client.** `content_block_start`
+  and `content_block_stop` were discarded and `input_json_delta` ignored, so
+  the streaming path — the default — dropped every tool call the model made
+  and ended the turn as though it had chosen to answer instead. Fragments are
+  now reassembled and the call is emitted when its block closes.
+- Parallel tool calls no longer fail against Anthropic. Each result was sent
+  as its own user message, but every result answering one assistant turn must
+  ride in a single message, so any multi-tool round was refused.
+- The empty text block emitted beside a `tool_use` is gone. Anthropic rejects
+  it, and a tool call with no preamble text is the ordinary case.
+- **A broken stream is reported as a failed round.** A stream dying mid-flight
+  set `StopReason::EndTurn` and reported success, presenting a partial answer
+  as a finished turn and leaving the failover chain and circuit breaker with
+  nothing to act on. It now sets `StopReason::Error` and fails the round, so
+  failover engages.
+- A tool call whose arguments will not parse is an error on the OpenAI client
+  rather than being dropped or defaulted to `{}`. A stream cut mid-JSON ran
+  the tool against inputs the model never sent.
+- Context-window truncation keeps tool exchanges intact. It could previously
+  separate an assistant turn from the results answering it, or keep results
+  whose call was gone — both refused by the providers, and again for the rest
+  of the conversation.
 
 ### Behavior changes
 
+- `ContextWindow::fit_messages` returns a repaired history: consecutive
+  same-role turns are coalesced (their content joined), and structurally
+  unsendable messages are dropped. It can therefore return fewer messages
+  than before.
+- `web_fetch` returns extracted text rather than raw markup for HTML
+  responses, capped at 120k characters independently of the 5 MB download
+  limit, and reports `extracted_as_text`. A tool result is replayed on every
+  later round of a turn, so an unbounded one grew each request until the
+  provider refused it or dropped the connection — the failure that motivated
+  most of this release.
 - **The circuit breaker is on by default.** Five consecutive failures on a
   provider open its circuit for thirty seconds, during which requests to it
   are refused with `LLMErrorKind::CircuitOpen` instead of being sent. A
@@ -30,6 +73,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `WebFetchTool::with_max_body_chars` to tune how much extracted text reaches
+  the model, separately from the download cap.
 - **Live introspection** over a Unix control socket, behind the new `ipc`
   feature, which joins the default set. `acton-ai status` asks a running
   process what it is doing — uptime, PID, each provider's model, health,

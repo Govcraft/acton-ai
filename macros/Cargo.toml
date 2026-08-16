@@ -1,6 +1,6 @@
 [package]
 name = "acton-ai-macros"
-version = "0.30.0"
+version = "0.31.0"
 edition = "2021"
 description = "Procedural macros for acton-ai: the #[tool] attribute that turns a function into an LLM tool"
 license = "MIT"
