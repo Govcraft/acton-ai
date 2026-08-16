@@ -1068,6 +1068,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                                     message = %message,
                                     "Stream error"
                                 );
+                                stop_reason = StopReason::Error;
                                 break;
                             }
                         }
@@ -1078,10 +1079,23 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                             error = %e,
                             "Stream error"
                         );
+                        // A stream that dies mid-flight has delivered a
+                        // partial answer, not a complete one. Leaving the
+                        // reason at `EndTurn` would present the fragment as
+                        // the model's finished turn: the caller would get a
+                        // truncated answer with no error, the history would
+                        // record it as final, and — because the round looked
+                        // successful — no failover would be attempted.
+                        stop_reason = StopReason::Error;
                         break;
                     }
                 }
             }
+
+            // Only a round that reached a terminal event counts as served.
+            // The circuit breaker and the failover chain both key off this,
+            // so a broken stream has to be reported as the failure it is.
+            let succeeded = stop_reason != StopReason::Error;
 
             // Send stream end
             broker
@@ -1109,7 +1123,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                 })
                 .await;
 
-            ctx.provider.send(RequestOutcome { succeeded: true }).await;
+            ctx.provider.send(RequestOutcome { succeeded }).await;
         }
         Err(e) => {
             tracing::error!(

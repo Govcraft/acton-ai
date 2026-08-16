@@ -250,6 +250,25 @@ struct ToolCallAccumulator {
     arguments: String,
 }
 
+/// Parses the arguments of a tool call, which this API carries as a JSON
+/// string rather than as JSON.
+///
+/// An absent or blank argument string means "no arguments" and yields an empty
+/// object. Anything else that fails to parse is an error: a truncated or
+/// malformed fragment must never be silently rounded down to `{}`, because the
+/// tool would then run against inputs the model never supplied.
+fn parse_tool_arguments(tool_name: &str, raw: &str) -> Result<serde_json::Value, LLMError> {
+    if raw.trim().is_empty() {
+        return Ok(serde_json::Value::Object(serde_json::Map::new()));
+    }
+
+    serde_json::from_str(raw).map_err(|e| {
+        LLMError::parse_error(format!(
+            "tool call `{tool_name}` supplied unparseable arguments: {e}"
+        ))
+    })
+}
+
 impl OpenAIClient {
     /// Creates a new OpenAI-compatible client.
     ///
@@ -318,8 +337,14 @@ impl OpenAIClient {
     }
 
     /// Converts internal messages to OpenAI API format.
+    /// Converts internal messages to API format.
+    ///
+    /// The history is structurally repaired first (see
+    /// [`crate::llm::sanitize`]) so that no `tool` message arrives without the
+    /// `tool_call_id` this format requires, and no `tool_calls` array is left
+    /// without its answering messages.
     fn convert_messages(&self, messages: &[Message]) -> Vec<OpenAIMessage> {
-        messages
+        crate::llm::sanitize::sanitize_history(messages)
             .iter()
             .map(|msg| match msg.role {
                 MessageRole::System => OpenAIMessage {
@@ -543,23 +568,28 @@ impl LLMClient for OpenAIClient {
 
         let content = choice.message.content.clone().unwrap_or_default();
 
+        // A call whose arguments will not parse is an error, not something to
+        // quietly leave out: dropping it strands the model mid-plan and the
+        // turn ends as though it had simply chosen to answer.
         let tool_calls = choice
             .message
             .tool_calls
             .as_ref()
             .map(|tcs| {
                 tcs.iter()
-                    .filter_map(|tc| {
-                        let arguments: serde_json::Value =
-                            serde_json::from_str(&tc.function.arguments).ok()?;
-                        Some(ToolCall {
+                    .map(|tc| {
+                        Ok(ToolCall {
                             id: tc.id.clone(),
                             name: tc.function.name.clone(),
-                            arguments,
+                            arguments: parse_tool_arguments(
+                                &tc.function.name,
+                                &tc.function.arguments,
+                            )?,
                         })
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>, LLMError>>()
             })
+            .transpose()?
             .unwrap_or_default();
 
         // If tool calls are present, force ToolUse stop reason even if the
@@ -731,11 +761,24 @@ impl LLMClient for OpenAIClient {
                                                         if let (Some(id), Some(name)) =
                                                             (&acc.id, &acc.name)
                                                         {
-                                                            let arguments: serde_json::Value =
-                                                                serde_json::from_str(
+                                                            // A stream cut mid-JSON leaves a
+                                                            // fragment. Defaulting it to `{}`
+                                                            // would run the tool with arguments
+                                                            // the model never sent, so the
+                                                            // round fails instead.
+                                                            let arguments =
+                                                                match parse_tool_arguments(
+                                                                    name,
                                                                     &acc.arguments,
-                                                                )
-                                                                .unwrap_or(serde_json::json!({}));
+                                                                ) {
+                                                                    Ok(arguments) => arguments,
+                                                                    Err(e) => {
+                                                                        state
+                                                                            .pending_events
+                                                                            .push_back(Err(e));
+                                                                        continue;
+                                                                    }
+                                                                };
 
                                                             state.pending_events.push_back(Ok(
                                                                 LLMStreamEvent::ToolCall {
@@ -965,14 +1008,20 @@ mod tests {
             name: "search".to_string(),
             arguments: serde_json::json!({"query": "rust"}),
         }];
-        let messages = vec![Message::assistant_with_tools("I'll search.", tool_calls)];
+        // A complete exchange: a call with no answering result is stripped
+        // before serialization, so the fixture has to include the result.
+        let messages = vec![
+            Message::user("search for rust"),
+            Message::assistant_with_tools("I'll search.", tool_calls),
+            Message::tool("tc_123", "Search results..."),
+        ];
         let api_messages = client.convert_messages(&messages);
 
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, "assistant");
-        assert!(api_messages[0].tool_calls.is_some());
+        assert_eq!(api_messages.len(), 3);
+        assert_eq!(api_messages[1].role, "assistant");
+        assert!(api_messages[1].tool_calls.is_some());
 
-        let tool_calls = api_messages[0].tool_calls.as_ref().unwrap();
+        let tool_calls = api_messages[1].tool_calls.as_ref().unwrap();
         assert_eq!(tool_calls.len(), 1);
         assert_eq!(tool_calls[0].id, "tc_123");
         assert_eq!(tool_calls[0].function.name, "search");
@@ -981,16 +1030,64 @@ mod tests {
     #[test]
     fn openai_convert_tool_response() {
         let client = create_test_client();
-        let messages = vec![Message::tool("tc_123", "Search results...")];
+        let messages = vec![
+            Message::user("search for rust"),
+            Message::assistant_with_tools(
+                "I'll search.",
+                vec![ToolCall {
+                    id: "tc_123".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({"query": "rust"}),
+                }],
+            ),
+            Message::tool("tc_123", "Search results..."),
+        ];
         let api_messages = client.convert_messages(&messages);
 
-        assert_eq!(api_messages.len(), 1);
-        assert_eq!(api_messages[0].role, "tool");
-        assert_eq!(api_messages[0].tool_call_id, Some("tc_123".to_string()));
+        assert_eq!(api_messages.len(), 3);
+        assert_eq!(api_messages[2].role, "tool");
+        assert_eq!(api_messages[2].tool_call_id, Some("tc_123".to_string()));
         assert_eq!(
-            api_messages[0].content,
+            api_messages[2].content,
             Some("Search results...".to_string())
         );
+    }
+
+    #[test]
+    fn openai_tool_message_without_an_id_is_never_serialized() {
+        let client = create_test_client();
+        // `tool_call_id` is required by this format; without it the message
+        // serializes as a `tool` role naming no call, which is rejected.
+        let messages = vec![
+            Message::user("search"),
+            Message {
+                role: MessageRole::Tool,
+                content: "results".to_string(),
+                tool_calls: None,
+                tool_call_id: None,
+            },
+        ];
+
+        let api_messages = client.convert_messages(&messages);
+
+        assert!(api_messages.iter().all(|m| m.role != "tool"));
+    }
+
+    #[test]
+    fn openai_unparseable_tool_arguments_are_an_error() {
+        let result = parse_tool_arguments("bash", "{\"command\":\"rm -");
+
+        assert!(
+            result.is_err(),
+            "a truncated argument list must not become {{}}"
+        );
+    }
+
+    #[test]
+    fn openai_absent_tool_arguments_mean_no_arguments() {
+        let parsed = parse_tool_arguments("now", "").unwrap();
+
+        assert_eq!(parsed, serde_json::json!({}));
     }
 
     #[test]

@@ -443,53 +443,66 @@ impl AnthropicClient {
     }
 
     /// Converts internal messages to API format.
+    ///
+    /// The history is structurally repaired first (see
+    /// [`crate::llm::sanitize`]), so this only has the wire format to worry
+    /// about. Two Anthropic rules shape what follows:
+    ///
+    /// - A text block must be non-empty, so a tool-calling turn with no
+    ///   preamble contributes only its `tool_use` blocks.
+    /// - Tool results are `user` messages, and every result answering one
+    ///   assistant turn must ride in a *single* user message. Adjacent
+    ///   same-role messages are therefore coalesced rather than pushed
+    ///   individually.
     fn convert_messages(&self, messages: &[Message]) -> (Option<String>, Vec<ApiMessage>) {
+        let messages = crate::llm::sanitize::sanitize_history(messages);
         let mut system = None;
-        let mut api_messages = Vec::new();
+        let mut api_messages: Vec<ApiMessage> = Vec::new();
 
-        for msg in messages {
+        for msg in &messages {
             match msg.role {
                 MessageRole::System => {
                     system = Some(msg.content.clone());
                 }
                 MessageRole::User => {
-                    api_messages.push(ApiMessage {
-                        role: "user".to_string(),
-                        content: ApiContent::Text(msg.content.clone()),
-                    });
+                    push_or_coalesce(
+                        &mut api_messages,
+                        "user",
+                        ApiContent::Text(msg.content.clone()),
+                    );
                 }
                 MessageRole::Assistant => {
-                    if let Some(tool_calls) = &msg.tool_calls {
-                        let blocks: Vec<ContentBlock> = std::iter::once(ContentBlock::Text {
-                            text: msg.content.clone(),
-                        })
-                        .chain(tool_calls.iter().map(|tc| ContentBlock::ToolUse {
+                    let content = if let Some(tool_calls) = &msg.tool_calls {
+                        let mut blocks = Vec::with_capacity(tool_calls.len() + 1);
+                        // An empty text block is rejected outright, and a
+                        // tool call with no preamble text is the common case.
+                        if !msg.content.trim().is_empty() {
+                            blocks.push(ContentBlock::Text {
+                                text: msg.content.clone(),
+                            });
+                        }
+                        blocks.extend(tool_calls.iter().map(|tc| ContentBlock::ToolUse {
                             id: tc.id.clone(),
                             name: tc.name.clone(),
                             input: tc.arguments.clone(),
-                        }))
-                        .collect();
-
-                        api_messages.push(ApiMessage {
-                            role: "assistant".to_string(),
-                            content: ApiContent::Blocks(blocks),
-                        });
+                        }));
+                        ApiContent::Blocks(blocks)
                     } else {
-                        api_messages.push(ApiMessage {
-                            role: "assistant".to_string(),
-                            content: ApiContent::Text(msg.content.clone()),
-                        });
-                    }
+                        ApiContent::Text(msg.content.clone())
+                    };
+
+                    push_or_coalesce(&mut api_messages, "assistant", content);
                 }
                 MessageRole::Tool => {
                     if let Some(tool_call_id) = &msg.tool_call_id {
-                        api_messages.push(ApiMessage {
-                            role: "user".to_string(),
-                            content: ApiContent::Blocks(vec![ContentBlock::ToolResult {
+                        push_or_coalesce(
+                            &mut api_messages,
+                            "user",
+                            ApiContent::Blocks(vec![ContentBlock::ToolResult {
                                 tool_use_id: tool_call_id.clone(),
                                 content: msg.content.clone(),
                             }]),
-                        });
+                        );
                     }
                 }
             }
@@ -762,27 +775,90 @@ impl LLMClient for AnthropicClient {
 
 /// Converts Anthropic stream events to unified LLMStreamEvent.
 ///
-/// Usage arrives split across two events — `message_start` carries the input
-/// and cache counts, `message_delta` the final output count — so the running
-/// total is threaded through the stream with `scan` and attached to whichever
-/// terminal event closes the round.
+/// Two things have to survive across events, so both ride in a [`StreamState`]
+/// threaded through with `scan`:
+///
+/// - Usage arrives split across two events — `message_start` carries the input
+///   and cache counts, `message_delta` the final output count — and is attached
+///   to whichever terminal event closes the round.
+/// - A `tool_use` block is announced, streamed as JSON fragments, then closed,
+///   so a tool call is only whole at `content_block_stop`.
 fn convert_anthropic_stream(
     stream: impl futures::Stream<Item = Result<StreamEvent, LLMError>> + Send + 'static,
 ) -> impl futures::Stream<Item = Result<LLMStreamEvent, LLMError>> + Send {
     stream
-        .scan(Usage::default(), |total, result| {
+        .scan(StreamState::default(), |state, result| {
             // Never yields `None`: the stream ends when the source does, not
             // when an event happens to carry nothing worth emitting.
-            futures::future::ready(Some(convert_one_event(total, result)))
+            futures::future::ready(Some(convert_one_event(state, result)))
         })
         .filter_map(futures::future::ready)
 }
 
-/// Folds one Anthropic event into the running usage total and maps it onto
+/// Appends `content` to the last API message when it shares `role`, otherwise
+/// starts a new message.
+///
+/// Anthropic requires alternating roles, and requires every tool result
+/// answering one assistant turn to arrive in a single user message. Both fall
+/// out of coalescing on the way in.
+fn push_or_coalesce(messages: &mut Vec<ApiMessage>, role: &str, content: ApiContent) {
+    if let Some(last) = messages.last_mut() {
+        if last.role == role {
+            append_content(&mut last.content, content);
+            return;
+        }
+    }
+    messages.push(ApiMessage {
+        role: role.to_string(),
+        content,
+    });
+}
+
+/// Concatenates two content bodies, promoting plain text to a block list so
+/// the two representations can be joined.
+fn append_content(existing: &mut ApiContent, incoming: ApiContent) {
+    let mut blocks = match std::mem::replace(existing, ApiContent::Blocks(Vec::new())) {
+        ApiContent::Text(text) => vec![ContentBlock::Text { text }],
+        ApiContent::Blocks(blocks) => blocks,
+    };
+
+    match incoming {
+        ApiContent::Text(text) => blocks.push(ContentBlock::Text { text }),
+        ApiContent::Blocks(incoming) => blocks.extend(incoming),
+    }
+
+    *existing = ApiContent::Blocks(blocks);
+}
+
+/// A `tool_use` content block being assembled across SSE deltas.
+///
+/// Anthropic announces the id and name in `content_block_start`, then streams
+/// the arguments as a sequence of `input_json_delta` fragments that are only
+/// valid JSON once concatenated.
+#[derive(Debug, Clone)]
+struct ToolBlock {
+    id: String,
+    name: String,
+    /// Concatenated `partial_json` fragments. Empty for a tool taking no
+    /// arguments, which Anthropic streams with no deltas at all.
+    json: String,
+}
+
+/// State threaded through the SSE stream by [`Self::convert_stream`].
+#[derive(Debug, Default)]
+struct StreamState {
+    /// Running usage total, folded from whichever events report it.
+    usage: Usage,
+    /// Tool blocks open right now, keyed by their content-block index.
+    /// Anthropic may interleave blocks, so this cannot be a single slot.
+    tools: std::collections::HashMap<usize, ToolBlock>,
+}
+
+/// Folds one Anthropic event into the running stream state and maps it onto
 /// the unified event type. Returns `None` for events with no unified
-/// counterpart (pings, block boundaries).
+/// counterpart (pings, the boundaries of a text block).
 fn convert_one_event(
-    total: &mut Usage,
+    state: &mut StreamState,
     result: Result<StreamEvent, LLMError>,
 ) -> Option<Result<LLMStreamEvent, LLMError>> {
     let event = match result {
@@ -792,24 +868,87 @@ fn convert_one_event(
 
     match event {
         StreamEvent::MessageStart { id, usage } => {
-            usage.apply_to(total);
+            usage.apply_to(&mut state.usage);
             Some(Ok(LLMStreamEvent::Start { id }))
         }
-        StreamEvent::ContentBlockDelta { text, .. } => {
+        StreamEvent::ContentBlockStart {
+            index,
+            block_type,
+            tool_id,
+            tool_name,
+        } => {
+            // Only `tool_use` blocks carry an id and a name; a text block
+            // opens with neither and needs no state.
+            if block_type == "tool_use" {
+                if let (Some(id), Some(name)) = (tool_id, tool_name) {
+                    state.tools.insert(
+                        index,
+                        ToolBlock {
+                            id,
+                            name,
+                            json: String::new(),
+                        },
+                    );
+                }
+            }
+            None
+        }
+        StreamEvent::ContentBlockDelta {
+            index,
+            text,
+            partial_json,
+            ..
+        } => {
+            // An argument fragment belongs to the tool block at this index,
+            // never to the caller's token stream.
+            if let Some(fragment) = partial_json {
+                if let Some(block) = state.tools.get_mut(&index) {
+                    block.json.push_str(&fragment);
+                }
+                return None;
+            }
             text.map(|t| Ok(LLMStreamEvent::Token { text: t }))
         }
+        StreamEvent::ContentBlockStop { index } => {
+            // The close of a tool block is the only point at which its
+            // arguments are complete enough to parse.
+            let block = state.tools.remove(&index)?;
+            let arguments = if block.json.trim().is_empty() {
+                serde_json::Value::Object(serde_json::Map::new())
+            } else {
+                match serde_json::from_str(&block.json) {
+                    Ok(value) => value,
+                    // Never fall back to empty arguments: that runs the tool
+                    // with inputs the model did not ask for.
+                    Err(e) => {
+                        return Some(Err(LLMError::parse_error(format!(
+                            "tool call `{}` streamed unparseable arguments: {e}",
+                            block.name
+                        ))))
+                    }
+                }
+            };
+            Some(Ok(LLMStreamEvent::ToolCall {
+                tool_call: ToolCall {
+                    id: block.id,
+                    name: block.name,
+                    arguments,
+                },
+            }))
+        }
         StreamEvent::MessageDelta { stop_reason, usage } => {
-            usage.apply_to(total);
+            usage.apply_to(&mut state.usage);
+            let total = state.usage;
             stop_reason.map(|reason| {
                 Ok(LLMStreamEvent::End {
                     stop_reason: parse_stop_reason(&reason),
-                    usage: *total,
+                    usage: total,
                 })
             })
         }
         StreamEvent::MessageStop => Some(Ok(LLMStreamEvent::End {
             stop_reason: StopReason::EndTurn,
-            usage: *total,
+            usage: state.usage,
         })),
         StreamEvent::Error {
             error_type,
@@ -818,9 +957,7 @@ fn convert_one_event(
             error_type,
             message,
         })),
-        StreamEvent::Ping
-        | StreamEvent::ContentBlockStart { .. }
-        | StreamEvent::ContentBlockStop { .. } => None,
+        StreamEvent::Ping => None,
     }
 }
 
@@ -959,6 +1096,193 @@ mod tests {
     }
 
     #[test]
+    fn tool_call_with_no_preamble_emits_no_empty_text_block() {
+        let config = ProviderConfig::new("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+
+        let messages = vec![
+            Message::user("search for rust"),
+            Message::assistant_with_tools(
+                "",
+                vec![ToolCall {
+                    id: "tc_1".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool("tc_1", "results"),
+        ];
+
+        let (_, api_messages) = client.convert_messages(&messages);
+        let wire = serde_json::to_string(&api_messages).unwrap();
+
+        assert!(
+            !wire.contains(r#"{"type":"text","text":""}"#),
+            "empty text block reached the wire: {wire}"
+        );
+        assert!(wire.contains("tool_use"));
+    }
+
+    #[test]
+    fn parallel_tool_results_ride_in_one_user_message() {
+        let config = ProviderConfig::new("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+
+        let calls = vec![
+            ToolCall {
+                id: "tc_1".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+            ToolCall {
+                id: "tc_2".to_string(),
+                name: "search".to_string(),
+                arguments: serde_json::json!({}),
+            },
+        ];
+        let messages = vec![
+            Message::user("search twice"),
+            Message::assistant_with_tools("on it", calls),
+            Message::tool("tc_1", "first"),
+            Message::tool("tc_2", "second"),
+        ];
+
+        let (_, api_messages) = client.convert_messages(&messages);
+
+        assert_eq!(api_messages.len(), 3);
+        assert_eq!(api_messages[2].role, "user");
+        let ApiContent::Blocks(blocks) = &api_messages[2].content else {
+            panic!("tool results must serialize as blocks")
+        };
+        assert_eq!(blocks.len(), 2);
+    }
+
+    #[test]
+    fn roles_never_repeat_on_the_wire() {
+        let config = ProviderConfig::new("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+
+        let messages = vec![
+            Message::user("extract the data"),
+            Message::user("record your answer"),
+        ];
+
+        let (_, api_messages) = client.convert_messages(&messages);
+
+        assert_eq!(api_messages.len(), 1);
+        assert!(api_messages
+            .windows(2)
+            .all(|pair| pair[0].role != pair[1].role));
+    }
+
+    #[test]
+    fn dangling_tool_call_never_reaches_the_wire() {
+        let config = ProviderConfig::new("test-key");
+        let client = AnthropicClient::new(config).unwrap();
+
+        // The shape a turn leaves behind when it dies between issuing a call
+        // and recording its result.
+        let messages = vec![
+            Message::user("search for rust"),
+            Message::assistant_with_tools(
+                "looking",
+                vec![ToolCall {
+                    id: "tc_1".to_string(),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::user("never mind"),
+        ];
+
+        let (_, api_messages) = client.convert_messages(&messages);
+        let wire = serde_json::to_string(&api_messages).unwrap();
+
+        assert!(!wire.contains("tool_use"), "dangling call survived: {wire}");
+    }
+
+    #[test]
+    fn streaming_reassembles_a_tool_call_from_json_fragments() {
+        let events = events_from_sse(&[
+            r#"data: {"type":"message_start","message":{"id":"msg_1","usage":{"input_tokens":10}}}"#,
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc_1","name":"search"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"query\":"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"\"rust\"}"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":5}}"#,
+        ]);
+
+        let tool_call = events
+            .iter()
+            .find_map(|event| match event {
+                Ok(LLMStreamEvent::ToolCall { tool_call }) => Some(tool_call),
+                _ => None,
+            })
+            .expect("the stream must yield the tool call it described");
+
+        assert_eq!(tool_call.id, "tc_1");
+        assert_eq!(tool_call.name, "search");
+        assert_eq!(tool_call.arguments["query"], "rust");
+    }
+
+    #[test]
+    fn streaming_tool_call_with_no_arguments_yields_an_empty_object() {
+        let events = events_from_sse(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc_1","name":"now"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        let tool_call = events
+            .iter()
+            .find_map(|event| match event {
+                Ok(LLMStreamEvent::ToolCall { tool_call }) => Some(tool_call),
+                _ => None,
+            })
+            .expect("a tool taking no arguments still produces a call");
+
+        assert_eq!(tool_call.arguments, serde_json::json!({}));
+    }
+
+    #[test]
+    fn truncated_tool_arguments_error_rather_than_running_empty() {
+        let events = events_from_sse(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tc_1","name":"bash"}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"command\":\"rm -"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        assert!(
+            events.iter().any(Result::is_err),
+            "a half-streamed argument list must not be rounded down to {{}}"
+        );
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, Ok(LLMStreamEvent::ToolCall { .. }))));
+    }
+
+    #[test]
+    fn text_deltas_are_not_confused_with_tool_arguments() {
+        let events = events_from_sse(&[
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#,
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello"}}"#,
+            r#"data: {"type":"content_block_stop","index":0}"#,
+        ]);
+
+        let tokens: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                Ok(LLMStreamEvent::Token { text }) => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(tokens, vec!["hello"]);
+        assert!(events
+            .iter()
+            .all(|event| !matches!(event, Ok(LLMStreamEvent::ToolCall { .. }))));
+    }
+
+    #[test]
     fn convert_messages_handles_tool_calls() {
         let config = ProviderConfig::new("test-key");
         let client = AnthropicClient::new(config).unwrap();
@@ -1048,20 +1372,27 @@ mod tests {
     /// Runs a scripted set of SSE lines through the same conversion the
     /// client uses, returning the usage attached to the terminal event.
     fn usage_from_sse(lines: &[&str]) -> Usage {
-        let mut total = Usage::default();
         let mut ended = None;
 
-        for line in lines {
-            for event in AnthropicClient::parse_sse_events(line).unwrap() {
-                if let Some(Ok(LLMStreamEvent::End { usage, .. })) =
-                    convert_one_event(&mut total, Ok(event))
-                {
-                    ended = Some(usage);
-                }
+        for event in events_from_sse(lines) {
+            if let Ok(LLMStreamEvent::End { usage, .. }) = event {
+                ended = Some(usage);
             }
         }
 
         ended.expect("the scripted stream must produce a terminal event")
+    }
+
+    /// Runs a scripted set of SSE lines through the same conversion the
+    /// client uses, returning every unified event it produced.
+    fn events_from_sse(lines: &[&str]) -> Vec<Result<LLMStreamEvent, LLMError>> {
+        let mut state = StreamState::default();
+
+        lines
+            .iter()
+            .flat_map(|line| AnthropicClient::parse_sse_events(line).unwrap())
+            .filter_map(|event| convert_one_event(&mut state, Ok(event)))
+            .collect()
     }
 
     #[test]
