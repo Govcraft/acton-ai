@@ -341,40 +341,93 @@ impl ContextWindow {
     /// # Returns
     ///
     /// A subset of messages that fit within the context window.
+    /// Fits messages within the context window.
+    ///
+    /// Truncation works on whole **exchanges**, never on individual messages:
+    /// an assistant turn and the tool results answering it are kept or dropped
+    /// together. Splitting them produces a history the providers reject
+    /// outright — a `tool_use` with no `tool_result`, or the reverse — and
+    /// that rejection persists for every later turn, not just this one.
+    ///
+    /// The result is passed through the same structural repair the clients
+    /// apply, which enforces the remaining wire invariant a window cannot see:
+    /// a history has to open on a user turn, and keeping the tail rarely lands
+    /// on one.
     #[must_use]
     pub fn fit_messages(&self, messages: &[Message]) -> Vec<Message> {
         let available = self.available_tokens();
         let total = self.estimate_total_tokens(messages);
 
-        if total <= available {
-            return messages.to_vec();
+        let fitted = if total <= available {
+            messages.to_vec()
+        } else {
+            match self.config.truncation_strategy {
+                TruncationStrategy::KeepRecent => self.truncate_keep_recent(messages, available),
+                TruncationStrategy::KeepSystemAndRecent => {
+                    self.truncate_keep_system_and_recent(messages, available)
+                }
+                TruncationStrategy::KeepEnds => self.truncate_keep_ends(messages, available),
+            }
+        };
+
+        // Only ever removes messages, so the fitted budget still holds.
+        crate::llm::sanitize::sanitize_history(&fitted)
+    }
+
+    /// Splits a history into runs that must not be broken apart.
+    ///
+    /// An assistant turn carrying tool calls forms one run with the tool
+    /// results that follow it. Every other message is a run of its own.
+    fn exchanges(messages: &[Message]) -> Vec<&[Message]> {
+        let mut runs = Vec::new();
+        let mut start = 0;
+
+        while start < messages.len() {
+            let mut end = start + 1;
+            if messages[start].role == MessageRole::Assistant
+                && messages[start].tool_calls.is_some()
+            {
+                while end < messages.len() && messages[end].role == MessageRole::Tool {
+                    end += 1;
+                }
+            }
+            runs.push(&messages[start..end]);
+            start = end;
         }
 
-        match self.config.truncation_strategy {
-            TruncationStrategy::KeepRecent => self.truncate_keep_recent(messages, available),
-            TruncationStrategy::KeepSystemAndRecent => {
-                self.truncate_keep_system_and_recent(messages, available)
+        runs
+    }
+
+    /// Sums the estimated tokens of every message in a run.
+    fn estimate_run_tokens(&self, run: &[Message]) -> usize {
+        run.iter().map(|msg| self.estimate_tokens(msg)).sum()
+    }
+
+    /// Takes whole exchanges from the end of `messages` while they fit.
+    fn take_recent_exchanges(
+        &self,
+        messages: &[Message],
+        available: usize,
+        already_used: usize,
+    ) -> Vec<Message> {
+        let mut result: Vec<Message> = Vec::new();
+        let mut total = already_used;
+
+        for run in Self::exchanges(messages).into_iter().rev() {
+            let tokens = self.estimate_run_tokens(run);
+            if total + tokens > available {
+                break;
             }
-            TruncationStrategy::KeepEnds => self.truncate_keep_ends(messages, available),
+            result.splice(0..0, run.iter().cloned());
+            total += tokens;
         }
+
+        result
     }
 
     /// Truncation strategy: keep most recent messages.
     fn truncate_keep_recent(&self, messages: &[Message], available: usize) -> Vec<Message> {
-        let mut result = Vec::new();
-        let mut total = 0;
-
-        for message in messages.iter().rev() {
-            let tokens = self.estimate_tokens(message);
-            if total + tokens > available {
-                break;
-            }
-            result.push(message.clone());
-            total += tokens;
-        }
-
-        result.reverse();
-        result
+        self.take_recent_exchanges(messages, available, 0)
     }
 
     /// Truncation strategy: keep system message + recent messages.
@@ -402,20 +455,7 @@ impl ContextWindow {
 
         // Add recent messages that fit
         let remaining_start = if result.is_empty() { 0 } else { 1 };
-        let remaining = &messages[remaining_start..];
-        let mut recent = Vec::new();
-
-        for message in remaining.iter().rev() {
-            let tokens = self.estimate_tokens(message);
-            if total + tokens > available {
-                break;
-            }
-            recent.push(message.clone());
-            total += tokens;
-        }
-
-        recent.reverse();
-        result.extend(recent);
+        result.extend(self.take_recent_exchanges(&messages[remaining_start..], available, total));
         result
     }
 
@@ -425,16 +465,21 @@ impl ContextWindow {
             return Vec::new();
         }
 
-        if messages.len() == 1 {
-            let tokens = self.estimate_tokens(&messages[0]);
+        let runs = Self::exchanges(messages);
+        let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
+            return Vec::new();
+        };
+
+        if runs.len() == 1 {
+            let tokens = self.estimate_run_tokens(first);
             if tokens <= available {
-                return vec![messages[0].clone()];
+                return first.to_vec();
             }
             return Vec::new();
         }
 
-        let first_tokens = self.estimate_tokens(&messages[0]);
-        let last_tokens = self.estimate_tokens(&messages[messages.len() - 1]);
+        let first_tokens = self.estimate_run_tokens(first);
+        let last_tokens = self.estimate_run_tokens(last);
 
         if first_tokens + last_tokens > available {
             // Can't even fit first and last, fall back to recent
@@ -442,25 +487,22 @@ impl ContextWindow {
         }
 
         // Start with first and last
-        let mut result = vec![messages[0].clone()];
+        let mut result = first.to_vec();
         let mut current_tokens = first_tokens + last_tokens;
 
-        // Try to add messages from the end (before the last message)
-        let middle = &messages[1..messages.len() - 1];
-        let mut middle_to_add = Vec::new();
-
-        for message in middle.iter().rev() {
-            let tokens = self.estimate_tokens(message);
+        // Try to add exchanges from the end (before the last one)
+        let mut middle_to_add: Vec<Message> = Vec::new();
+        for run in runs[1..runs.len() - 1].iter().rev() {
+            let tokens = self.estimate_run_tokens(run);
             if current_tokens + tokens > available {
                 break;
             }
-            middle_to_add.push(message.clone());
+            middle_to_add.splice(0..0, run.iter().cloned());
             current_tokens += tokens;
         }
 
-        middle_to_add.reverse();
         result.extend(middle_to_add);
-        result.push(messages[messages.len() - 1].clone());
+        result.extend(last.iter().cloned());
 
         result
     }
@@ -578,6 +620,7 @@ fn build_system_with_memories(system_prompt: &str, memories: &[Memory]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::messages::ToolCall;
     use crate::types::AgentId;
 
     // Helper to create test messages
@@ -588,6 +631,104 @@ mod tests {
             tool_calls: None,
             tool_call_id: None,
         }
+    }
+
+    /// A window tight enough that fitting must drop something.
+    fn tight_window(max_tokens: usize, strategy: TruncationStrategy) -> ContextWindow {
+        ContextWindow::new(ContextWindowConfig {
+            max_tokens,
+            truncation_strategy: strategy,
+            reserved_for_response: 0,
+            tokens_per_char: 0.25,
+        })
+    }
+
+    /// A user turn, then an assistant turn calling one tool, then its result.
+    fn tool_exchange(tag: &str, filler: usize) -> Vec<Message> {
+        vec![
+            msg(MessageRole::User, &format!("ask {tag}")),
+            Message::assistant_with_tools(
+                format!("calling {tag}"),
+                vec![ToolCall {
+                    id: format!("tc_{tag}"),
+                    name: "search".to_string(),
+                    arguments: serde_json::json!({}),
+                }],
+            ),
+            Message::tool(format!("tc_{tag}"), "r".repeat(filler)),
+        ]
+    }
+
+    /// Every tool call in `messages` has a result, and vice versa.
+    fn tool_pairing_is_intact(messages: &[Message]) -> bool {
+        let calls: Vec<&str> = messages
+            .iter()
+            .filter_map(|m| m.tool_calls.as_ref())
+            .flatten()
+            .map(|c| c.id.as_str())
+            .collect();
+        let results: Vec<&str> = messages
+            .iter()
+            .filter(|m| m.role == MessageRole::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+
+        calls.len() == results.len() && calls.iter().all(|id| results.contains(id))
+    }
+
+    #[test]
+    fn truncation_never_splits_a_tool_exchange() {
+        // Sized so the budget lands in the middle of the older exchange,
+        // which is exactly where a message-at-a-time walk would split it.
+        let mut messages = tool_exchange("old", 400);
+        messages.extend(tool_exchange("new", 40));
+
+        for strategy in [
+            TruncationStrategy::KeepRecent,
+            TruncationStrategy::KeepSystemAndRecent,
+            TruncationStrategy::KeepEnds,
+        ] {
+            let fitted = tight_window(120, strategy).fit_messages(&messages);
+
+            assert!(
+                tool_pairing_is_intact(&fitted),
+                "{strategy:?} split a tool exchange: {fitted:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn truncation_leaves_a_history_opening_on_a_user_turn() {
+        let mut messages = tool_exchange("old", 400);
+        messages.extend(tool_exchange("new", 40));
+
+        for strategy in [
+            TruncationStrategy::KeepRecent,
+            TruncationStrategy::KeepSystemAndRecent,
+            TruncationStrategy::KeepEnds,
+        ] {
+            let fitted = tight_window(120, strategy).fit_messages(&messages);
+
+            let first = fitted
+                .iter()
+                .find(|m| m.role != MessageRole::System)
+                .expect("fitting must keep something");
+            assert_eq!(
+                first.role,
+                MessageRole::User,
+                "{strategy:?} opened on {:?}",
+                first.role
+            );
+        }
+    }
+
+    #[test]
+    fn fitting_an_intact_history_changes_nothing() {
+        let messages = tool_exchange("only", 4);
+
+        let fitted = ContextWindow::default().fit_messages(&messages);
+
+        assert_eq!(fitted, messages);
     }
 
     // -------------------------------------------------------------------------

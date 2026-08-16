@@ -992,8 +992,13 @@ fn test_truncation_strategies() {
         "Expected truncation but got {} messages",
         fitted.len()
     );
-    // Last message should be in result
-    assert!(fitted.iter().any(|m| m.content == "msg3"));
+    // The newest turn must survive. Consecutive user turns are coalesced into
+    // one message on the way out — providers reject a repeated role — so this
+    // asks whether the content survived, not whether it kept its own message.
+    assert!(
+        fitted.iter().any(|m| m.content.contains("msg3")),
+        "newest turn was dropped: {fitted:#?}"
+    );
 }
 
 /// Test building context with memories.
