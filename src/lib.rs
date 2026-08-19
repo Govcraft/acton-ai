@@ -62,18 +62,21 @@
 
 pub mod accounting;
 pub mod agent;
+pub mod audit;
 pub mod cli;
 pub mod config;
 pub mod conversation;
 pub mod error;
 pub mod extract;
 pub mod facade;
+pub mod fips;
 pub mod introspection;
 pub mod llm;
 pub mod logging;
 pub mod mcp;
 pub mod memory;
 pub mod messages;
+pub mod policy;
 pub mod prompt;
 pub mod stream;
 pub mod telemetry;
@@ -123,10 +126,15 @@ pub mod prelude {
         BudgetStatus, CheckBudget, CostBreakdown, GetUsage, ModelPricing, ModelUsage, PricingTable,
         ProviderUsage, ScopeStatus, UsageSnapshot, DEFAULT_WARN_AT_PERCENT,
     };
+    pub use crate::audit::{
+        default_audit_path, verify_chain, AuditConfig, AuditDecision, AuditEntry, AuditOutcome,
+        ChainBreak, ChainBreakKind, ChainHead, InvocationRecord, Redactor, DEFAULT_REDACT_PATTERNS,
+        GENESIS_HASH,
+    };
     pub use crate::config::{
-        ActonAIConfig, ActonAIDefaults, BudgetFileConfig, CircuitBreakerFileConfig,
-        IntrospectionFileConfig, McpServerConfig, NamedProviderConfig, PricingFileConfig,
-        RateLimitFileConfig,
+        ActonAIConfig, ActonAIDefaults, AuditFileConfig, BudgetFileConfig,
+        CircuitBreakerFileConfig, IntrospectionFileConfig, McpServerConfig, NamedProviderConfig,
+        PricingFileConfig, RateLimitFileConfig, ToolPolicyFileConfig,
     };
     pub use crate::conversation::{
         ChatConfig, Conversation, ConversationBuilder, StreamToken, DEFAULT_SYSTEM_PROMPT,
@@ -134,8 +142,13 @@ pub mod prelude {
     pub use crate::error::{ActonAIError, ActonAIErrorKind, ProviderAttempt};
     pub use crate::extract::STRUCTURED_OUTPUT_TOOL;
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
+    pub use crate::fips::{install_crypto_provider, is_fips_build};
     pub use crate::introspection::{AdmissionGate, AdmissionState, IntrospectionConfig};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
+    pub use crate::policy::{
+        ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason, ToolInvocation,
+        ToolPolicy, TurnCounts,
+    };
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
 
     // Low-level API (for advanced use cases)

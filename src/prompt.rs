@@ -264,6 +264,13 @@ pub struct PromptBuilder {
     /// Set by [`PromptBuilder::extract`]: the schema the model must fill in
     /// and the type-erased check that its answer really parses.
     structured: Option<StructuredSpec>,
+    /// The conversation this turn belongs to, when it belongs to one.
+    ///
+    /// Carried for the audit trail: a one-shot `prompt()` has no conversation
+    /// to name, while a turn driven by [`Conversation`](crate::Conversation)
+    /// does, and an auditor reading the trail needs to be able to tell which
+    /// calls belonged to the same exchange.
+    conversation_id: Option<crate::types::ConversationId>,
 }
 
 impl PromptBuilder {
@@ -287,6 +294,7 @@ impl PromptBuilder {
             token_target: None,
             sampling: None,
             structured: None,
+            conversation_id: None,
         }
     }
 
@@ -769,6 +777,18 @@ impl PromptBuilder {
         self
     }
 
+    /// Names the conversation this turn belongs to.
+    ///
+    /// Recorded on every audit entry the turn produces, so a reader of the
+    /// trail can group the tool calls of one exchange. Set automatically by
+    /// [`Conversation`](crate::Conversation); a one-shot prompt has no
+    /// conversation and leaves it unset.
+    #[must_use]
+    pub fn conversation_id(mut self, id: crate::types::ConversationId) -> Self {
+        self.conversation_id = Some(id);
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -1080,6 +1100,7 @@ impl PromptBuilder {
             token_target,
             sampling,
             structured,
+            conversation_id,
         } = self;
 
         // Resolve the provider handle
@@ -1104,6 +1125,19 @@ impl PromptBuilder {
         let billed_provider = provider_name
             .clone()
             .unwrap_or_else(|| runtime.default_provider_name().to_string());
+
+        // The gate and the trail, resolved once. Both are `None` in a runtime
+        // that configured neither, and every added branch below is guarded by
+        // that `Option` — a loop with no policy and no audit does exactly what
+        // it did before.
+        let tool_policy = runtime.tool_policy().cloned();
+        let audit = runtime
+            .audit()
+            .map(|(handle, config)| (handle.clone(), config.clone()));
+
+        // Per-turn invocation counts. Owned outright by this task, so a plain
+        // map: the caps are per turn, and a turn is exactly this loop.
+        let mut turn_counts = crate::policy::TurnCounts::new();
 
         // Build the initial messages
         let mut messages = Vec::new();
@@ -1474,94 +1508,32 @@ impl PromptBuilder {
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
-                        // Child of the turn, not of the round: the tool runs
-                        // after its round has closed, and nesting it under a
-                        // finished span would misreport when it ran.
-                        let tool_span = turn.tool(&tool_call.name);
-                        let tool_started = std::time::Instant::now();
-
-                        // Bracketed for the same reason the turn is: a tool
-                        // is where a turn spends most of its wall-clock, so
-                        // "what is this process doing right now" is usually
-                        // answered by the name of a running tool.
-                        provider_handle
-                            .broadcast(TurnLifecycle::ToolStarted {
-                                turn_id: turn_id.clone(),
-                                tool_call_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                            })
-                            .await;
-
-                        let result = execute_tool_with_callback(&mut tools, tool_call).await;
-
-                        provider_handle
-                            .broadcast(TurnLifecycle::ToolFinished {
-                                turn_id: turn_id.clone(),
-                                tool_call_id: tool_call.id.clone(),
-                            })
-                            .await;
-
-                        let tool_outcome = if result.is_ok() {
-                            crate::telemetry::metrics::OUTCOME_OK
-                        } else {
-                            crate::telemetry::metrics::OUTCOME_ERROR
+                        let step = ToolStep {
+                            provider_handle: &provider_handle,
+                            turn,
+                            turn_id,
+                            correlation_id: &round_correlation_id,
+                            conversation_id: conversation_id.as_ref(),
+                            policy: tool_policy.as_ref(),
+                            audit: audit.as_ref(),
                         };
-                        crate::telemetry::metrics::record_tool_duration(
-                            &tool_call.name,
-                            tool_outcome,
-                            tool_started.elapsed().as_secs_f64(),
-                        );
-                        // Name and outcome only. The arguments and the result
-                        // are user data of unbounded size and are never
-                        // recorded — see `crate::telemetry::spans`.
-                        tool_span.finish(tool_outcome);
 
-                        // Broadcast a compact result event so observers
-                        // (the CLI chat REPL) can render success/failure
-                        // inline alongside the preceding tool-call line.
-                        let (success, summary) = match &result {
-                            Ok(value) => (true, summarize_tool_value(value, 200)),
-                            Err(e) => (false, summarize_error(&e.to_string(), 200)),
-                        };
-                        provider_handle
-                            .broadcast(crate::messages::LLMStreamToolResult {
-                                correlation_id: round_correlation_id.clone(),
-                                tool_call_id: tool_call.id.clone(),
-                                tool_name: tool_call.name.clone(),
-                                success,
-                                summary,
-                            })
-                            .await;
+                        let (outcome, executed) =
+                            step.run(&mut tools, &mut turn_counts, tool_call).await;
 
-                        // Record the executed tool call
-                        let executed = match &result {
-                            Ok(value) => ExecutedToolCall::success(
-                                &tool_call.id,
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                                value.clone(),
-                            ),
-                            Err(e) => ExecutedToolCall::error(
-                                &tool_call.id,
-                                &tool_call.name,
-                                tool_call.arguments.clone(),
-                                e.to_string(),
-                            ),
-                        };
                         executed_tool_calls.push(executed);
-                        tool_results.push(result);
+                        tool_results.push(outcome);
                     }
 
                     // Add assistant message with tool calls to conversation
                     messages.push(Message::assistant_with_tools(text, tool_calls.clone()));
 
-                    // Add tool result messages
-                    for (tool_call, result) in tool_calls.iter().zip(tool_results.iter()) {
-                        let result_str = match result {
-                            Ok(v) => serde_json::to_string(v).unwrap_or_default(),
-                            Err(e) => format!("Error: {e}"),
-                        };
-                        messages.push(Message::tool(&tool_call.id, result_str));
+                    // Add tool result messages. A refused call gets the
+                    // gate's own words rather than an error string: it is a
+                    // normal outcome the model is expected to work around,
+                    // and dressing it as a failure invites a retry.
+                    for (tool_call, outcome) in tool_calls.iter().zip(tool_results.iter()) {
+                        messages.push(Message::tool(&tool_call.id, outcome.as_tool_result()));
                     }
                 }
                 // The round produced no answer and nothing left to execute:
@@ -2022,32 +1994,359 @@ fn flatten_and_truncate(s: &str, max: usize) -> String {
     }
 }
 
+/// What happened to one tool call, in the form the next round needs it.
+///
+/// The loop cannot use a plain `Result` here because refusal is a third
+/// thing: not a value the tool returned, and not a failure it suffered. The
+/// model is told about all three, but in different words.
+#[derive(Debug)]
+enum ToolOutcome {
+    /// The tool ran, successfully or not.
+    Ran(Result<serde_json::Value, ToolError>),
+    /// The gate refused the call, with the text the model reads.
+    Refused(String),
+}
+
+impl ToolOutcome {
+    /// The string that goes back to the model as this call's tool result.
+    fn as_tool_result(&self) -> String {
+        match self {
+            Self::Ran(Ok(value)) => serde_json::to_string(value).unwrap_or_default(),
+            Self::Ran(Err(error)) => format!("Error: {error}"),
+            Self::Refused(feedback) => feedback.clone(),
+        }
+    }
+}
+
+/// Everything one tool call needs that does not change between calls.
+///
+/// Assembled per call from borrows the round loop already holds; nothing here
+/// is cloned. It exists so [`Self::run`] can carry the whole gate → execute →
+/// record sequence without adding eight more locals to a loop body that is
+/// already long.
+struct ToolStep<'a> {
+    /// The provider actor, used only as a broadcast source.
+    provider_handle: &'a ActorHandle,
+    /// The turn's span, parent of this call's tool span.
+    turn: &'a crate::telemetry::spans::TurnSpan,
+    /// The turn being served.
+    turn_id: &'a TurnId,
+    /// The correlation ID of the round that asked for this call.
+    correlation_id: &'a CorrelationId,
+    /// The conversation this turn belongs to, when it belongs to one.
+    conversation_id: Option<&'a crate::types::ConversationId>,
+    /// The gate, when one is configured.
+    policy: Option<&'a crate::policy::ToolPolicy>,
+    /// The audit log and its settings, when a trail is configured.
+    audit: Option<&'a (ActorHandle, crate::audit::AuditConfig)>,
+}
+
+impl ToolStep<'_> {
+    /// Gates one tool call, runs it if admitted, and records what happened.
+    ///
+    /// Returns the outcome the round loop feeds back to the model and the
+    /// record it keeps for the caller. Every path through this function
+    /// produces both — a refused call and a failed call are as reportable as
+    /// a successful one, and an audit trail with holes in it is not evidence
+    /// of anything.
+    async fn run(
+        &self,
+        tools: &mut [ToolSpec],
+        counts: &mut crate::policy::TurnCounts,
+        tool_call: &ToolCall,
+    ) -> (ToolOutcome, ExecutedToolCall) {
+        let started = std::time::Instant::now();
+
+        // The gate comes first, ahead of the span and the lifecycle
+        // broadcast: a refused call never ran, and announcing it as started
+        // would put a tool in the observer's status line that no process ever
+        // executed.
+        let gate = self.decide(tool_call, counts).await;
+
+        let (arguments, decided_by) = match gate {
+            crate::policy::GateOutcome::Deny { reason, decided_by } => {
+                return self.refuse(tool_call, &reason, decided_by, started).await;
+            }
+            crate::policy::GateOutcome::Allow {
+                arguments,
+                decided_by,
+            } => (arguments, decided_by),
+        };
+
+        // Recorded only once the call is admitted, so a refusal does not
+        // consume the very budget it was refused against.
+        counts.record(&tool_call.name);
+
+        self.execute(tools, tool_call, arguments, decided_by, started)
+            .await
+    }
+
+    /// Applies the policy, or admits everything when there is none.
+    async fn decide(
+        &self,
+        tool_call: &ToolCall,
+        counts: &crate::policy::TurnCounts,
+    ) -> crate::policy::GateOutcome {
+        let Some(policy) = self.policy else {
+            return crate::policy::GateOutcome::Allow {
+                arguments: tool_call.arguments.clone(),
+                decided_by: crate::policy::Decider::NoPolicy,
+            };
+        };
+
+        policy
+            .decide(
+                crate::policy::ToolInvocation {
+                    tool_name: tool_call.name.clone(),
+                    arguments: tool_call.arguments.clone(),
+                    correlation_id: self.correlation_id.clone(),
+                    turn_id: self.turn_id.clone(),
+                },
+                counts,
+            )
+            .await
+    }
+
+    /// Handles a call the gate refused.
+    async fn refuse(
+        &self,
+        tool_call: &ToolCall,
+        reason: &crate::policy::DenialReason,
+        decided_by: crate::policy::Decider,
+        started: std::time::Instant,
+    ) -> (ToolOutcome, ExecutedToolCall) {
+        tracing::info!(
+            tool = %tool_call.name,
+            decided_by = %decided_by,
+            %reason,
+            "tool call refused by policy",
+        );
+
+        // Observers still hear about it. A refusal is something an operator
+        // watching a chat session needs to see, and `success: false` is
+        // exactly what the REPL already renders as a failed call.
+        let summary = summarize_error(&reason.to_string(), 200);
+        self.provider_handle
+            .broadcast(crate::messages::LLMStreamToolResult {
+                correlation_id: self.correlation_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                success: false,
+                summary,
+            })
+            .await;
+
+        self.record(
+            tool_call,
+            &tool_call.arguments,
+            crate::audit::AuditOutcome::Denied {
+                reason: reason.to_string(),
+            },
+            crate::audit::AuditDecision::refused(decided_by),
+            started,
+        )
+        .await;
+
+        // `ExecutedToolCall` has no refusal variant and public fields, so
+        // adding one would break every caller that builds it by literal. The
+        // caller-facing record says the call did not happen and why; the
+        // structured decision lives in the audit entry, which is the artifact
+        // that has to be precise about it.
+        let executed = ExecutedToolCall::error(
+            &tool_call.id,
+            &tool_call.name,
+            tool_call.arguments.clone(),
+            format!("denied by policy: {reason}"),
+        );
+
+        (
+            ToolOutcome::Refused(crate::policy::denial_feedback(reason)),
+            executed,
+        )
+    }
+
+    /// Runs a call the gate admitted, with the arguments the gate settled on.
+    async fn execute(
+        &self,
+        tools: &mut [ToolSpec],
+        tool_call: &ToolCall,
+        arguments: serde_json::Value,
+        decided_by: crate::policy::Decider,
+        started: std::time::Instant,
+    ) -> (ToolOutcome, ExecutedToolCall) {
+        // Child of the turn, not of the round: the tool runs after its round
+        // has closed, and nesting it under a finished span would misreport
+        // when it ran.
+        let tool_span = self.turn.tool(&tool_call.name);
+
+        // Bracketed for the same reason the turn is: a tool is where a turn
+        // spends most of its wall-clock, so "what is this process doing right
+        // now" is usually answered by the name of a running tool.
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolStarted {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+            })
+            .await;
+
+        // Kept only when there is a trail to write it to: the entry must
+        // describe the call that actually ran, and a hook may have rewritten
+        // it into something the model never proposed.
+        let recorded_arguments = self.audit.map(|_| arguments.clone());
+
+        let result = execute_tool_with_callback(tools, tool_call, arguments).await;
+
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolFinished {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+            })
+            .await;
+
+        let tool_outcome = if result.is_ok() {
+            crate::telemetry::metrics::OUTCOME_OK
+        } else {
+            crate::telemetry::metrics::OUTCOME_ERROR
+        };
+        crate::telemetry::metrics::record_tool_duration(
+            &tool_call.name,
+            tool_outcome,
+            started.elapsed().as_secs_f64(),
+        );
+        // Name and outcome only. The arguments and the result are user data
+        // of unbounded size and are never recorded — see
+        // `crate::telemetry::spans`.
+        tool_span.finish(tool_outcome);
+
+        // Broadcast a compact result event so observers (the CLI chat REPL)
+        // can render success/failure inline alongside the preceding tool-call
+        // line.
+        let (success, summary) = match &result {
+            Ok(value) => (true, summarize_tool_value(value, 200)),
+            Err(e) => (false, summarize_error(&e.to_string(), 200)),
+        };
+        self.provider_handle
+            .broadcast(crate::messages::LLMStreamToolResult {
+                correlation_id: self.correlation_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                success,
+                summary: summary.clone(),
+            })
+            .await;
+
+        let audit_outcome = match (&result, self.audit) {
+            // Summarized from a redacted copy of the result, not the raw one.
+            // A tool that echoes part of its input back — and plenty do —
+            // would otherwise write into the file the very secret that was
+            // stripped out of the arguments one field earlier.
+            (Ok(value), Some((_, config))) => crate::audit::AuditOutcome::Success {
+                summary: summarize_tool_value(&config.redactor().redact(value), 200),
+            },
+            (Ok(_), None) => crate::audit::AuditOutcome::Success { summary },
+            // An error is prose, not structured data, so key-based redaction
+            // has nothing to match on. It is bounded, and it is the tool's own
+            // words about its own failure.
+            (Err(_), _) => crate::audit::AuditOutcome::Error { message: summary },
+        };
+        self.record(
+            tool_call,
+            recorded_arguments.as_ref().unwrap_or(&tool_call.arguments),
+            audit_outcome,
+            crate::audit::AuditDecision::approved(decided_by),
+            started,
+        )
+        .await;
+
+        let executed = match &result {
+            Ok(value) => ExecutedToolCall::success(
+                &tool_call.id,
+                &tool_call.name,
+                tool_call.arguments.clone(),
+                value.clone(),
+            ),
+            Err(e) => ExecutedToolCall::error(
+                &tool_call.id,
+                &tool_call.name,
+                tool_call.arguments.clone(),
+                e.to_string(),
+            ),
+        };
+
+        (ToolOutcome::Ran(result), executed)
+    }
+
+    /// Appends one entry to the trail, if a trail is configured.
+    ///
+    /// Fire-and-forget by design: the entry is `send`, not `ask`, so the turn
+    /// is never blocked waiting on a disk. Ordering still holds — the audit
+    /// actor's mailbox is FIFO and its handler is sequential — which is what
+    /// the hash chain needs and all it needs.
+    async fn record(
+        &self,
+        tool_call: &ToolCall,
+        arguments: &serde_json::Value,
+        outcome: crate::audit::AuditOutcome,
+        decision: crate::audit::AuditDecision,
+        started: std::time::Instant,
+    ) {
+        let Some((handle, config)) = self.audit else {
+            return;
+        };
+
+        let record = crate::audit::InvocationRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            correlation_id: self.correlation_id.clone(),
+            conversation_id: self.conversation_id.cloned(),
+            turn_id: self.turn_id.clone(),
+            tool_name: tool_call.name.clone(),
+            // Redacted here, at the boundary, so a secret never reaches the
+            // actor's mailbox — let alone its file.
+            arguments: config.redactor().redact(arguments),
+            outcome,
+            decision,
+            duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+        };
+
+        handle
+            .send(crate::audit::RecordInvocation::new(record))
+            .await;
+    }
+}
+
 /// Executes a single tool call and invokes the result callback if present.
+///
+/// `arguments` is passed separately rather than read off `tool_call` because
+/// an approval hook may rewrite them — the call the model asked for and the
+/// call that runs are not always the same, and the difference is exactly what
+/// the gate exists to express.
 async fn execute_tool_with_callback(
     tools: &mut [ToolSpec],
     tool_call: &ToolCall,
+    arguments: serde_json::Value,
 ) -> Result<serde_json::Value, ToolError> {
-    // Find the tool by name
-    for spec in tools.iter_mut() {
-        if spec.definition.name == tool_call.name {
-            let result = spec.executor.call(tool_call.arguments.clone()).await;
+    let Some(spec) = tools
+        .iter_mut()
+        .find(|spec| spec.definition.name == tool_call.name)
+    else {
+        return Err(ToolError::not_found(&tool_call.name));
+    };
 
-            // Invoke the result callback if present
-            if let Some(ref mut callback) = spec.on_result {
-                match &result {
-                    Ok(value) => callback(Ok(value)),
-                    Err(e) => {
-                        let error_str = e.to_string();
-                        callback(Err(&error_str));
-                    }
-                }
+    let result = spec.executor.call(arguments).await;
+
+    // Invoke the result callback if present
+    if let Some(ref mut callback) = spec.on_result {
+        match &result {
+            Ok(value) => callback(Ok(value)),
+            Err(e) => {
+                let error_str = e.to_string();
+                callback(Err(&error_str));
             }
-
-            return result;
         }
     }
 
-    Err(ToolError::not_found(&tool_call.name))
+    result
 }
 
 /// Internal actor for collecting stream tokens.

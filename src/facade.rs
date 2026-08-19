@@ -209,6 +209,16 @@ pub(crate) struct ActonAIInner {
     /// `ipc` feature in does not create a socket; only `[introspection]` or
     /// [`ActonAIBuilder::introspection`] does.
     pub(crate) introspection: Option<IntrospectionRuntime>,
+    /// The rules applied to every tool call, when a policy was configured.
+    ///
+    /// `None` is what lets the prompt loop skip the gate entirely rather than
+    /// consult an empty policy on every call — the same shape `budget` uses.
+    pub(crate) tool_policy: Option<crate::policy::ToolPolicy>,
+    /// Handle to the audit log, when a trail was configured.
+    pub(crate) audit: Option<ActorHandle>,
+    /// Redaction and path settings for the trail, kept beside the handle so
+    /// the loop can redact without asking the actor anything.
+    pub(crate) audit_config: Option<crate::audit::AuditConfig>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
 }
@@ -511,6 +521,62 @@ impl ActonAI {
             .budget
             .as_ref()
             .and(self.inner.accountant.as_ref())
+    }
+
+    /// The tool-approval policy in force, or `None` when none was configured.
+    ///
+    /// `None` is what keeps an unconfigured runtime's tool path exactly as it
+    /// was: the loop never builds an invocation, never awaits a hook, and
+    /// never allocates.
+    pub(crate) fn tool_policy(&self) -> Option<&crate::policy::ToolPolicy> {
+        self.inner.tool_policy.as_ref()
+    }
+
+    /// The audit log and its settings, or `None` when no trail is configured.
+    pub(crate) fn audit(&self) -> Option<(&ActorHandle, &crate::audit::AuditConfig)> {
+        self.inner
+            .audit
+            .as_ref()
+            .zip(self.inner.audit_config.as_ref())
+    }
+
+    /// Whether tool invocations are being recorded.
+    #[must_use]
+    pub fn is_audited(&self) -> bool {
+        self.inner.audit.is_some()
+    }
+
+    /// Where the audit trail's hash chain currently ends.
+    ///
+    /// Doubles as a barrier: mailboxes are FIFO, so a reply proves every
+    /// invocation recorded before this call has already been written. That is
+    /// how an audited flow is awaited without sleeping.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when no audit trail is configured — an
+    /// empty chain would read as "nothing happened" rather than "nothing was
+    /// being recorded" — or a provider error if the audit actor cannot be
+    /// reached.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let head = ai.audit_head().await?;
+    /// println!("{} entries, head {}", head.entries, head.hash);
+    /// ```
+    pub async fn audit_head(&self) -> Result<crate::audit::ChainHead, ActonAIError> {
+        let Some(audit) = self.inner.audit.as_ref() else {
+            return Err(ActonAIError::configuration(
+                "audit",
+                "no audit trail is configured, so nothing was recorded; enable it with \
+                 ActonAIBuilder::audit(..) or an `[audit]` section in your config file",
+            ));
+        };
+
+        audit.ask(crate::audit::GetChainHead).await.map_err(|e| {
+            ActonAIError::provider_error(format!("could not reach the audit log: {e}"))
+        })
     }
 
     /// Returns a snapshot of the tokens — and, where pricing is configured,
@@ -993,6 +1059,24 @@ pub struct ActonAIBuilder {
     /// Unconditional: a build without the `ipc` feature still has to notice
     /// this section at launch and refuse, rather than ignore it.
     introspection_file: Option<crate::config::IntrospectionFileConfig>,
+    /// A policy set programmatically with [`tool_policy`](Self::tool_policy).
+    ///
+    /// Present, this replaces `[tool_policy]` from the config file
+    /// **wholesale** — the rule budgets already follow, and for the same
+    /// reason: a half-merged policy is a rule nobody wrote.
+    tool_policy: Option<crate::policy::ToolPolicy>,
+    /// The `[tool_policy]` section, used only when the builder sets no policy
+    /// of its own. Resolved at launch rather than in
+    /// [`apply_config`](Self::apply_config), so `.tool_policy(..)` wins
+    /// whether it is called before or after `.from_config()`.
+    tool_policy_file: Option<crate::config::ToolPolicyFileConfig>,
+    /// The approval hook, which has no TOML form and so is always the
+    /// builder's. Attached to whichever policy resolves.
+    tool_approval_hook: Option<Arc<dyn crate::policy::ApprovalHookFn>>,
+    /// Audit settings set programmatically with [`audit`](Self::audit).
+    audit: Option<crate::audit::AuditConfig>,
+    /// The `[audit]` section, used only when the builder sets none.
+    audit_file: Option<crate::config::AuditFileConfig>,
     /// Whether `SIGTERM` should start a drain.
     drain_on_sigterm: bool,
 }
@@ -1429,6 +1513,107 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Installs the rules applied to every tool call before it runs.
+    ///
+    /// Covers built-ins, `#[tool]` functions and MCP tools uniformly, because
+    /// the gate sits at the one point the prompt loop dispatches a call.
+    /// Replaces any `[tool_policy]` section wholesale, whether this is called
+    /// before or after `from_config()`.
+    ///
+    /// A refused call is not an error: the tool does not run, the reason goes
+    /// back to the model as that call's result, and the turn continues.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::prelude::*;
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .tool_policy(
+    ///         ToolPolicy::new()
+    ///             .allow(["read_file", "mcp__fs__*"])
+    ///             .deny(["bash"])
+    ///             .cap_per_turn("mcp__fs__*", 5),
+    ///     )
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn tool_policy(mut self, policy: crate::policy::ToolPolicy) -> Self {
+        self.tool_policy = Some(policy);
+        self
+    }
+
+    /// Runs `hook` before every tool call the rules already admitted.
+    ///
+    /// This is the human-in-the-loop seam: the hook may approve, approve a
+    /// rewritten set of arguments, or refuse with a reason. It is awaited on
+    /// the prompt loop's own task, so a hook that waits for a person holds the
+    /// turn open — which is the point.
+    ///
+    /// A hook cannot be written in TOML, so this applies to whichever policy
+    /// resolves, whether that came from the builder or a config file. Setting
+    /// a hook with no other rules is a complete policy on its own.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .on_tool_approval(|invocation| async move {
+    ///         if invocation.tool_name == "bash" {
+    ///             ApprovalDecision::deny("shell access needs a human")
+    ///         } else {
+    ///             ApprovalDecision::Approve
+    ///         }
+    ///     })
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn on_tool_approval<H>(mut self, hook: H) -> Self
+    where
+        H: crate::policy::ApprovalHookFn + 'static,
+    {
+        self.tool_approval_hook = Some(Arc::new(hook));
+        self
+    }
+
+    /// Records every tool invocation to a tamper-evident, hash-chained trail.
+    ///
+    /// Replaces any `[audit]` section wholesale. Off unless one of the two is
+    /// present: no trail is written and no actor is spawned.
+    ///
+    /// Every invocation produces an entry, including refused and failed ones —
+    /// a trail that recorded only successes would answer the wrong question.
+    /// Arguments are redacted before they are written.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .audit(AuditConfig::new("/var/log/acton-ai/audit.jsonl"))
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn audit(mut self, config: crate::audit::AuditConfig) -> Self {
+        self.audit = Some(config);
+        self
+    }
+
+    /// Records every tool invocation to a trail at `path`, with the default
+    /// redaction patterns.
+    ///
+    /// A one-liner for the common case; [`audit`](Self::audit) takes the full
+    /// settings.
+    #[must_use]
+    pub fn audit_to(self, path: impl Into<std::path::PathBuf>) -> Self {
+        self.audit(crate::audit::AuditConfig::new(path))
+    }
+
     /// Listens for control commands on a socket at `path`.
     ///
     /// As [`introspection`](Self::introspection), but at an address chosen by
@@ -1625,6 +1810,17 @@ impl ActonAIBuilder {
         // without the `ipc` feature notices the section at launch and says so.
         if let Some(introspection) = config.introspection {
             self.introspection_file = Some(introspection);
+        }
+
+        // `[tool_policy]` and `[audit]` follow the same rule: stashed, not
+        // resolved. Resolution happens at launch so `.tool_policy(..)` wins
+        // regardless of whether it was called before or after `from_config`.
+        if let Some(tool_policy) = config.tool_policy {
+            self.tool_policy_file = Some(tool_policy);
+        }
+
+        if let Some(audit) = config.audit {
+            self.audit_file = Some(audit);
         }
 
         // Stash `[context]` settings — resolved at launch after the default
@@ -2107,6 +2303,21 @@ impl ActonAIBuilder {
         // process an operator believes they can talk to.
         let introspection_config = self.resolve_introspection()?;
 
+        // The tool policy and the audit trail are settled here for the same
+        // reason: both are refusals waiting to happen, and a rule that turns
+        // out to be malformed on the first tool call is a rule that was not
+        // enforcing anything in the meantime. `resolve_audit` also creates the
+        // trail's directory, so an unwritable path fails the launch rather
+        // than silently dropping every entry.
+        let tool_policy = self.resolve_tool_policy()?;
+        let audit_config = self.resolve_audit()?;
+
+        // Idempotent, and here for embedders who never run this crate's
+        // `main`: a FIPS build must have its provider installed before the
+        // first provider actor can reach an API, and this is the last point
+        // that is still true.
+        crate::fips::install_crypto_provider()?;
+
         let app_name = self
             .app_name
             .take()
@@ -2253,6 +2464,14 @@ impl ActonAIBuilder {
             None
         };
 
+        // The one writer of the trail. Spawned before any prompt can run, and
+        // only when a trail was configured: with no `[audit]` section and no
+        // `.audit(..)` call there is no actor and nothing is written.
+        let audit = match audit_config {
+            Some(ref config) => Some(crate::audit::AuditLog::spawn(&mut runtime, config).await?),
+            None => None,
+        };
+
         // Spawned after the accountant so the subscription is in place before
         // anything can broadcast. Only when a callback was actually
         // registered — an actor whose closure is `None` is pure overhead.
@@ -2337,6 +2556,9 @@ impl ActonAIBuilder {
                 telemetry,
                 admission,
                 introspection,
+                tool_policy,
+                audit,
+                audit_config,
                 is_shutdown: AtomicBool::new(false),
             }),
         })
@@ -2451,6 +2673,68 @@ impl ActonAIBuilder {
             .as_ref()
             .map(crate::config::BudgetFileConfig::to_budget)
             .transpose()
+    }
+
+    /// Resolves the effective tool policy: builder first, then
+    /// `[tool_policy]` TOML, then the approval hook folded into whichever
+    /// won.
+    ///
+    /// Wholesale, never field-by-field — the same precedence `budget` and
+    /// `telemetry` follow. The hook is the one exception, and deliberately
+    /// so: a callback cannot be written in TOML, so a config file that sets
+    /// rules and a builder that sets a hook are describing two halves of one
+    /// policy rather than competing for the same slot. A hook with no rules
+    /// at all is still a policy — every call goes to the callback.
+    fn resolve_tool_policy(&mut self) -> Result<Option<crate::policy::ToolPolicy>, ActonAIError> {
+        let rules = match self.tool_policy.take() {
+            Some(policy) => Some(policy),
+            None => self
+                .tool_policy_file
+                .as_ref()
+                .map(crate::config::ToolPolicyFileConfig::to_tool_policy)
+                .transpose()?,
+        };
+
+        let hook = self.tool_approval_hook.take();
+
+        match (rules, hook) {
+            (Some(mut policy), Some(hook)) => {
+                policy.set_hook(hook);
+                Ok(Some(policy))
+            }
+            (Some(policy), None) => Ok(Some(policy)),
+            (None, Some(hook)) => {
+                let mut policy = crate::policy::ToolPolicy::new();
+                policy.set_hook(hook);
+                Ok(Some(policy))
+            }
+            (None, None) => Ok(None),
+        }
+    }
+
+    /// Resolves the effective audit settings: builder first, then `[audit]`
+    /// TOML.
+    ///
+    /// The parent directory is created here rather than on first append, so a
+    /// path nobody can write fails the launch instead of dropping entries
+    /// into the void for the rest of the process's life.
+    fn resolve_audit(&mut self) -> Result<Option<crate::audit::AuditConfig>, ActonAIError> {
+        let resolved = match self.audit.take() {
+            Some(config) => Some(config),
+            None => match self.audit_file.as_ref() {
+                // `enabled = false` is a deployment switching the trail off
+                // without deleting the settings it will want back.
+                Some(file) if !file.is_enabled() => None,
+                Some(file) => Some(file.to_audit()?),
+                None => None,
+            },
+        };
+
+        if let Some(ref config) = resolved {
+            config.ensure_parent_dir()?;
+        }
+
+        Ok(resolved)
     }
 
     /// Resolves the default provider name from configuration.

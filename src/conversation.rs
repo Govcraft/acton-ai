@@ -37,6 +37,7 @@ use crate::facade::ActonAI;
 use crate::messages::{Message, ToolDefinition};
 use crate::prompt::{build_stream_collector, StreamCollectorSession};
 use crate::stream::CollectedResponse;
+use crate::types::ConversationId;
 use acton_reactive::prelude::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -307,6 +308,8 @@ struct StdoutTokenPrinter;
 /// function signature clean.
 struct HandlerState {
     runtime: ActonAI,
+    /// Identifies this conversation on every audit entry its turns produce.
+    conversation_id: ConversationId,
     self_handle: ActorHandle,
     history_tx: Arc<watch::Sender<Vec<Message>>>,
     history_len: Arc<AtomicUsize>,
@@ -327,6 +330,7 @@ struct HandlerState {
 fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state: HandlerState) {
     let HandlerState {
         runtime,
+        conversation_id,
         self_handle,
         history_tx,
         history_len,
@@ -340,6 +344,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
     // ----- ConvSend: push user msg, run LLM call, await it -----
     {
         let runtime = runtime.clone();
+        let conversation_id = conversation_id.clone();
         let self_handle = self_handle.clone();
         let history_tx = history_tx.clone();
         let history_len = history_len.clone();
@@ -364,6 +369,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
             let history = fit_history_for_request(&context_window, history);
             let system_prompt = system_prompt_rx.borrow().clone();
             let runtime = runtime.clone();
+            let conversation_id = conversation_id.clone();
             let exit_requested = exit_requested.clone();
             let exit_tool_enabled_val = exit_tool_enabled.load(Ordering::SeqCst);
             let result_tx = msg.result_tx;
@@ -378,7 +384,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
             Reply::pending(async move {
                 let llm_result = tokio::spawn(async move {
                     // Build prompt with full history
-                    let mut builder = runtime.continue_with(history);
+                    let mut builder = runtime
+                        .continue_with(history)
+                        .conversation_id(conversation_id);
 
                     if let Some(ref system) = system_prompt {
                         builder = builder.system(system);
@@ -524,6 +532,8 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
 pub struct Conversation {
     /// Handle to the ConversationActor.
     handle: ActorHandle,
+    /// Identifies this conversation in the audit trail.
+    conversation_id: ConversationId,
     /// The ActonAI runtime (cheaply cloned via Arc).
     runtime: ActonAI,
     /// Exit flag — set when the exit tool is called.
@@ -557,6 +567,7 @@ impl Clone for Conversation {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle.clone(),
+            conversation_id: self.conversation_id.clone(),
             runtime: self.runtime.clone(),
             exit_requested: self.exit_requested.clone(),
             exit_tool_enabled: self.exit_tool_enabled.clone(),
@@ -569,6 +580,16 @@ impl Clone for Conversation {
 }
 
 impl Conversation {
+    /// This conversation's identity.
+    ///
+    /// The same ID appears on every audit entry the conversation's turns
+    /// produce, which is how a reviewer groups the tool calls of one exchange
+    /// out of a shared trail.
+    #[must_use]
+    pub fn id(&self) -> &ConversationId {
+        &self.conversation_id
+    }
+
     /// Sends a message and receives a response, automatically managing history.
     ///
     /// This is the primary method for interacting with a conversation. It:
@@ -1186,6 +1207,11 @@ impl ConversationBuilder {
         // accumulates dead subscribers across turns.
         let stream_session = build_stream_collector(&self.runtime).await;
 
+        // Minted here rather than by the audit trail, so every turn this
+        // conversation runs carries the same identity even across a restart
+        // of the trail itself.
+        let conversation_id = ConversationId::new();
+
         // Create the actor
         let mut actor_runtime = self.runtime.runtime().clone();
         let mut actor_builder = actor_runtime.new_actor::<ConversationActor>();
@@ -1200,6 +1226,7 @@ impl ConversationBuilder {
             &mut actor_builder,
             HandlerState {
                 runtime: self.runtime.clone(),
+                conversation_id: conversation_id.clone(),
                 self_handle: actor_handle.clone(),
                 history_tx: Arc::new(history_tx),
                 history_len: history_len.clone(),
@@ -1217,6 +1244,7 @@ impl ConversationBuilder {
 
         Conversation {
             handle: actor_handle,
+            conversation_id,
             runtime: self.runtime,
             exit_requested,
             exit_tool_enabled,

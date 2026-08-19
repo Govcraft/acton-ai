@@ -19,6 +19,15 @@ fn main() {
         acton_ai::tools::sandbox::process::runner::main();
     }
 
+    // Before clap, before the tokio runtime, before anything that could open a
+    // socket: rustls honours only the first crypto provider installed in a
+    // process, so a FIPS build has exactly one chance to install the right
+    // one and this is it.
+    if let Err(error) = acton_ai::fips::install_crypto_provider() {
+        eprintln!("error: {error}");
+        std::process::exit(acton_ai::cli::error::exit_code::RUNTIME_ERROR);
+    }
+
     cli_main();
 }
 

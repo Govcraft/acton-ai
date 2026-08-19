@@ -1,6 +1,6 @@
 [package]
 name = "acton-ai"
-version = "0.31.0"
+version = "0.32.0"
 edition = "2021"
 description = "An agentic AI framework where each agent is an actor"
 license = "MIT"
@@ -26,7 +26,7 @@ default-members = [".", "macros"]
 resolver = "2"
 
 [features]
-default = ["sandbox-hardening", "derive", "otel", "ipc"]
+default = ["sandbox-hardening", "derive", "otel", "ipc", "tls-ring"]
 # Enables Linux-specific OS hardening (landlock + seccomp) for the process
 # sandbox child. A no-op on non-Linux platforms.
 sandbox-hardening = ["dep:landlock", "dep:seccompiler", "dep:libc"]
@@ -55,6 +55,32 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # compiled: it is ordinary in-process state, not IPC, and an embedder that
 # builds without `ipc` still gets it.
 ipc = ["acton-reactive/ipc"]
+# Selects the TLS stack. Exactly one of `tls-ring` and `fips` should be on:
+# both compile, but linking two crypto libraries into a build that exists to
+# claim it uses only one defeats the point of claiming it.
+#
+# `tls-ring` is the ordinary stack — rustls over *ring*, webpki roots — and is
+# part of the default set, so a normal build is byte-for-byte what it always
+# was.
+tls-ring = ["reqwest/rustls-tls"]
+# Routes every TLS connection through aws-lc-rs in FIPS mode.
+#
+# Off by default and deliberately not in CI: aws-lc-fips-sys builds the AWS-LC
+# FIPS module from source and needs CMake and Go on the build host. Adding that
+# to the default set would break `cargo install acton-ai` for everybody in
+# exchange for a property almost nobody needs.
+#
+# Build it on its own, without the ring stack:
+#
+#     cargo build --release --no-default-features \
+#         --features "fips,sandbox-hardening,derive,otel,ipc"
+#
+# `src/fips.rs` installs the FIPS provider as the process-wide rustls default
+# before anything opens a connection, and reqwest's `-no-provider` variant
+# picks it up rather than reaching for ring. Release builds only: a debug
+# build fails AWS-LC's integrity self-test, which hashes the loaded module and
+# is defeated by the relocations a debug build carries.
+fips = ["dep:rustls", "reqwest/rustls-tls-webpki-roots-no-provider"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
@@ -70,9 +96,6 @@ mti = "1.1"
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-
-# HTTP client for LLM API calls
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking", "rustls-tls"] }
 
 # Async utilities
 futures = "0.3"
@@ -109,6 +132,9 @@ acton-ai-macros = { version = "0.31.0", path = "macros", optional = true }
 opentelemetry = { version = "0.32", optional = true }
 opentelemetry_sdk = { version = "0.32", optional = true }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "internal-logs"], optional = true }
+blake3 = "1.8.6"
+rustls = { version = "0.23.43", default-features = false, features = ["fips"], optional = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking"] }
 
 [dev-dependencies]
 anyhow = "1.0.100"

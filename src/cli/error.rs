@@ -13,6 +13,12 @@ pub mod exit_code {
     /// Runtime error (provider down, session not found, job failed).
     pub const RUNTIME_ERROR: i32 = 1;
     // Note: exit code 2 is used by clap for usage errors automatically.
+    /// The audit trail's hash chain does not verify.
+    ///
+    /// Distinct from a plain runtime error so a monitor can tell "the check
+    /// could not run" from "the check ran and the evidence has been altered".
+    /// The second one is an incident.
+    pub const AUDIT_CHAIN_BROKEN: i32 = 3;
 }
 
 /// CLI error with an associated exit code.
@@ -57,13 +63,23 @@ pub enum CliErrorKind {
     Framework(ActonAIError),
     /// No input provided (neither --message nor stdin).
     NoInput,
+    /// The audit trail's hash chain is broken at a specific entry.
+    AuditChainBroken {
+        /// The trail that was checked.
+        path: std::path::PathBuf,
+        /// The first break found, walking from the genesis entry forward.
+        break_found: crate::audit::ChainBreak,
+    },
 }
 
 impl CliError {
     /// Returns the exit code for this error.
     #[must_use]
     pub fn exit_code(&self) -> i32 {
-        exit_code::RUNTIME_ERROR
+        match self.kind {
+            CliErrorKind::AuditChainBroken { .. } => exit_code::AUDIT_CHAIN_BROKEN,
+            _ => exit_code::RUNTIME_ERROR,
+        }
     }
 
     /// Creates a configuration error.
@@ -214,6 +230,13 @@ impl fmt::Display for CliError {
             CliErrorKind::Framework(err) => write!(f, "{err}"),
             CliErrorKind::NoInput => {
                 write!(f, "no input provided; use --message or pipe via stdin")
+            }
+            CliErrorKind::AuditChainBroken { path, break_found } => {
+                write!(
+                    f,
+                    "the audit trail at {} does not verify: {break_found}",
+                    path.display()
+                )
             }
         }
     }

@@ -55,6 +55,9 @@ pub enum Commands {
     /// Autonomous wake-up cycle — review and execute due heartbeat entries.
     Heartbeat(commands::heartbeat::HeartbeatArgs),
 
+    /// Inspect and verify the tamper-evident tool-invocation trail.
+    Audit(commands::audit::AuditArgs),
+
     /// Send a message or start an interactive chat session.
     #[command(
         long_about = "Send a single message, pipe input, or open an interactive \
@@ -143,6 +146,7 @@ pub async fn run(cli: Cli) -> i32 {
         Commands::Heartbeat(args) => {
             commands::heartbeat::execute(args, &output, config_path, provider).await
         }
+        Commands::Audit(args) => commands::audit::execute(args, &output, config_path),
         Commands::Chat(args) => commands::chat::execute(args, &output, config_path, provider).await,
         Commands::RunJob(args) => {
             commands::run_job::execute(args, &output, config_path, provider).await

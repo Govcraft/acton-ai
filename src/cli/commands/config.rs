@@ -319,6 +319,47 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
         }
     }
 
+    if let Some(policy) = &report.config.tool_policy {
+        output.write_line("")?;
+        output.write_line("Tool policy:")?;
+        match &policy.allow {
+            Some(allow) => {
+                output.write_line(&format!("  allow:            {}", allow.join(", ")))?;
+            }
+            // Said out loud, because "no allowlist" and "an empty allowlist"
+            // are opposite settings and the difference is invisible otherwise.
+            None => output.write_line("  allow:            (every tool)")?,
+        }
+        if !policy.deny.is_empty() {
+            output.write_line(&format!("  deny:             {}", policy.deny.join(", ")))?;
+        }
+        for (pattern, limit) in &policy.per_turn_caps {
+            output.write_line(&format!("  cap {pattern}: {limit} per turn"))?;
+        }
+    }
+
+    if let Some(audit) = &report.config.audit {
+        output.write_line("")?;
+        output.write_line("Audit:")?;
+        output.write_line(&format!("  enabled:          {}", audit.is_enabled()))?;
+        match &audit.path {
+            Some(path) => output.write_line(&format!("  path:             {}", path.display()))?,
+            None => output.write_line(&format!(
+                "  path:             (default: {})",
+                crate::audit::default_audit_path().display()
+            ))?,
+        }
+        // Patterns, not what they matched: these are key fragments an operator
+        // chose, and printing them is how you check the list is the one you
+        // meant. Nothing they matched is ever in this report.
+        let patterns = if audit.redact_patterns.is_empty() {
+            crate::audit::DEFAULT_REDACT_PATTERNS.join(", ")
+        } else {
+            audit.redact_patterns.join(", ")
+        };
+        output.write_line(&format!("  redact_patterns:  {patterns}"))?;
+    }
+
     if let Some(sb) = &report.config.sandbox {
         output.write_line("")?;
         output.write_line("Sandbox:")?;

@@ -103,3 +103,25 @@ tokens_per_minute = 1000000
 # # permission bits are the whole of the access control, so anything granting
 # # group or other access fails the launch rather than warning.
 # socket_mode = 0o600
+
+# ---------------------------------------------------------------------------
+# Tool-approval policy. Absent, every tool the model asks for simply runs.
+# Patterns are exact names or a single trailing `*`; precedence is deny, then
+# allow, then cap.
+# ---------------------------------------------------------------------------
+# [tool_policy]
+# allow = ["read_file", "glob", "grep", "mcp__docs__*"]
+# deny = ["bash"]
+#
+# [tool_policy.per_turn_caps]
+# read_file = 20
+
+# ---------------------------------------------------------------------------
+# Tamper-evident audit trail. Absent, nothing is written. Verify it with
+# `acton-ai audit verify`, which exits 3 if the hash chain does not hold.
+# `redact_patterns` replaces the built-in list rather than extending it.
+# ---------------------------------------------------------------------------
+# [audit]
+# enabled = true
+# path = "/var/log/acton-ai/audit.jsonl"
+# redact_patterns = ["password", "token", "api_key", "authorization"]

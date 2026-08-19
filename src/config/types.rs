@@ -140,6 +140,227 @@ pub struct ActonAIConfig {
     /// would otherwise debug the socket rather than the build.
     #[serde(default)]
     pub introspection: Option<IntrospectionFileConfig>,
+
+    /// Rules applied to every tool call before it runs.
+    ///
+    /// Corresponds to `[tool_policy]` in TOML. A
+    /// [`tool_policy`](crate::facade::ActonAIBuilder::tool_policy) call on the
+    /// builder replaces this section wholesale — there is no field-level
+    /// merging, because a half-merged policy is a rule nobody wrote.
+    ///
+    /// The approval hook has no TOML form: a callback cannot be written in a
+    /// config file. It is attached separately with
+    /// [`on_tool_approval`](crate::facade::ActonAIBuilder::on_tool_approval)
+    /// and applies to whichever policy resolves.
+    #[serde(default)]
+    pub tool_policy: Option<ToolPolicyFileConfig>,
+
+    /// The tamper-evident audit trail.
+    ///
+    /// Corresponds to `[audit]` in TOML. An
+    /// [`audit`](crate::facade::ActonAIBuilder::audit) call on the builder
+    /// replaces this section wholesale. Absent, nothing is recorded and no
+    /// actor is spawned.
+    #[serde(default)]
+    pub audit: Option<AuditFileConfig>,
+}
+
+/// Tool-approval rules loaded from `[tool_policy]` in TOML.
+///
+/// ```toml
+/// [tool_policy]
+/// allow = ["read_file", "mcp__fs__*"]   # omit to allow every tool
+/// deny  = ["bash"]                      # omit to deny nothing
+///
+/// [tool_policy.per_turn_caps]
+/// mcp__fs__write_file = 3
+/// ```
+///
+/// Patterns are exact names, or a trailing `*` acting as a prefix wildcard —
+/// enough to name a whole MCP server without inviting a config file to express
+/// something subtle enough to be misread. The denylist is checked first, so a
+/// tool named by both lists is refused.
+///
+/// The section's **presence** is what arms the gate. An empty section allows
+/// everything, which is also what no section at all does.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolPolicyFileConfig {
+    /// Tools admitted. Absent admits every tool; present admits only these.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow: Option<Vec<String>>,
+
+    /// Tools refused outright, whatever `allow` says.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
+
+    /// How many times a matching tool may be called in one turn.
+    ///
+    /// The cap resets per turn, not per round: a model that spreads five calls
+    /// across five rounds still hits a cap of three.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub per_turn_caps: BTreeMap<String, u32>,
+}
+
+impl ToolPolicyFileConfig {
+    /// Validates the section and builds the policy it describes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when a pattern is empty (which would
+    /// match nothing and is always a typo) or when a cap is zero (which is a
+    /// denylist entry written the wrong way round, and would otherwise refuse
+    /// every call while looking like a limit).
+    ///
+    /// ```rust
+    /// use acton_ai::config::ToolPolicyFileConfig;
+    ///
+    /// let section: ToolPolicyFileConfig =
+    ///     toml::from_str("deny = ['bash']").unwrap();
+    /// let policy = section.to_tool_policy().unwrap();
+    /// assert_eq!(policy.denylist(), ["bash".to_string()]);
+    ///
+    /// let bad: ToolPolicyFileConfig =
+    ///     toml::from_str("[per_turn_caps]\nbash = 0").unwrap();
+    /// assert!(bad.to_tool_policy().is_err());
+    /// ```
+    pub fn to_tool_policy(&self) -> Result<crate::policy::ToolPolicy, ActonAIError> {
+        for pattern in self.allow.iter().flatten().chain(self.deny.iter()) {
+            if pattern.trim().is_empty() {
+                return Err(ActonAIError::configuration(
+                    "tool_policy",
+                    "an empty tool pattern matches nothing; remove it, or use \"*\" to mean \
+                     every tool",
+                ));
+            }
+        }
+
+        let mut policy = crate::policy::ToolPolicy::new();
+
+        if let Some(allow) = self.allow.as_ref() {
+            policy = policy.allow(allow.iter().map(String::as_str));
+        }
+        if !self.deny.is_empty() {
+            policy = policy.deny(self.deny.iter().map(String::as_str));
+        }
+
+        for (pattern, limit) in &self.per_turn_caps {
+            if pattern.trim().is_empty() {
+                return Err(ActonAIError::configuration(
+                    "tool_policy.per_turn_caps",
+                    "an empty tool pattern matches nothing; remove it, or use \"*\" to mean \
+                     every tool",
+                ));
+            }
+            if *limit == 0 {
+                return Err(ActonAIError::configuration(
+                    "tool_policy.per_turn_caps",
+                    format!(
+                        "a cap of 0 for '{pattern}' would refuse every call; put the tool in \
+                         `deny` instead if that is what you meant"
+                    ),
+                ));
+            }
+            policy = policy.cap_per_turn(pattern.clone(), *limit);
+        }
+
+        Ok(policy)
+    }
+}
+
+/// Audit-trail settings loaded from `[audit]` in TOML.
+///
+/// ```toml
+/// [audit]
+/// enabled = true                              # optional, default true
+/// path = "/var/log/acton-ai/audit.jsonl"      # optional, defaults under the data dir
+/// redact_patterns = ["password", "ssn"]       # optional, replaces the defaults
+/// ```
+///
+/// The section's **presence** arms the trail; `enabled = false` is there so a
+/// deployment can turn recording off without losing the settings it will want
+/// back. With no section at all, no actor is spawned and nothing is written.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuditFileConfig {
+    /// Whether to record at all. Defaults to true — writing the section is a
+    /// request for a trail.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+
+    /// Where the JSONL trail is appended.
+    ///
+    /// Defaults to `$XDG_DATA_HOME/acton-ai/audit.jsonl`. The parent directory
+    /// is created at launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<PathBuf>,
+
+    /// Argument key fragments whose values are redacted before writing.
+    ///
+    /// Matched case-insensitively by substring. Setting this **replaces** the
+    /// built-in list rather than extending it, so a deployment that names its
+    /// own patterns gets exactly those — list the built-ins too if you still
+    /// want them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redact_patterns: Vec<String>,
+}
+
+impl AuditFileConfig {
+    /// Whether this section asks for a trail.
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.unwrap_or(true)
+    }
+
+    /// Validates the section and resolves defaults.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when `path` is a directory, or when a
+    /// redaction pattern is empty — an empty pattern is a substring of every
+    /// key and would redact the entire argument object, which looks like a
+    /// working trail while recording nothing.
+    ///
+    /// ```rust
+    /// use acton_ai::config::AuditFileConfig;
+    ///
+    /// let section: AuditFileConfig =
+    ///     toml::from_str("path = '/tmp/audit.jsonl'").unwrap();
+    /// let audit = section.to_audit().unwrap();
+    /// assert!(audit.path().ends_with("audit.jsonl"));
+    ///
+    /// let bad: AuditFileConfig = toml::from_str("redact_patterns = ['']").unwrap();
+    /// assert!(bad.to_audit().is_err());
+    /// ```
+    pub fn to_audit(&self) -> Result<crate::audit::AuditConfig, ActonAIError> {
+        let path = self
+            .path
+            .clone()
+            .unwrap_or_else(crate::audit::default_audit_path);
+
+        if path.is_dir() {
+            return Err(ActonAIError::configuration(
+                "audit.path",
+                format!(
+                    "{} is a directory; the audit trail is a single file",
+                    path.display()
+                ),
+            ));
+        }
+
+        let mut config = crate::audit::AuditConfig::new(path);
+
+        if !self.redact_patterns.is_empty() {
+            if self.redact_patterns.iter().any(|p| p.trim().is_empty()) {
+                return Err(ActonAIError::configuration(
+                    "audit.redact_patterns",
+                    "an empty redaction pattern matches every key and would redact whole \
+                     arguments; remove it",
+                ));
+            }
+            config = config.with_redactor(crate::audit::Redactor::new(&self.redact_patterns));
+        }
+
+        Ok(config)
+    }
 }
 
 /// Live introspection settings loaded from `[introspection]` in TOML.
@@ -1854,6 +2075,8 @@ max_execution_ms = 60000
             mcp_servers: HashMap::new(),
             budget: None,
             introspection: None,
+            tool_policy: None,
+            audit: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();

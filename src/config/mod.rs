@@ -81,9 +81,9 @@ pub use file::{from_path, from_str, load, search_paths, xdg_config_dir};
 
 // Re-export types
 pub use types::{
-    parse_truncation_strategy, ActonAIConfig, ActonAIDefaults, BudgetFileConfig,
+    parse_truncation_strategy, ActonAIConfig, ActonAIDefaults, AuditFileConfig, BudgetFileConfig,
     CircuitBreakerFileConfig, CliFileConfig, ContextFileConfig, IntrospectionFileConfig, JobConfig,
     McpServerConfig, NamedProviderConfig, PersistenceFileConfig, PricingFileConfig,
     RateLimitFileConfig, SandboxFileConfig, SandboxLimitsConfig, SkillsFileConfig,
-    TelemetryFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
+    TelemetryFileConfig, ToolPolicyFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
 };

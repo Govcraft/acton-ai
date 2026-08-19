@@ -41,6 +41,9 @@ Five lines to an interactive chat with file access and command execution.
 - **Spending budgets** — Hard process-wide and per-provider caps checked before every request, with warnings on the way up and a typed refusal at the ceiling
 - **OpenTelemetry export** — Traces spanning each prompt loop (turn → rounds → tools) plus token, latency, and reliability metrics, over OTLP to any collector
 - **Failover & circuit breaking** — Named provider chains tried in order, a per-provider circuit breaker with half-open recovery, and model degradation when a vendor throttles instead of dies
+- **Tool-approval policy** — Allowlists, denylists, and per-turn invocation caps over every tool the model can reach, plus an async approval hook for a human in the loop; a refusal is fed back to the model and the turn carries on
+- **Tamper-evident audit trail** — Every tool invocation appended to a BLAKE3 hash-chained JSONL log with secrets redacted, verified by `acton-ai audit verify`
+- **FIPS mode** — An optional `fips` build routes every TLS connection through the FIPS 140-3 validated AWS-LC module
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
 
@@ -506,6 +509,140 @@ listens unless configured. Pause, resume, and drain are *not* behind it —
 `--no-default-features` builds keep `ActonAI::pause()` and friends, since an
 embedder driving the library from its own control plane needs them just as
 much.
+
+### Tool-approval policy
+
+Every tool the model can reach — built-ins, `#[tool]` functions, MCP tools —
+passes one gate before it runs. Nothing is configured by default, and an
+unconfigured runtime behaves exactly as it always did.
+
+```rust
+use acton_ai::prelude::*;
+
+let ai = ActonAI::builder()
+    .anthropic_from_env()
+    .tool_policy(
+        ToolPolicy::new()
+            .allow(["read_file", "glob", "grep", "mcp__docs__*"])
+            .deny(["bash"])
+            .cap_per_turn("read_file", 20),
+    )
+    .on_tool_approval(|invocation| async move {
+        if invocation.tool_name == "write_file" {
+            ApprovalDecision::deny("writes need a change ticket")
+        } else {
+            ApprovalDecision::Approve
+        }
+    })
+    .launch()
+    .await?;
+```
+
+Patterns are exact names or a single trailing `*`, which is enough to name a
+whole MCP server (`mcp__docs__*`) without inviting something subtle enough to
+be misread. Precedence is denylist, then allowlist, then cap; the denylist
+wins over the allowlist because when a tool is named by both, refusing is the
+reading that cannot cause harm.
+
+The hook is consulted only for calls the rules already admitted, and it can
+approve, refuse with a reason, or rewrite the arguments
+(`ApprovalDecision::approve_with(..)`). It is `async`, so "ask a human" is a
+legitimate implementation.
+
+**A refusal is an outcome, not an error.** The tool does not run, the reason
+goes back to the model as that call's tool result, and the turn continues —
+the same shape the loop already uses for a schema-validation failure. Nothing
+aborts, and the model is told not to retry.
+
+The TOML twin, for the rules half:
+
+```toml
+[tool_policy]
+allow = ["read_file", "glob", "grep", "mcp__docs__*"]
+deny = ["bash"]
+
+[tool_policy.per_turn_caps]
+read_file = 20
+```
+
+A config file that sets rules and a builder that sets a hook are describing
+two halves of one policy, so they combine rather than compete. Two sets of
+*rules* do compete, and the builder wins.
+
+### Audit trail
+
+An append-only, hash-chained record of every tool invocation — allowed,
+refused, or failed:
+
+```toml
+[audit]
+path = "/var/log/acton-ai/audit.jsonl"
+redact_patterns = ["password", "token", "api_key", "authorization"]
+```
+
+or `.audit_to("/var/log/acton-ai/audit.jsonl")` on the builder. Off unless one
+of the two is present.
+
+Each line is one entry: timestamp, correlation / conversation / turn IDs, tool
+name, the arguments with secret-bearing keys redacted *before* they are
+written, a bounded result summary, who approved or refused it and under which
+rule, and how long it took. Every entry carries the BLAKE3 hash of the one
+before it, so editing an entry invalidates it, and re-sealing that entry
+invalidates its successor. The chain starts at a fixed genesis hash and is
+resumed, never restarted, when the process restarts.
+
+```bash
+acton-ai audit verify                                   # the configured trail
+acton-ai audit verify --file /var/log/acton-ai/audit.jsonl
+acton-ai audit verify --json                            # for a monitoring check
+```
+
+Exit code is `0` when the chain verifies and `3` when it does not, so a cron
+job can tell "the evidence has been altered" from "the check could not run".
+A break is reported at the first entry that does not add up, with the expected
+and found hashes.
+
+Redaction is by key, not by value, and matches case-insensitively anywhere in
+a key name; a matched key has its whole subtree replaced. Setting
+`redact_patterns` replaces the defaults rather than extending them, so the list
+in your config is the list in force.
+
+One actor owns the chain and is the only thing that writes the file, which is
+what makes the ordering guarantee real rather than hopeful. Recording is
+fire-and-forget: a turn is never blocked on a disk.
+
+### FIPS mode
+
+An optional, non-default `fips` feature routes every TLS connection through
+the FIPS 140-3 validated AWS-LC module instead of *ring*:
+
+```bash
+cargo build --release --no-default-features \
+    --features "fips,sandbox-hardening,derive,otel,ipc"
+```
+
+`acton_ai::fips::install_crypto_provider()` installs it as the process-wide
+rustls default before anything can open a connection; the CLI calls it at the
+top of `main`, and `launch()` calls it again idempotently for embedders with
+their own entry point. A build that claims FIPS refuses to start if a non-FIPS
+provider got there first.
+
+Two things to know before you reach for it. It needs **CMake and Go** on the
+build host, because aws-lc-fips-sys builds the module from source — which is
+why it is not in the default set and not gated in CI. And it must be a
+**release** build: AWS-LC's power-on integrity test hashes its own loaded text
+segment, and a debug build's relocations change that hash between runs, so the
+module aborts the process at startup. That is the FIPS module working as
+specified.
+
+One honest caveat: this covers the TLS the framework itself opens — LLM
+providers, streamable-HTTP MCP servers, OTLP export — all of which go through
+reqwest. libsql, used for persistence, carries its own pinned rustls and
+*ring* for remote-database connections; a deployment that needs the whole
+process free of non-validated cryptography should use a local database file,
+which is the default.
+
+`acton_ai::fips::is_fips_build()` reports which binary you have.
 
 ## Built-in Tools
 

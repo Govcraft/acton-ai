@@ -3,6 +3,52 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.32.0 - 2026-08-19
+
+### Added
+
+- **Tool-approval policy gate.** One choke point between "the model asked for
+  a tool" and "the tool ran", covering built-ins, `#[tool]` functions and MCP
+  tools uniformly. Rules — allowlist, denylist, per-turn invocation caps —
+  come from `ToolPolicy` or a `[tool_policy]` section; an async
+  `.on_tool_approval(..)` hook can approve, refuse with a reason, or rewrite
+  the arguments, which makes a human in the loop possible. Patterns are exact
+  names or a single trailing `*`, enough to name a whole MCP server. A refusal
+  is an outcome, not an error: the tool does not run, the reason goes back to
+  the model as that call's tool result, and the turn continues. Nothing is
+  configured by default and an unconfigured runtime behaves exactly as before.
+- **Tamper-evident audit trail.** Every tool invocation — allowed, refused, or
+  failed — is appended to a JSONL file as one BLAKE3 hash-chained entry
+  carrying the timestamp, correlation / conversation / turn IDs, tool name,
+  redacted arguments, a bounded result summary, the approval decision and who
+  made it, and the duration. One actor owns the chain and is the only writer.
+  Secrets are redacted by key before an entry ever leaves the prompt loop, and
+  the result summary is redacted too, so a tool that echoes its input cannot
+  launder a secret past the argument redaction. A restarted process resumes
+  the chain it already has, and refuses to start on a file that does not
+  verify. Configured with `[audit]` or `.audit_to(..)`; off by default.
+- **`acton-ai audit verify`.** Walks the chain and reports the first broken
+  link, with `--file` and the global `--json`. Exit code 3 when the chain does
+  not hold, distinct from the generic runtime error, so a monitoring check can
+  tell "the evidence has been altered" from "the check could not run".
+- **`ConversationId` on the wire.** `Conversation::id()` names a conversation
+  and every audit entry its turns produce carries it, so the tool calls of one
+  exchange can be grouped out of a shared trail.
+- **`fips` cargo feature.** Routes every TLS connection the framework opens
+  through the FIPS 140-3 validated AWS-LC module instead of *ring*, installed
+  as the process-wide rustls default before anything can connect. Off by
+  default and not gated in CI: it builds AWS-LC from source and needs CMake
+  and Go, and it must be a release build because the module's power-on
+  integrity self-test does not survive a debug build's relocations.
+
+### Changed
+
+- TLS backend selection moved behind features. The ordinary *ring* stack is
+  now the `tls-ring` feature and is part of the default set, so a default
+  build is unchanged. **A `--no-default-features` build that relied on TLS
+  must now name `tls-ring` (or `fips`) explicitly**, where it previously got
+  the *ring* stack implicitly.
+
 ## 0.31.0 - 2026-08-16
 
 ### Fixed
