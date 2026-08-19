@@ -253,6 +253,17 @@ pub struct CollectedResponse {
     /// This is populated when tools were used and contains all tool calls
     /// that were executed during the conversation loop.
     pub tool_calls: Vec<ExecutedToolCall>,
+
+    /// The plan as it stood when the turn ended, when the model published one
+    /// via the `update_plan` built-in tool.
+    ///
+    /// Owned by the prompt round loop for the life of the turn and carried
+    /// across every round of the tool loop, so this is the *last* plan the
+    /// model recorded — each update replaces the previous one wholesale, and
+    /// an update the validator refused leaves the recorded plan untouched.
+    /// Live observers get the same plans as they land, via the
+    /// [`PlanUpdated`](crate::messages::PlanUpdated) broadcast.
+    pub plan: Option<crate::tools::plan::Plan>,
 }
 
 impl CollectedResponse {
@@ -265,6 +276,7 @@ impl CollectedResponse {
             token_count,
             usage: Usage::default(),
             tool_calls: Vec::new(),
+            plan: None,
         }
     }
 
@@ -272,6 +284,13 @@ impl CollectedResponse {
     #[must_use]
     pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = usage;
+        self
+    }
+
+    /// Attaches the turn's final plan to this response.
+    #[must_use]
+    pub fn with_plan(mut self, plan: Option<crate::tools::plan::Plan>) -> Self {
+        self.plan = plan;
         self
     }
 
@@ -289,6 +308,7 @@ impl CollectedResponse {
             token_count,
             usage: Usage::default(),
             tool_calls,
+            plan: None,
         }
     }
 
@@ -325,6 +345,7 @@ impl Default for CollectedResponse {
             token_count: 0,
             usage: Usage::default(),
             tool_calls: Vec::new(),
+            plan: None,
         }
     }
 }

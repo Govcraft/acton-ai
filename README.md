@@ -659,8 +659,22 @@ Available when you call `.with_builtins()`:
 | `bash` | Execute shell commands |
 | `calculate` | Evaluate mathematical expressions |
 | `web_fetch` | Fetch content from URLs |
+| `update_plan` | Record the plan for the current task and its progress |
 
 Select specific tools with `.with_builtin_tools(&["read_file", "glob", "bash"])`.
+
+`update_plan` is the odd one out: it runs no code and touches nothing. The
+model sends its whole plan — `{steps: [{title, status}], note?}`, two or more
+steps, at most one of them `in_progress` — the plan is validated, recorded as
+the turn's state, and broadcast as a `PlanUpdated` message. Single-step plans
+are refused with a corrective message, and the tool's description tells the
+model to skip planning for trivial tasks. The chat REPL renders each update as
+an inline checklist; the turn's final plan is on `CollectedResponse::plan`; and
+any actor can watch live:
+
+```rust
+builder.handle().subscribe::<PlanUpdated>().await;   // on the builder, before start()
+```
 
 ## MCP Servers
 

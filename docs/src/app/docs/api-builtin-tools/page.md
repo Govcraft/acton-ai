@@ -502,6 +502,83 @@ Fetches content from a URL. Supports GET and POST methods with custom headers.
 
 ---
 
+### update_plan
+
+Maintains the model's structured plan for the current task. The only built-in
+that runs no code: it validates what the model sent, records it as the turn's
+plan, echoes back the normalized version, and broadcasts it. The tool's
+description teaches the model to skip planning for trivial tasks, never send a
+single-step plan, and update the plan right after completing each step.
+
+**Parameters:**
+
+```json
+{
+  "type": "object",
+  "properties": {
+    "steps": {
+      "type": "array",
+      "description": "The complete ordered list of steps, resent in full on every call",
+      "minItems": 2,
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "What this step does, in a few words"
+          },
+          "status": {
+            "type": "string",
+            "enum": ["pending", "in_progress", "completed"]
+          }
+        },
+        "required": ["title", "status"]
+      }
+    },
+    "note": {
+      "type": "string",
+      "description": "Optional one-line note about the plan or why it changed"
+    }
+  },
+  "required": ["steps"]
+}
+```
+
+**Returns:** `{ status: "recorded", plan, completed, total }`
+
+**Behavior:**
+- The model sends the **whole** plan every time, not a diff.
+- A plan must have 2--32 steps; each step's title is trimmed, non-empty, at
+  most 200 characters, and distinct from every other step. A single-step plan
+  is refused with a corrective message: split the work, or skip planning.
+- At most one step may be `in_progress`. A step with no `status` is `pending`.
+- A `note` is optional, at most 1000 characters; blank counts as absent.
+- A plan that breaks any of those rules is refused, and the reason goes back to
+  the model as that call's tool result so it can correct itself. Nothing is
+  broadcast for a refused plan, and the plan already recorded stands.
+- The prompt round loop owns the turn's current plan: it carries across every
+  round of the tool loop, and the turn's final plan is returned on
+  `CollectedResponse::plan`.
+- Every accepted plan is broadcast on the broker as a `PlanUpdated` message
+  (defined in `acton_ai::messages`, alongside the other stream and lifecycle
+  events) carrying the turn ID, the round's correlation ID, the tool call ID,
+  and the validated `Plan`. The `acton-ai chat` REPL renders each update as an
+  inline checklist. Subscribe an actor to render progress yourself:
+
+```rust
+// On the builder, before start() -- a later subscription is ignored.
+builder.handle().subscribe::<PlanUpdated>().await;
+
+builder.mutate_on::<PlanUpdated>(|actor, envelope| {
+    let plan = &envelope.message().plan;
+    println!("{}/{} steps done", plan.completed_count(), plan.step_count());
+    Reply::ready()
+});
+```
+
+---
+
 ## Agent skill tools
 
 These tools are auto-registered on every prompt when skills are loaded via [`ActonAIBuilder::with_skill_paths`](#) or a `[skills]` TOML section (or the `--skill-dir` CLI flag). If no skill paths are supplied, the tools are absent.
@@ -584,6 +661,7 @@ let skill_tools = spawn_skill_tool_actors(&mut runtime, registry).await;
 | `bash` | Yes | Execution | Execute shell commands |
 | `calculate` | No | Computation | Evaluate math expressions |
 | `web_fetch` | No | Web | Fetch content from URLs |
+| `update_plan` | No | Coordination | Record the task plan and its progress |
 | `list_skills` | No | Skills | List available agent skills |
 | `activate_skill` | No | Skills | Activate a skill for the agent |
 

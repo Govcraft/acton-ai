@@ -703,6 +703,39 @@ pub enum TurnLifecycle {
     },
 }
 
+/// A plan the model published, broadcast the moment it is recorded.
+///
+/// The `update_plan` built-in tool validates the plan; the prompt round loop
+/// — the single owner of a turn's current plan — records it and publishes
+/// this event. Published unconditionally, like [`UsageReport`] and
+/// [`TurnLifecycle`]: a broadcast nobody is subscribed to costs one send, and
+/// a UI that wants to draw the model's progress should not have to be wired
+/// in specially to get it. A plan the validator refused is never published —
+/// the refusal goes back to the model as that call's tool result instead.
+///
+/// The turn's *final* plan is also returned on
+/// [`CollectedResponse::plan`](crate::stream::CollectedResponse::plan), for
+/// callers who want the state rather than the stream.
+///
+/// Subscribe on an actor's **builder**, before `start()`:
+///
+/// ```rust,ignore
+/// builder.handle().subscribe::<PlanUpdated>().await;
+/// ```
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct PlanUpdated {
+    /// The turn whose model published this plan.
+    pub turn_id: TurnId,
+    /// The round that made the call.
+    pub correlation_id: CorrelationId,
+    /// The provider-assigned call ID, matching the [`ToolCall::id`] it came
+    /// from.
+    pub tool_call_id: String,
+    /// The plan as recorded, already validated.
+    pub plan: crate::tools::plan::Plan,
+}
+
 // =============================================================================
 // Tool Messages
 // =============================================================================

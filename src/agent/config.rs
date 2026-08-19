@@ -308,12 +308,18 @@ mod tests {
     fn with_all_builtins_adds_all_tools() {
         let config = AgentConfig::new("Test").with_all_builtins();
 
-        // Should have all 9 builtin tools
-        assert_eq!(config.tools.len(), 9);
-        assert!(config.tools.contains(&"read_file".to_string()));
-        assert!(config.tools.contains(&"bash".to_string()));
-        assert!(config.tools.contains(&"calculate".to_string()));
-        assert!(config.tools.contains(&"web_fetch".to_string()));
+        // Every name `BuiltinTools` knows about, and no invented ones: the
+        // count is derived rather than written down so adding a built-in
+        // cannot leave this test asserting a stale number.
+        let available = crate::tools::builtins::BuiltinTools::available();
+        assert_eq!(config.tools.len(), available.len());
+        for name in available {
+            assert!(
+                config.tools.contains(&name.to_string()),
+                "with_all_builtins must include {name}"
+            );
+        }
+        assert!(config.tools.contains(&"update_plan".to_string()));
     }
 
     #[test]

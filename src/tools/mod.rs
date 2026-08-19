@@ -82,6 +82,7 @@ pub mod builtins;
 pub mod definition;
 pub mod error;
 pub mod executor;
+pub mod plan;
 pub mod registry;
 pub mod sandbox;
 pub mod security;
@@ -95,6 +96,11 @@ pub use actor::{
 pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExecutorTrait};
 pub use error::{ToolError, ToolErrorKind};
 pub use executor::{Execute, InitExecutor, ToolExecutor};
+pub use plan::{
+    plan_from_tool_result, Plan, PlanError, PlanNote, PlanStep, PlanStepStatus, PlanStepTitle,
+    PlanTextError, RawPlanStep, UnknownPlanStepStatus, MAX_NOTE_CHARS, MAX_PLAN_STEPS,
+    MAX_STEP_CHARS, MIN_PLAN_STEPS, UPDATE_PLAN_TOOL,
+};
 pub use registry::{
     InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics,
     RegistryMetricsSnapshot, ToolListResponse, ToolRegistry, UnregisterTool,

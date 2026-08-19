@@ -40,6 +40,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default and not gated in CI: it builds AWS-LC from source and needs CMake
   and Go, and it must be a release build because the module's power-on
   integrity self-test does not survive a debug build's relocations.
+- **`update_plan` built-in tool.** The model maintains a structured plan for
+  the current task — `{steps: [{title, status}], note?}` with statuses
+  `pending`/`in_progress`/`completed` — and every accepted update is broadcast
+  on the broker as `PlanUpdated` (in `acton_ai::messages`, alongside the other
+  stream and lifecycle events), carrying the turn ID, the round's correlation
+  ID, the tool call ID, and the validated `Plan`. Subscribe an actor to it (on
+  the builder, before `start()`) to render the model's progress; the chat REPL
+  already does, drawing each update as an inline checklist. The prompt round
+  loop owns the turn's current plan: it carries across every round of the tool
+  loop and the turn's final plan is returned on `CollectedResponse::plan`. The
+  tool runs no code and touches nothing: 2–32 steps, each title trimmed,
+  non-empty, at most 200 characters, and distinct; at most one step
+  `in_progress`. A single-step plan is refused outright — the tool's
+  description tells the model to skip planning for trivial tasks, and the
+  refusal tells it to split the work or not plan at all. Any refused plan goes
+  back to the model as that call's tool result so it can correct itself on the
+  next round; nothing is broadcast and the recorded plan stands. Included in
+  `with_builtins()`, or named on its own with
+  `.with_builtin_tools(&["update_plan"])`. The plan types and validation live
+  in the new public `acton_ai::tools::plan` module.
 
 ### Changed
 

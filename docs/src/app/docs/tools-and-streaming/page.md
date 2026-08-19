@@ -166,6 +166,7 @@ let runtime = ActonAI::builder()
 | `bash` | Execute shell commands |
 | `calculate` | Evaluate mathematical expressions |
 | `web_fetch` | Fetch content from URLs |
+| `update_plan` | Record the task plan and its progress |
 
 ### Auto-builtins vs manual builtins
 
