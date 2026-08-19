@@ -172,6 +172,12 @@ pub(crate) struct ActonAIInner {
     /// `None` means unbounded history (explicit opt-out via
     /// [`ActonAIBuilder::without_context_window`]).
     pub(crate) context_window: Option<crate::memory::ContextWindow>,
+    /// The auto-compaction policy in force, when one was configured.
+    ///
+    /// `None` — the default — is what lets the prompt loop skip the whole
+    /// step rather than plan a compaction and discard it on every round, the
+    /// same shape `budget` and `tool_policy` use.
+    pub(crate) compaction: Option<crate::memory::CompactionConfig>,
     /// Handle to the cost accountant, when usage tracking is enabled.
     ///
     /// `None` means tracking was switched off, which
@@ -648,6 +654,15 @@ impl ActonAI {
         self.inner.context_window.as_ref()
     }
 
+    /// Returns the auto-compaction policy applied inside the prompt loop.
+    ///
+    /// `None` means compaction is off, which is the default. See
+    /// [`ActonAIBuilder::compaction`].
+    #[must_use]
+    pub fn compaction(&self) -> Option<&crate::memory::CompactionConfig> {
+        self.inner.compaction.as_ref()
+    }
+
     /// Returns the sandbox factory shared by sandboxed builtin tool calls.
     ///
     /// Populated when the builder was configured with
@@ -996,6 +1011,12 @@ pub struct ActonAIBuilder {
     /// Set by [`without_context_window`](Self::without_context_window) to
     /// explicitly disable per-turn truncation for [`Conversation`].
     context_window_disabled: bool,
+    /// Explicit compaction policy set via [`compaction`](Self::compaction).
+    /// Wins over `auto_compact` under `[context]` in TOML.
+    compaction_override: Option<crate::memory::CompactionConfig>,
+    /// Set by [`without_compaction`](Self::without_compaction) to refuse the
+    /// TOML section outright.
+    compaction_disabled: bool,
     /// Per-provider native context window, captured from `[providers.<name>].context_window_tokens`
     /// during [`apply_config`](Self::apply_config). At launch the entry for the
     /// resolved default provider wins over the global `[context] max_tokens`.
@@ -1675,6 +1696,45 @@ impl ActonAIBuilder {
     pub fn without_context_window(mut self) -> Self {
         self.context_window_disabled = true;
         self.context_window_override = None;
+        self
+    }
+
+    /// Turns on auto-compaction inside the prompt loop.
+    ///
+    /// A turn that works through tools appends an assistant turn and every
+    /// tool result on each round, and nothing else bounds that growth: the
+    /// per-turn truncation a [`Conversation`](crate::conversation::Conversation)
+    /// applies runs *between* turns, not inside one. With a policy in force,
+    /// the loop sends the head of an over-budget history back to the same
+    /// provider for summarization and splices the summary in where the elided
+    /// messages were, instead of failing at the provider.
+    ///
+    /// Off by default. Requires a context window — with
+    /// [`without_context_window`](Self::without_context_window) there is no
+    /// budget to compact against, and the policy is inert.
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::memory::CompactionConfig;
+    ///
+    /// let runtime = ActonAI::builder()
+    ///     .ollama("qwen2.5:7b")
+    ///     .compaction(CompactionConfig::default())
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn compaction(mut self, config: crate::memory::CompactionConfig) -> Self {
+        self.compaction_override = Some(config);
+        self.compaction_disabled = false;
+        self
+    }
+
+    /// Refuses auto-compaction, including an `auto_compact = true` under
+    /// `[context]` in TOML that would otherwise switch it on.
+    #[must_use]
+    pub fn without_compaction(mut self) -> Self {
+        self.compaction_disabled = true;
+        self.compaction_override = None;
         self
     }
 
@@ -2537,6 +2597,12 @@ impl ActonAIBuilder {
             &default_provider_model,
         );
 
+        let compaction = resolve_compaction(
+            self.compaction_override.take(),
+            self.compaction_disabled,
+            self.context_config.as_ref(),
+        )?;
+
         Ok(ActonAI {
             inner: Arc::new(ActonAIInner {
                 runtime,
@@ -2550,6 +2616,7 @@ impl ActonAIBuilder {
                 sandbox_factory,
                 default_max_tool_rounds,
                 context_window,
+                compaction,
                 accountant,
                 budget,
                 mcp,
@@ -3141,6 +3208,50 @@ fn resolve_context_window(
         "context window resolved",
     );
     Some(window)
+}
+
+/// Resolves the runtime compaction policy at [`ActonAIBuilder::launch`] time.
+///
+/// Precedence (highest to lowest):
+/// 1. [`ActonAIBuilder::compaction`] (explicit API call).
+/// 2. [`ActonAIBuilder::without_compaction`] (explicit opt-out) → `None`.
+/// 3. `auto_compact = true` under `[context]` in TOML.
+/// 4. `None` — compaction is off unless asked for.
+///
+/// # Errors
+///
+/// Returns [`ActonAIError::configuration`] naming the offending key when a
+/// TOML value is out of range. Launch fails rather than silently falling back
+/// to a default: an operator who wrote `compact_threshold = 80` meant
+/// something, and quietly compacting at 0.8 instead would hide the mistake.
+fn resolve_compaction(
+    override_config: Option<crate::memory::CompactionConfig>,
+    disabled: bool,
+    context_config: Option<&crate::config::ContextFileConfig>,
+) -> Result<Option<crate::memory::CompactionConfig>, ActonAIError> {
+    if let Some(config) = override_config {
+        return Ok(Some(config));
+    }
+    if disabled {
+        return Ok(None);
+    }
+
+    let Some(section) = context_config else {
+        return Ok(None);
+    };
+
+    let resolved = section
+        .resolve_compaction()
+        .map_err(|error| ActonAIError::configuration("context", error.to_string()))?;
+
+    if let Some(config) = resolved {
+        tracing::info!(
+            threshold = %config.threshold,
+            keep_recent_turns = %config.keep_recent_turns,
+            "auto-compaction enabled",
+        );
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
@@ -4356,5 +4467,102 @@ mod tests {
 
         let registry = runtime.skills().expect("registry");
         assert_eq!(registry.len(), 1);
+    }
+
+    // -- compaction resolution --------------------------------------------
+
+    /// A `[context]` section carrying only compaction keys.
+    fn context_with_compaction(
+        threshold: Option<f64>,
+        keep_recent_turns: Option<usize>,
+    ) -> crate::config::ContextFileConfig {
+        crate::config::ContextFileConfig {
+            auto_compact: Some(true),
+            compact_threshold: threshold,
+            keep_recent_turns,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn compaction_is_off_when_nothing_asks_for_it() {
+        assert_eq!(resolve_compaction(None, false, None).unwrap(), None);
+
+        let context = crate::config::ContextFileConfig {
+            max_tokens: Some(4096),
+            ..Default::default()
+        };
+        assert_eq!(
+            resolve_compaction(None, false, Some(&context)).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn a_builder_policy_wins_over_the_toml_keys() {
+        let explicit = crate::memory::CompactionConfig::default()
+            .with_keep_recent_turns(crate::memory::KeepRecentTurns::new(9).unwrap());
+        let context = context_with_compaction(None, Some(2));
+
+        let resolved = resolve_compaction(Some(explicit), false, Some(&context))
+            .unwrap()
+            .expect("explicit policy should survive");
+
+        assert_eq!(resolved.keep_recent_turns.get(), 9);
+    }
+
+    #[test]
+    fn without_compaction_refuses_the_toml_keys() {
+        let context = context_with_compaction(None, None);
+
+        assert_eq!(
+            resolve_compaction(None, true, Some(&context)).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn auto_compact_in_toml_switches_compaction_on() {
+        let context = context_with_compaction(Some(0.5), None);
+
+        let resolved = resolve_compaction(None, false, Some(&context))
+            .unwrap()
+            .expect("auto_compact = true should yield a policy");
+
+        assert_eq!(resolved.threshold.get(), 0.5);
+    }
+
+    #[test]
+    fn an_invalid_toml_threshold_fails_the_launch_naming_its_key() {
+        let context = context_with_compaction(Some(1.5), None);
+
+        let error =
+            resolve_compaction(None, false, Some(&context)).expect_err("1.5 is not a fraction");
+
+        let rendered = error.to_string();
+        assert!(rendered.contains("context"), "{rendered}");
+        assert!(rendered.contains("compact_threshold"), "{rendered}");
+    }
+
+    #[tokio::test]
+    async fn a_launched_runtime_reports_the_compaction_policy_it_was_given() {
+        let runtime = ActonAI::builder()
+            .ollama("test-model")
+            .compaction(crate::memory::CompactionConfig::default())
+            .launch()
+            .await
+            .expect("launch");
+
+        assert_eq!(
+            runtime.compaction().copied(),
+            Some(crate::memory::CompactionConfig::default()),
+        );
+
+        let off = ActonAI::builder()
+            .ollama("test-model")
+            .launch()
+            .await
+            .expect("launch");
+        assert_eq!(off.compaction(), None);
     }
 }

@@ -305,6 +305,14 @@ fn write_status_plain(
         "Turns:      {} started, {} refused",
         report.turns_started, report.turns_refused,
     ))?;
+    // Only shown once it has happened: a "0 compacted" line on every status
+    // is noise for the majority of runtimes, which never configure compaction.
+    if report.turns_compacted > 0 {
+        output.write_line(&format!(
+            "Compaction: {} histor(ies) compacted mid-turn",
+            report.turns_compacted,
+        ))?;
+    }
 
     if !report.providers.is_empty() {
         output.write_line("")?;

@@ -174,6 +174,16 @@ pub struct StatusReport {
     /// Nonzero here with `admission: "running"` is the signature of a pause
     /// that was resumed after callers had already been turned away.
     pub turns_refused: u64,
+    /// Histories compacted since launch, across every turn.
+    ///
+    /// Nonzero means the runtime has been rewriting histories mid-turn to
+    /// keep them inside the context window — the first thing to check when a
+    /// model appears to have forgotten something it was told.
+    ///
+    /// Added after `SCHEMA_VERSION` 1, so it carries `#[serde(default)]`: an
+    /// older server's reply deserializes with a zero here.
+    #[serde(default)]
+    pub turns_compacted: u64,
     /// Every configured provider, in name order.
     pub providers: Vec<ProviderStatus>,
     /// Every configured MCP server, in name order. Empty when none.
@@ -268,6 +278,7 @@ mod tests {
             in_flight_tool_calls: 1,
             turns_started: 17,
             turns_refused: 3,
+            turns_compacted: 2,
             providers: vec![ProviderStatus {
                 name: "claude".to_string(),
                 model: "claude-sonnet-4".to_string(),

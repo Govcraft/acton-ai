@@ -7,6 +7,43 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auto-compaction.** A turn that works through tools appends an assistant
+  turn and every tool result on each round, and nothing bounded that growth:
+  the per-turn truncation a `Conversation` applies runs *between* turns, not
+  inside one, so a long tool loop eventually exceeded the provider's context
+  window and failed mid-turn, after the earlier rounds were already paid for.
+  When the history reaches a configurable fraction of the available budget the
+  prompt loop now — between rounds, never mid-exchange — sends the older
+  history back to the **same provider** with a fixed summarization prompt and
+  splices the model's own summary in where the elided messages were, keeping
+  the last few exchanges verbatim. This is deliberately not truncation:
+  dropping the oldest exchanges silently erases the user's original request
+  and the model has no way to know, whereas the summary tells it what it
+  forgot. Configured with `auto_compact = true` (plus optional
+  `compact_threshold` and `keep_recent_turns`) under `[context]`, or
+  `.compaction(..)` on the builder; **off by default**, so an unconfigured
+  runtime behaves exactly as before. A summarization that fails or is refused
+  by the budget stalls compaction for the turn, which proceeds with its full
+  history rather than a hole where its history used to be.
+- **`acton_ai::memory::compaction`.** The policy as pure functions —
+  `plan_compaction`, `summarization_messages`, `finish_compaction` — over
+  validated newtypes (`CompactionThreshold`, `KeepRecentTurns`), so every
+  decision is testable without a provider. Compaction never splits an
+  exchange: an assistant turn carrying tool calls travels with the tool
+  results answering it, because a `tool_use` with no matching `tool_result` is
+  rejected by every provider for the rest of the conversation. It also
+  declines whenever the summary would be no smaller than the text it replaces,
+  which is what stops an already-compacted history from being rewritten — and
+  paid for — on every round.
+- **Compaction is transparent, everywhere it can be seen.**
+  `TurnLifecycle::ContextCompacted` is broadcast on every pass with the token
+  counts and the number of messages elided, alongside an `info` log;
+  `CollectedResponse` gained `compactions` carrying a `CompactionRecord` per
+  pass; the CLI's session store persists each record as a clearly marked
+  summary message, so a stored session records that — and what — the model was
+  told it forgot; and `acton-ai status` reports the running total once it is
+  nonzero.
+
 - **Tool-approval policy gate.** One choke point between "the model asked for
   a tool" and "the tool ran", covering built-ins, `#[tool]` functions and MCP
   tools uniformly. Rules — allowlist, denylist, per-turn invocation caps —
@@ -43,6 +80,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- `StatusReport` gained `turns_compacted`. Additive and `#[serde(default)]`,
+  so an older client still deserializes a newer server's reply and
+  `SCHEMA_VERSION` is unchanged.
 - TLS backend selection moved behind features. The ordinary *ring* stack is
   now the `tls-ring` feature and is part of the default set, so a default
   build is unchanged. **A `--no-default-features` build that relied on TLS

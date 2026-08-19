@@ -254,6 +254,31 @@ fn resolve_encoding_name(model: &str) -> &'static str {
     }
 }
 
+/// Splits a history into runs that must not be broken apart.
+///
+/// An assistant turn carrying tool calls forms one run with the tool results
+/// that follow it. Every other message is a run of its own. Splitting such a
+/// run produces a history the providers reject outright — a `tool_use` with no
+/// `tool_result`, or the reverse — so every consumer that removes messages
+/// wholesale (truncation, compaction) works in these units.
+pub(crate) fn exchanges(messages: &[Message]) -> Vec<&[Message]> {
+    let mut runs = Vec::new();
+    let mut start = 0;
+
+    while start < messages.len() {
+        let mut end = start + 1;
+        if messages[start].role == MessageRole::Assistant && messages[start].tool_calls.is_some() {
+            while end < messages.len() && messages[end].role == MessageRole::Tool {
+                end += 1;
+            }
+        }
+        runs.push(&messages[start..end]);
+        start = end;
+    }
+
+    runs
+}
+
 // =============================================================================
 // Context Window
 // =============================================================================
@@ -374,30 +399,6 @@ impl ContextWindow {
         crate::llm::sanitize::sanitize_history(&fitted)
     }
 
-    /// Splits a history into runs that must not be broken apart.
-    ///
-    /// An assistant turn carrying tool calls forms one run with the tool
-    /// results that follow it. Every other message is a run of its own.
-    fn exchanges(messages: &[Message]) -> Vec<&[Message]> {
-        let mut runs = Vec::new();
-        let mut start = 0;
-
-        while start < messages.len() {
-            let mut end = start + 1;
-            if messages[start].role == MessageRole::Assistant
-                && messages[start].tool_calls.is_some()
-            {
-                while end < messages.len() && messages[end].role == MessageRole::Tool {
-                    end += 1;
-                }
-            }
-            runs.push(&messages[start..end]);
-            start = end;
-        }
-
-        runs
-    }
-
     /// Sums the estimated tokens of every message in a run.
     fn estimate_run_tokens(&self, run: &[Message]) -> usize {
         run.iter().map(|msg| self.estimate_tokens(msg)).sum()
@@ -413,7 +414,7 @@ impl ContextWindow {
         let mut result: Vec<Message> = Vec::new();
         let mut total = already_used;
 
-        for run in Self::exchanges(messages).into_iter().rev() {
+        for run in exchanges(messages).into_iter().rev() {
             let tokens = self.estimate_run_tokens(run);
             if total + tokens > available {
                 break;
@@ -465,7 +466,7 @@ impl ContextWindow {
             return Vec::new();
         }
 
-        let runs = Self::exchanges(messages);
+        let runs = exchanges(messages);
         let (Some(first), Some(last)) = (runs.first(), runs.last()) else {
             return Vec::new();
         };

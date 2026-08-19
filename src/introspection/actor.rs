@@ -94,6 +94,8 @@ pub struct IntrospectionActor {
     turns_started: u64,
     /// Turns refused because admission was closed.
     turns_refused: u64,
+    /// Histories compacted since launch, across every turn.
+    compactions: u64,
     /// When the runtime finished launching.
     ///
     /// `Option` because an actor model must be `Default` and `Instant` is
@@ -166,6 +168,9 @@ impl IntrospectionActor {
                 }
                 TurnLifecycle::TurnRefused => {
                     actor.model.turns_refused = actor.model.turns_refused.saturating_add(1);
+                }
+                TurnLifecycle::ContextCompacted { .. } => {
+                    actor.model.compactions = actor.model.compactions.saturating_add(1);
                 }
             }
             Reply::ready()
@@ -246,6 +251,7 @@ struct ModelSnapshot {
     in_flight_tool_calls: u64,
     turns_started: u64,
     turns_refused: u64,
+    compactions: u64,
     uptime_secs: u64,
     admission: String,
 }
@@ -257,6 +263,7 @@ impl ModelSnapshot {
             in_flight_tool_calls: model.in_flight_tools.len() as u64,
             turns_started: model.turns_started,
             turns_refused: model.turns_refused,
+            compactions: model.compactions,
             uptime_secs: model
                 .started_at
                 .map_or(0, |started| started.elapsed().as_secs()),
@@ -278,6 +285,7 @@ async fn assemble(snapshot: ModelSnapshot, sources: StatusSources) -> StatusRepo
         in_flight_tool_calls: snapshot.in_flight_tool_calls,
         turns_started: snapshot.turns_started,
         turns_refused: snapshot.turns_refused,
+        turns_compacted: snapshot.compactions,
         providers: provider_statuses(&sources).await,
         mcp_servers: mcp_statuses(&sources),
         usage: usage_summary(&sources).await,

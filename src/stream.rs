@@ -253,6 +253,15 @@ pub struct CollectedResponse {
     /// This is populated when tools were used and contains all tool calls
     /// that were executed during the conversation loop.
     pub tool_calls: Vec<ExecutedToolCall>,
+
+    /// Compactions the prompt loop performed during this turn, oldest first.
+    ///
+    /// Empty unless auto-compaction is configured *and* fired. Each record
+    /// carries the provider-written summary that replaced the elided span and
+    /// the measured effect; a caller that persists sessions can store
+    /// [`CompactionRecord::as_message`](crate::memory::CompactionRecord::as_message)
+    /// so the stored conversation records that compaction happened.
+    pub compactions: Vec<crate::memory::CompactionRecord>,
 }
 
 impl CollectedResponse {
@@ -265,6 +274,7 @@ impl CollectedResponse {
             token_count,
             usage: Usage::default(),
             tool_calls: Vec::new(),
+            compactions: Vec::new(),
         }
     }
 
@@ -273,6 +283,19 @@ impl CollectedResponse {
     pub fn with_usage(mut self, usage: Usage) -> Self {
         self.usage = usage;
         self
+    }
+
+    /// Attaches the compactions the turn performed.
+    #[must_use]
+    pub fn with_compactions(mut self, compactions: Vec<crate::memory::CompactionRecord>) -> Self {
+        self.compactions = compactions;
+        self
+    }
+
+    /// Returns true if the prompt loop compacted the history during this turn.
+    #[must_use]
+    pub fn was_compacted(&self) -> bool {
+        !self.compactions.is_empty()
     }
 
     /// Creates a new collected response with tool calls.
@@ -289,6 +312,7 @@ impl CollectedResponse {
             token_count,
             usage: Usage::default(),
             tool_calls,
+            compactions: Vec::new(),
         }
     }
 
@@ -325,6 +349,7 @@ impl Default for CollectedResponse {
             token_count: 0,
             usage: Usage::default(),
             tool_calls: Vec::new(),
+            compactions: Vec::new(),
         }
     }
 }

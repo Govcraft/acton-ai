@@ -125,3 +125,39 @@ tokens_per_minute = 1000000
 # enabled = true
 # path = "/var/log/acton-ai/audit.jsonl"
 # redact_patterns = ["password", "token", "api_key", "authorization"]
+
+# ---------------------------------------------------------------------------
+# Context window and auto-compaction.
+#
+# `max_tokens` and `strategy` bound the history a Conversation ships BETWEEN
+# turns. They do nothing INSIDE one: a turn that works through tools appends
+# an assistant turn and every tool result on each round, and only compaction
+# bounds that.
+#
+# When the history reaches `compact_threshold` of the available budget, the
+# prompt loop sends the older history back to the SAME provider with a fixed
+# summarization prompt and splices the model's own summary in where the elided
+# messages were, keeping the last `keep_recent_turns` exchanges verbatim. The
+# summary message is clearly marked, the pass is broadcast as a lifecycle
+# event, and `acton-ai chat` sessions store the summary row — compaction is
+# never silent. A summarization that fails leaves the turn to proceed with its
+# full history.
+#
+# Off unless `auto_compact = true`, because the fallback `max_tokens` below is
+# far smaller than the native window of most providers — compacting by default
+# would summarize history that was never in danger, and every summary is a
+# paid request. Set a realistic budget (per-provider `context_window_tokens`
+# is the best place) before switching it on.
+# ---------------------------------------------------------------------------
+# [context]
+# max_tokens = 8192
+# reserved_for_response = 1024
+# strategy = "keep-recent"   # "keep-recent" | "keep-system-and-recent" | "keep-ends"
+#
+# # Summarize older history instead of failing at the provider. Off by default.
+# auto_compact = true
+# # Fraction of the available budget at which compaction triggers.
+# compact_threshold = 0.8
+# # Trailing turns kept verbatim, counted in whole exchanges: an assistant
+# # turn and the tool results answering it are ONE exchange, never split.
+# keep_recent_turns = 3

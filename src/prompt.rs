@@ -1139,6 +1139,18 @@ impl PromptBuilder {
         // map: the caps are per turn, and a turn is exactly this loop.
         let mut turn_counts = crate::policy::TurnCounts::new();
 
+        // The compaction step, resolved once. `None` in a runtime that
+        // configured no policy, which is what keeps the plan-and-discard work
+        // out of every round of every unconfigured turn. Summarization goes
+        // to the same provider the turn itself uses, under the same budget.
+        let mut compaction = CompactionGate::resolve(
+            &runtime,
+            provider_handle.clone(),
+            billed_provider.clone(),
+            budget_accountant.clone(),
+        );
+        let mut compaction_records: Vec<crate::memory::CompactionRecord> = Vec::new();
+
         // Build the initial messages
         let mut messages = Vec::new();
         if let Some(ref system) = system_prompt {
@@ -1218,6 +1230,25 @@ impl PromptBuilder {
                 return Err(ActonAIError::prompt_failed(format!(
                     "exceeded maximum tool rounds ({max_tool_rounds})",
                 )));
+            }
+
+            // Before the request is built, and therefore before a candidate
+            // is chosen: every provider in the chain gets the same history,
+            // and a failover must not be the thing that decides whether the
+            // history was compacted.
+            if let Some(ref mut gate) = compaction {
+                if let Some(record) = gate
+                    .apply(
+                        session,
+                        turn_id,
+                        &mut messages,
+                        stats,
+                        &mut total_token_count,
+                    )
+                    .await
+                {
+                    compaction_records.push(record);
+                }
             }
 
             // Constrain the choice only while extracting. Plain `collect()`
@@ -1569,7 +1600,8 @@ impl PromptBuilder {
                 total_token_count,
                 executed_tool_calls,
             )
-            .with_usage(stats.usage),
+            .with_usage(stats.usage)
+            .with_compactions(compaction_records),
             captured,
         ))
     }
@@ -1587,6 +1619,191 @@ pub(crate) struct TurnStats {
     /// drive several provider requests, and the caller is billed for all of
     /// them.
     usage: Usage,
+}
+
+/// The auto-compaction step of the prompt loop.
+///
+/// Resolved once per turn and only when the runtime has both a context window
+/// and a policy. Runs between rounds — before a request is built, never while
+/// a tool exchange is in flight — so a compaction can never split a
+/// `tool_use` from its `tool_result`.
+///
+/// The summary is written by the **same provider** the turn dispatches to:
+/// the model that will continue the conversation is the one that decides what
+/// the conversation still needs. That request is a paid round like any other,
+/// so it passes the same budget check, and its usage folds into the turn's
+/// totals.
+///
+/// This is the only place a history the caller handed us is rewritten, and it
+/// is deliberately loud about it: an `info` log and a lifecycle broadcast on
+/// every pass, and a [`CompactionRecord`](crate::memory::CompactionRecord)
+/// handed back so the caller's persistence can store what happened. A
+/// framework that silently deletes context is indistinguishable, from the
+/// outside, from a model that ignores it.
+struct CompactionGate {
+    window: crate::memory::ContextWindow,
+    config: crate::memory::CompactionConfig,
+    broker: ActorHandle,
+    /// The turn's own provider, which also writes the summaries.
+    provider: ActorHandle,
+    /// The name the summarization spend is billed under.
+    provider_name: String,
+    /// The budget gate, when one is configured: a summary costs money too.
+    accountant: Option<ActorHandle>,
+    /// Latched on the first failed or refused summarization. A provider that
+    /// cannot summarize now is unlikely to summarize on the very next round,
+    /// and without the latch every remaining round of the turn would pay for
+    /// — and wait on — another doomed attempt.
+    stalled: bool,
+}
+
+impl CompactionGate {
+    /// Builds the gate, or `None` when this runtime does not compact.
+    fn resolve(
+        runtime: &ActonAI,
+        provider: ActorHandle,
+        provider_name: String,
+        accountant: Option<ActorHandle>,
+    ) -> Option<Self> {
+        let config = *runtime.compaction()?;
+        // No window means no budget to measure against, so a policy alone is
+        // inert rather than an error: `without_context_window` is an explicit
+        // choice to ship the whole history.
+        let window = runtime.context_window()?.clone();
+        Some(Self {
+            window,
+            config,
+            broker: runtime.runtime().broker(),
+            provider,
+            provider_name,
+            accountant,
+            stalled: false,
+        })
+    }
+
+    /// Compacts `messages` in place if the policy calls for it, returning the
+    /// record of what happened when it does.
+    ///
+    /// Every failure path returns `None` and leaves `messages` untouched:
+    /// a turn whose summarization fails proceeds with its full history and
+    /// takes its chances at the provider, which can only be better than
+    /// proceeding with a hole where its history used to be.
+    async fn apply(
+        &mut self,
+        session: &StreamCollectorSession,
+        turn_id: &TurnId,
+        messages: &mut Vec<Message>,
+        stats: &mut TurnStats,
+        total_token_count: &mut usize,
+    ) -> Option<crate::memory::CompactionRecord> {
+        if self.stalled {
+            return None;
+        }
+
+        let plan = crate::memory::plan_compaction(&self.window, &self.config, messages)?;
+
+        // The summary is a paid request, so it faces the same budget gate as
+        // the rounds it exists to protect. A refusal stalls the gate rather
+        // than erroring the turn: the caller's own dispatch will run the same
+        // check and produce the caller-facing answer.
+        if let Some(ref accountant) = self.accountant {
+            if let Err(error) = check_budget(accountant, &self.provider_name).await {
+                tracing::warn!(
+                    error = %error,
+                    "budget refused the summarization request; \
+                     continuing this turn without compaction",
+                );
+                self.stalled = true;
+                return None;
+            }
+        }
+
+        // A fresh correlation ID: this is its own request, not part of any
+        // round's stream. Default callbacks keep the caller's token hooks
+        // quiet — the summary is framework traffic, not the model's answer.
+        let correlation_id = CorrelationId::new();
+        let request = LLMRequest {
+            correlation_id: correlation_id.clone(),
+            agent_id: AgentId::new(),
+            messages: crate::memory::summarization_messages(&plan),
+            tools: None,
+            sampling: None,
+            tool_choice: None,
+        };
+
+        stats.rounds += 1;
+        let round = match run_stream_round(
+            session,
+            &self.provider,
+            &request,
+            correlation_id,
+            StreamRoundCallbacks::default(),
+        )
+        .await
+        {
+            Ok(round) => round,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "summarization request failed; continuing this turn without compaction",
+                );
+                self.stalled = true;
+                return None;
+            }
+        };
+
+        // Spent whether or not the summary is usable.
+        *total_token_count += round.token_count;
+        stats.usage += round.usage;
+
+        let summary = round.text.trim().to_string();
+        if round.stop_reason == StopReason::Error || summary.is_empty() {
+            tracing::warn!(
+                stop_reason = ?round.stop_reason,
+                "provider returned no usable summary; \
+                 continuing this turn without compaction",
+            );
+            self.stalled = true;
+            return None;
+        }
+
+        // Declined when the summary outweighs what it would replace. Not
+        // latched, unlike a failure: the history grows on every round of a
+        // tool loop, so the next plan elides a larger span and the same-sized
+        // summary can succeed against it.
+        let Some((compacted, outcome)) =
+            crate::memory::finish_compaction(&self.window, &plan, &summary)
+        else {
+            tracing::debug!(
+                "summary would not shrink the history; \
+                 leaving it uncompacted this round",
+            );
+            return None;
+        };
+
+        tracing::info!(
+            messages_before = outcome.messages_before,
+            messages_after = outcome.messages_after,
+            messages_elided = outcome.messages_elided,
+            tokens_before = outcome.tokens_before,
+            tokens_after = outcome.tokens_after,
+            max_tokens = self.window.config().max_tokens,
+            "compacted conversation history to stay within the context window",
+        );
+
+        *messages = compacted;
+
+        self.broker
+            .broadcast(TurnLifecycle::ContextCompacted {
+                turn_id: turn_id.clone(),
+                tokens_before: outcome.tokens_before as u64,
+                tokens_after: outcome.tokens_after as u64,
+                messages_elided: outcome.messages_elided as u64,
+            })
+            .await;
+
+        Some(crate::memory::CompactionRecord { summary, outcome })
+    }
 }
 
 /// The span outcome label for an error.
