@@ -22,7 +22,7 @@ pub fn render_tool_call(tool: &ToolCall, theme: &Theme) {
         "\n{dim}[{name}]{reset} {dim}{args}{reset}",
         dim = theme.dim_open,
         reset = theme.dim_close,
-        name = tool.name,
+        name = sanitize_line(&tool.name),
         args = args_preview,
     );
 }
@@ -31,6 +31,8 @@ pub fn render_tool_call(tool: &ToolCall, theme: &Theme) {
 /// follow-up line to the preceding `[tool]` invocation. Successes render
 /// dim; errors render in the theme's warn colour so they stand out.
 pub fn render_tool_result(tool_name: &str, success: bool, summary: &str, theme: &Theme) {
+    let tool_name = sanitize_line(tool_name);
+    let summary = sanitize_line(summary);
     if success {
         println!(
             "  {dim}↳ ok{reset}  {dim}{summary}{reset}",
@@ -75,9 +77,27 @@ fn args_preview(args: &serde_json::Value) -> String {
     truncate(&rendered, ARGS_PREVIEW_MAX)
 }
 
+/// Neutralise characters that would let tool-supplied text rewrite or spoof
+/// this line. These lines are the user's only in-band view of which tools ran
+/// with which arguments, so a `\r` or an ANSI escape smuggled through a tool
+/// name, argument, or result summary could display a command other than the
+/// one that executed. C0/C1 controls become U+FFFD; Unicode bidi overrides,
+/// which can visually reorder a command, are treated the same way.
+fn sanitize_line(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            '\n' | '\t' => ' ',
+            c if c.is_control() => char::REPLACEMENT_CHARACTER,
+            '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' => {
+                char::REPLACEMENT_CHARACTER
+            }
+            c => c,
+        })
+        .collect()
+}
+
 fn truncate(s: &str, max: usize) -> String {
-    // Flatten embedded newlines so a single line of args stays a single line.
-    let flat: String = s.chars().map(|c| if c == '\n' { ' ' } else { c }).collect();
+    let flat = sanitize_line(s);
     if flat.chars().count() <= max {
         flat
     } else {
@@ -126,5 +146,26 @@ mod tests {
     fn preview_flattens_newlines() {
         let got = args_preview(&json!({ "command": "line1\nline2" }));
         assert_eq!(got, "line1 line2");
+    }
+
+    #[test]
+    fn preview_neutralises_ansi_escapes() {
+        let got = args_preview(&json!({ "command": "safe\u{001b}[2K\rrm -rf /" }));
+        assert!(!got.contains('\u{1b}'));
+        assert!(!got.contains('\r'));
+        assert_eq!(got, "safe\u{fffd}[2K\u{fffd}rm -rf /");
+    }
+
+    #[test]
+    fn sanitize_neutralises_c1_and_bidi_overrides() {
+        // C1 CSI (0x9B) is interpreted as an escape introducer by some
+        // terminals; U+202E reverses the visual order of what follows.
+        let got = sanitize_line("a\u{9b}b\u{202E}c");
+        assert_eq!(got, "a\u{fffd}b\u{fffd}c");
+    }
+
+    #[test]
+    fn sanitize_preserves_plain_unicode() {
+        assert_eq!(sanitize_line("café → 東京"), "café → 東京");
     }
 }
