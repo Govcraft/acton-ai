@@ -84,7 +84,7 @@ fips = ["dep:rustls", "reqwest/rustls-tls-webpki-roots-no-provider"]
 
 [dependencies]
 # Actor framework (re-exports tokio)
-acton-reactive = "9.1"
+acton-reactive = "9.2"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
