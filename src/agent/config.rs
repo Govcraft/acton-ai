@@ -308,12 +308,14 @@ mod tests {
     fn with_all_builtins_adds_all_tools() {
         let config = AgentConfig::new("Test").with_all_builtins();
 
-        // Should have all 9 builtin tools
-        assert_eq!(config.tools.len(), 9);
+        // Mirrors the full builtin registry, whatever its size today
+        let available = crate::tools::builtins::BuiltinTools::available();
+        assert_eq!(config.tools.len(), available.len());
         assert!(config.tools.contains(&"read_file".to_string()));
         assert!(config.tools.contains(&"bash".to_string()));
         assert!(config.tools.contains(&"calculate".to_string()));
         assert!(config.tools.contains(&"web_fetch".to_string()));
+        assert!(config.tools.contains(&"get_context_remaining".to_string()));
     }
 
     #[test]

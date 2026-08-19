@@ -1508,6 +1508,29 @@ impl PromptBuilder {
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
                     for tool_call in &tool_calls {
+                        // `get_context_remaining` reads the turn's live
+                        // message state. That state has exactly one owner —
+                        // this loop — so the measured budget is injected into
+                        // the call's arguments here, at call time, and the
+                        // tool itself stays pure arithmetic. The original
+                        // call, not the augmented one, is what goes back into
+                        // `messages` below.
+                        let call_with_state;
+                        let tool_call = if tool_call.name
+                            == crate::tools::builtins::GET_CONTEXT_REMAINING_TOOL
+                        {
+                            call_with_state = ToolCall {
+                                arguments: crate::tools::builtins::inject_context_state(
+                                    &tool_call.arguments,
+                                    runtime.context_window(),
+                                    &messages,
+                                ),
+                                ..tool_call.clone()
+                            };
+                            &call_with_state
+                        } else {
+                            tool_call
+                        };
                         let step = ToolStep {
                             provider_handle: &provider_handle,
                             turn,

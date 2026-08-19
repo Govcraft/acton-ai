@@ -2040,6 +2040,7 @@ impl ActonAIBuilder {
     /// - `bash`: Execute shell commands
     /// - `calculate`: Evaluate mathematical expressions
     /// - `web_fetch`: Fetch content from URLs
+    /// - `get_context_remaining`: Report the conversation's context-window budget
     ///
     /// When using this method, builtins are automatically enabled on every prompt
     /// created via [`prompt()`](ActonAI::prompt), [`continue_with()`](ActonAI::continue_with),

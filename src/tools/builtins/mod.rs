@@ -21,6 +21,9 @@
 //! ### Web Tools
 //! - **web_fetch**: Fetch content from URLs
 //!
+//! ### Introspection Tools
+//! - **get_context_remaining**: Report the conversation's context-window budget
+//!
 //! ## Usage
 //!
 //! ### Using the High-Level API
@@ -64,6 +67,7 @@
 mod bash;
 mod calculate;
 mod edit_file;
+mod get_context_remaining;
 mod glob;
 mod grep;
 mod list_directory;
@@ -78,6 +82,10 @@ mod skill_list;
 pub use bash::{BashTool, BashToolActor};
 pub use calculate::{CalculateTool, CalculateToolActor};
 pub use edit_file::{EditFileTool, EditFileToolActor};
+pub(crate) use get_context_remaining::inject_context_state;
+pub use get_context_remaining::{
+    GetContextRemainingTool, GetContextRemainingToolActor, GET_CONTEXT_REMAINING_TOOL,
+};
 pub use glob::{GlobTool, GlobToolActor};
 pub use grep::{GrepTool, GrepToolActor};
 pub use list_directory::{ListDirectoryTool, ListDirectoryToolActor};
@@ -147,6 +155,11 @@ impl BuiltinTools {
             WebFetchTool::config(),
             Box::new(WebFetchTool::new()),
         );
+        registry.register(
+            GET_CONTEXT_REMAINING_TOOL,
+            GetContextRemainingTool::config(),
+            Box::new(GetContextRemainingTool::new()),
+        );
 
         registry
     }
@@ -206,6 +219,7 @@ impl BuiltinTools {
             "bash",
             "calculate",
             "web_fetch",
+            GET_CONTEXT_REMAINING_TOOL,
         ]
     }
 
@@ -322,6 +336,11 @@ pub async fn spawn_tool_actor(
             let definition = WebFetchToolActor::definition();
             Ok((handle, definition))
         }
+        GET_CONTEXT_REMAINING_TOOL => {
+            let handle = GetContextRemainingToolActor::spawn(runtime).await;
+            let definition = GetContextRemainingToolActor::definition();
+            Ok((handle, definition))
+        }
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -346,6 +365,7 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
         "bash" => Ok(BashToolActor::definition()),
         "calculate" => Ok(CalculateToolActor::definition()),
         "web_fetch" => Ok(WebFetchToolActor::definition()),
+        GET_CONTEXT_REMAINING_TOOL => Ok(GetContextRemainingToolActor::definition()),
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -405,7 +425,7 @@ mod tests {
     #[test]
     fn builtin_tools_all_creates_all_tools() {
         let tools = BuiltinTools::all();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
 
         for name in BuiltinTools::available() {
             assert!(
@@ -438,7 +458,7 @@ mod tests {
     #[test]
     fn builtin_tools_available_returns_all_names() {
         let names = BuiltinTools::available();
-        assert_eq!(names.len(), 9);
+        assert_eq!(names.len(), 10);
 
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -449,20 +469,21 @@ mod tests {
         assert!(names.contains(&"bash"));
         assert!(names.contains(&"calculate"));
         assert!(names.contains(&"web_fetch"));
+        assert!(names.contains(&GET_CONTEXT_REMAINING_TOOL));
     }
 
     #[test]
     fn builtin_tools_configs_iterator() {
         let tools = BuiltinTools::all();
         let configs: Vec<_> = tools.configs().collect();
-        assert_eq!(configs.len(), 9);
+        assert_eq!(configs.len(), 10);
     }
 
     #[test]
     fn builtin_tools_executors_iterator() {
         let tools = BuiltinTools::all();
         let executors: Vec<_> = tools.executors().collect();
-        assert_eq!(executors.len(), 9);
+        assert_eq!(executors.len(), 10);
     }
 
     #[test]

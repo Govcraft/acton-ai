@@ -40,6 +40,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default and not gated in CI: it builds AWS-LC from source and needs CMake
   and Go, and it must be a release build because the module's power-on
   integrity self-test does not survive a debug build's relocations.
+- **`get_context_remaining` built-in tool.** Lets the model ask how much of
+  the context window is spent before it commits to something large.
+  Registered with the other builtins, so `with_builtins()` offers it, and it
+  answers `{total_tokens, used_tokens, remaining_tokens, percent_used}` —
+  measured by the same estimator that decides truncation, against the window
+  resolved at launch from per-provider `context_window_tokens`, then
+  `[context] max_tokens`, then the built-in default. The live message state
+  has exactly one owner, the prompt loop, so the loop measures at call time
+  and injects the two numbers into the call's arguments; the tool itself is
+  pure arithmetic, and the injected state never enters the conversation
+  history.
 
 ### Changed
 
