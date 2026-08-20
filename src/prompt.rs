@@ -1101,7 +1101,7 @@ impl PromptBuilder {
         // The caller's id when one was supplied, so an embedder that
         // announced the turn to its own client before calling `collect` sees
         // that exact id on every event; minted here otherwise.
-        let turn_id = self.turn_id.clone().unwrap_or_else(TurnId::new);
+        let turn_id = self.turn_id.clone().unwrap_or_default();
         broker
             .broadcast(TurnLifecycle::TurnStarted {
                 turn_id: turn_id.clone(),

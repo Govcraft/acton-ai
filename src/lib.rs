@@ -149,7 +149,7 @@ pub mod prelude {
         ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason, ToolInvocation,
         ToolPolicy, TurnCounts,
     };
-    pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
+    pub use crate::stream::{CollectedResponse, StreamAction, StreamContext, StreamHandler};
 
     // Low-level API (for advanced use cases)
     pub use crate::agent::{
