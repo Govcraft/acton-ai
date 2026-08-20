@@ -19,6 +19,16 @@ pub struct ToolInvocation {
     pub tool_name: String,
     /// The arguments the model proposed, before any rewriting.
     pub arguments: serde_json::Value,
+    /// The provider's ID for this particular call.
+    ///
+    /// The same ID appears on the `TurnLifecycle::ToolStarted` that was
+    /// published just before the hook ran, on the matching `ToolFinished`,
+    /// and on the audit entry. A hook that surfaces the call to a human can
+    /// therefore key its prompt by this ID and have the answer line up with
+    /// what the rest of the system observed.
+    ///
+    /// Unique within a turn, not globally: pair it with `turn_id`.
+    pub tool_call_id: String,
     /// The correlation ID of the round that requested the call.
     pub correlation_id: CorrelationId,
     /// The turn the call belongs to.
@@ -102,6 +112,7 @@ mod tests {
         ToolInvocation {
             tool_name: "bash".to_string(),
             arguments: json!({"command": "ls"}),
+            tool_call_id: "toolu_01".to_string(),
             correlation_id: CorrelationId::new(),
             turn_id: TurnId::new(),
         }
@@ -139,6 +150,24 @@ mod tests {
             decision,
             ApprovalDecision::ApproveWith {
                 arguments: json!({"command": "ls -la"})
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_can_read_the_tool_call_id() {
+        // A human-in-the-loop hook keys its prompt by the call ID so the
+        // answer lines up with the lifecycle events and the audit entry.
+        let hook = |invocation: ToolInvocation| async move {
+            ApprovalDecision::deny(format!("declined {}", invocation.tool_call_id))
+        };
+
+        let decision = ApprovalHookFn::call(&hook, invocation()).await;
+
+        assert_eq!(
+            decision,
+            ApprovalDecision::Deny {
+                reason: "declined toolu_01".to_string()
             }
         );
     }

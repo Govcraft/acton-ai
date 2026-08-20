@@ -268,6 +268,7 @@ mod tests {
         ToolInvocation {
             tool_name: tool_name.to_string(),
             arguments: json!({"value": 1}),
+            tool_call_id: "toolu_01".to_string(),
             correlation_id: CorrelationId::new(),
             turn_id: TurnId::new(),
         }
