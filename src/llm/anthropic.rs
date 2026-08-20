@@ -1313,6 +1313,7 @@ mod tests {
         let client = AnthropicClient::new(config).unwrap();
 
         let tools = vec![ToolDefinition {
+            idempotent: false,
             name: "calculator".to_string(),
             description: "Performs math".to_string(),
             input_schema: serde_json::json!({

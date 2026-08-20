@@ -299,6 +299,7 @@ struct RendezvousTool {
 impl RendezvousTool {
     fn definition() -> ToolDefinition {
         ToolDefinition {
+            idempotent: false,
             name: "rendezvous".to_string(),
             description: "Completes only when every concurrent call has arrived".to_string(),
             input_schema: serde_json::json!({ "type": "object", "properties": {} }),

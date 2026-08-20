@@ -121,6 +121,7 @@ mod tests {
                 },
                 decision: AuditDecision::approved(Decider::NoPolicy),
                 duration_ms: 3,
+                resumed: false,
             },
             sequence,
             prev_hash,

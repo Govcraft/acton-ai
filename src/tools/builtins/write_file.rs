@@ -45,6 +45,7 @@ impl WriteFileTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "write_file".to_string(),
             description: "Write content to a file, creating parent directories if needed. Overwrites existing files.".to_string(),
             input_schema: json!({

@@ -107,6 +107,7 @@ impl StructuredSpec {
     /// The synthetic tool definition to append to the request.
     pub(crate) fn tool_definition(&self) -> ToolDefinition {
         ToolDefinition {
+            idempotent: false,
             name: STRUCTURED_OUTPUT_TOOL.to_string(),
             description: STRUCTURED_OUTPUT_DESCRIPTION.to_string(),
             input_schema: self.schema.clone(),

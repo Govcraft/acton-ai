@@ -55,6 +55,7 @@ impl Default for ToolConfig {
     fn default() -> Self {
         Self {
             definition: ToolDefinition {
+                idempotent: false,
                 name: "unnamed".to_string(),
                 description: "An unnamed tool".to_string(),
                 input_schema: serde_json::json!({
@@ -140,6 +141,7 @@ mod tests {
 
     fn make_test_definition(name: &str, description: &str) -> ToolDefinition {
         ToolDefinition {
+            idempotent: false,
             name: name.to_string(),
             description: description.to_string(),
             input_schema: serde_json::json!({"type": "object"}),

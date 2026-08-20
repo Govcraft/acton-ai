@@ -1094,6 +1094,7 @@ mod tests {
     fn openai_convert_tools() {
         let client = create_test_client();
         let tools = vec![ToolDefinition {
+            idempotent: false,
             name: "calculator".to_string(),
             description: "Performs math".to_string(),
             input_schema: serde_json::json!({

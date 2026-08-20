@@ -163,6 +163,62 @@ pub struct ActonAIConfig {
     /// actor is spawned.
     #[serde(default)]
     pub audit: Option<AuditFileConfig>,
+
+    /// Checkpoint and resume for interrupted turns.
+    ///
+    /// Corresponds to `[checkpoint]` in TOML. A
+    /// [`checkpoint`](crate::facade::ActonAIBuilder::checkpoint) call on the
+    /// builder replaces this section wholesale. Absent, nothing is
+    /// checkpointed, no store is opened, and launch inspects nothing —
+    /// behavior is exactly what it was before the feature existed.
+    #[serde(default)]
+    pub checkpoint: Option<CheckpointFileConfig>,
+}
+
+/// Checkpoint settings loaded from `[checkpoint]` in TOML.
+///
+/// ```toml
+/// [checkpoint]
+/// db_path = "checkpoints.db"     # where interrupted turns are recorded
+/// policy = "abandon"             # abandon | resume_on_request | resume_auto
+/// ```
+///
+/// Writing the section is what turns checkpointing on: every prompt records
+/// its progress, and a restarted process applies `policy` to whatever
+/// interrupted turns it finds.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct CheckpointFileConfig {
+    /// Where the checkpoint database lives.
+    ///
+    /// Defaults to `acton-ai-checkpoints.db` in the working directory. A
+    /// resume only ever finds something when the path outlives the process,
+    /// so `:memory:` is useful only in tests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub db_path: Option<String>,
+
+    /// What launch does about interrupted turns from a previous process.
+    ///
+    /// One of `abandon` (the default), `resume_on_request`, or `resume_auto`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub policy: Option<crate::checkpoint::ResumePolicy>,
+}
+
+impl CheckpointFileConfig {
+    /// The default database file name, relative to the working directory.
+    pub const DEFAULT_DB_PATH: &'static str = "acton-ai-checkpoints.db";
+
+    /// Resolves this section into the builder-level configuration.
+    #[must_use]
+    pub fn to_checkpoint(&self) -> crate::checkpoint::CheckpointConfig {
+        crate::checkpoint::CheckpointConfig {
+            db_path: self
+                .db_path
+                .clone()
+                .unwrap_or_else(|| Self::DEFAULT_DB_PATH.to_string()),
+            policy: self.policy.unwrap_or_default(),
+        }
+    }
 }
 
 /// Tool-approval rules loaded from `[tool_policy]` in TOML.
@@ -2077,6 +2133,7 @@ max_execution_ms = 60000
             introspection: None,
             tool_policy: None,
             audit: None,
+            checkpoint: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -2176,6 +2233,54 @@ x-tenant = "acme"
             crate::telemetry::DEFAULT_METRICS_INTERVAL_SECS
         );
         assert!(resolved.headers.is_empty());
+    }
+
+    #[test]
+    fn the_documented_checkpoint_section_parses_in_full() {
+        // The exact shape shipped in `examples/acton-ai.toml`: the sample
+        // config must be a template, not a trap.
+        let toml_str = r#"
+[checkpoint]
+db_path = "acton-ai-checkpoints.db"
+policy = "abandon"
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let section = config
+            .checkpoint
+            .expect("the [checkpoint] section must parse");
+
+        let resolved = section.to_checkpoint();
+        assert_eq!(resolved.db_path, "acton-ai-checkpoints.db");
+        assert_eq!(resolved.policy, crate::checkpoint::ResumePolicy::Abandon);
+    }
+
+    #[test]
+    fn an_empty_checkpoint_section_resolves_to_the_defaults() {
+        let config: ActonAIConfig = toml::from_str(
+            "[checkpoint]
+",
+        )
+        .unwrap();
+        let resolved = config
+            .checkpoint
+            .expect("the bare section must parse")
+            .to_checkpoint();
+
+        assert_eq!(resolved.db_path, CheckpointFileConfig::DEFAULT_DB_PATH);
+        assert_eq!(resolved.policy, crate::checkpoint::ResumePolicy::Abandon);
+    }
+
+    #[test]
+    fn a_misspelled_checkpoint_key_is_refused() {
+        // `deny_unknown_fields`: a typo must fail loudly, not silently fall
+        // back to a policy the operator did not choose.
+        let result = toml::from_str::<ActonAIConfig>(
+            "[checkpoint]
+polcy = \"resume_auto\"
+",
+        );
+        assert!(result.is_err());
     }
 
     #[test]

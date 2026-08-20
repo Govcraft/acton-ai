@@ -7,6 +7,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Checkpoint and resume.** A turn that dies with the process no longer
+  loses its work. With a `[checkpoint]` section (or `.checkpoint(..)` on the
+  builder) every prompt records its progress into a Turso/libSQL database:
+  the conversation as the next round would send it, the rounds spent, the
+  tools already executed — and, mid-round, a per-call ledger written before
+  each tool starts and rewritten when it completes, one single-row upsert per
+  change so the state and the record of it can never disagree. On restart the
+  configured `ResumePolicy` decides what happens to interrupted turns:
+  `abandon` (the default) marks them as a recorded outcome and runs nothing,
+  `resume_on_request` leaves them for `interrupted_turns()` /
+  `resume_turn(..)`, and `resume_auto` picks them back up in the background.
+  A resume settles the interrupted round first — completed calls keep their
+  stored results, unstarted calls execute — and then re-prompts with the
+  accumulated results. Without the section nothing is recorded, no store is
+  opened, and behavior is exactly what it was.
+- **Per-tool idempotency declarations.** `ToolDefinition` carries an
+  `idempotent` flag (default `false`; the read-only built-ins — `read_file`,
+  `glob`, `grep`, `list_directory`, `calculate` — declare `true`). Crash
+  recovery turns on it: a call that was mid-execution when the process died
+  re-runs only if its tool is idempotent; otherwise it is NOT re-run, and the
+  model is told its outcome is uncertain as that call's tool result.
+- **`resumed` marker in the audit trail.** Every tool call executed by a
+  resumed turn is stamped `resumed: true` in its audit entry, covered by the
+  entry's hash. First-run entries keep their exact pre-existing byte shape,
+  so trails written before the field existed still verify.
 - **Tool-approval policy gate.** One choke point between "the model asked for
   a tool" and "the tool ran", covering built-ins, `#[tool]` functions and MCP
   tools uniformly. Rules — allowlist, denylist, per-turn invocation caps —

@@ -216,11 +216,24 @@ pub(crate) struct ActonAIInner {
     pub(crate) tool_policy: Option<crate::policy::ToolPolicy>,
     /// Handle to the audit log, when a trail was configured.
     pub(crate) audit: Option<ActorHandle>,
+    /// The checkpoint store and resume policy, when checkpointing was
+    /// configured. `None` means no store is open, no prompt writes anything,
+    /// and launch inspected nothing — the pre-feature behavior exactly.
+    pub(crate) checkpoint: Option<CheckpointRuntime>,
     /// Redaction and path settings for the trail, kept beside the handle so
     /// the loop can redact without asking the actor anything.
     pub(crate) audit_config: Option<crate::audit::AuditConfig>,
     /// Whether the runtime has been shut down
     pub(crate) is_shutdown: AtomicBool,
+}
+
+/// The checkpoint store a launched runtime owns, and the policy it applied.
+pub(crate) struct CheckpointRuntime {
+    /// The `MemoryStore` actor holding the checkpoint database.
+    pub(crate) store: ActorHandle,
+    /// What launch did — and [`ActonAI::resume_interrupted`] does — about
+    /// interrupted turns.
+    pub(crate) policy: crate::checkpoint::ResumePolicy,
 }
 
 /// The introspection socket a launched runtime owns.
@@ -378,6 +391,15 @@ impl ActonAI {
         }
         builder = self.inject_skill_tools(builder);
         builder = self.inject_mcp_tools(builder);
+        // A configured `[checkpoint]` section is the request to checkpoint
+        // every turn, so each prompt records under a fresh ID without any
+        // per-call wiring. An explicit `.checkpoint(store, id)` on the
+        // builder afterwards replaces this sink, which is what lets a caller
+        // pin an ID they intend to resume by name.
+        if let Some(ref checkpoint) = self.inner.checkpoint {
+            builder =
+                builder.checkpoint(checkpoint.store.clone(), crate::types::CheckpointId::new());
+        }
         builder
     }
 
@@ -576,6 +598,124 @@ impl ActonAI {
 
         audit.ask(crate::audit::GetChainHead).await.map_err(|e| {
             ActonAIError::provider_error(format!("could not reach the audit log: {e}"))
+        })
+    }
+
+    /// Whether this runtime checkpoints its turns.
+    #[must_use]
+    pub fn is_checkpointing(&self) -> bool {
+        self.inner.checkpoint.is_some()
+    }
+
+    /// The `MemoryStore` actor holding the checkpoint database, when
+    /// checkpointing is configured.
+    ///
+    /// Exposed for callers who pin their own checkpoint IDs with
+    /// [`PromptBuilder::checkpoint`](crate::prompt::PromptBuilder::checkpoint)
+    /// or inspect records with the low-level store messages.
+    #[must_use]
+    pub fn checkpoint_store(&self) -> Option<ActorHandle> {
+        self.inner
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.store.clone())
+    }
+
+    /// Lists the turns a previous process left unfinished.
+    ///
+    /// In-progress and failed records, newest first. Abandoned and completed
+    /// turns are not here: neither has work left to do.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when checkpointing is not configured,
+    /// and a checkpoint error when the store cannot be read.
+    pub async fn interrupted_turns(
+        &self,
+    ) -> Result<Vec<crate::checkpoint::CheckpointRecord>, ActonAIError> {
+        let checkpoint = self.checkpoint_runtime()?;
+        let mut records = list_checkpoints_with_status(
+            &checkpoint.store,
+            crate::checkpoint::CheckpointStatus::InProgress,
+        )
+        .await?;
+        records.extend(
+            list_checkpoints_with_status(
+                &checkpoint.store,
+                crate::checkpoint::CheckpointStatus::Failed,
+            )
+            .await?,
+        );
+        Ok(records)
+    }
+
+    /// Picks an interrupted turn back up where its record says it stopped.
+    ///
+    /// The returned builder is driven like any other prompt — call
+    /// `.collect().await` on it. The loop settles whatever the interrupted
+    /// round left behind first: finished tool calls keep their recorded
+    /// results, unstarted ones execute, and a started call whose tool is not
+    /// idempotent is NOT re-run — the model is told its outcome is uncertain
+    /// instead. Progress keeps being written under the record's own ID, and
+    /// every tool call the resumed turn makes is marked `resumed` in the
+    /// audit trail.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when checkpointing is not configured.
+    /// The record itself is validated when the builder runs, not here.
+    pub fn resume_turn(
+        &self,
+        record: crate::checkpoint::CheckpointRecord,
+    ) -> Result<PromptBuilder, ActonAIError> {
+        let checkpoint = self.checkpoint_runtime()?;
+        let store = checkpoint.store.clone();
+        // Through `prompt()` deliberately, so a resumed turn holds the same
+        // builtins, skills, and MCP tools a fresh one would — the tool set
+        // the interrupted turn was already working with.
+        Ok(self.prompt(String::new()).resume_from(store, record))
+    }
+
+    /// Resumes every interrupted turn, one at a time, and returns the IDs of
+    /// the ones that finished.
+    ///
+    /// This is what [`ResumePolicy::ResumeAuto`](crate::checkpoint::ResumePolicy::ResumeAuto)
+    /// runs in the background after launch; under
+    /// [`ResumeOnRequest`](crate::checkpoint::ResumePolicy::ResumeOnRequest)
+    /// the operator calls it — or [`ActonAI::resume_turn`] per turn — when ready.
+    /// A turn that fails to resume is logged and marked failed rather than
+    /// aborting the rest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error when checkpointing is not configured,
+    /// and a checkpoint error when the store cannot be listed.
+    pub async fn resume_interrupted(
+        &self,
+    ) -> Result<Vec<crate::types::CheckpointId>, ActonAIError> {
+        let mut resumed = Vec::new();
+        for record in self.interrupted_turns().await? {
+            let id = record.id.clone();
+            match self.resume_turn(record)?.collect().await {
+                Ok(_) => resumed.push(id),
+                Err(error) => {
+                    // The loop already marked the record failed on its way
+                    // out, so the turn stays visible for another attempt.
+                    tracing::warn!(checkpoint = %id, %error, "an interrupted turn did not resume");
+                }
+            }
+        }
+        Ok(resumed)
+    }
+
+    /// The checkpoint runtime, or the error telling the caller how to get one.
+    fn checkpoint_runtime(&self) -> Result<&CheckpointRuntime, ActonAIError> {
+        self.inner.checkpoint.as_ref().ok_or_else(|| {
+            ActonAIError::configuration(
+                "checkpoint",
+                "checkpointing is not configured; add a `[checkpoint]` section to your config \
+                 file or call ActonAIBuilder::checkpoint(..)",
+            )
         })
     }
 
@@ -1077,6 +1217,11 @@ pub struct ActonAIBuilder {
     audit: Option<crate::audit::AuditConfig>,
     /// The `[audit]` section, used only when the builder sets none.
     audit_file: Option<crate::config::AuditFileConfig>,
+    /// Checkpoint settings set programmatically with
+    /// [`checkpoint`](Self::checkpoint).
+    checkpoint: Option<crate::checkpoint::CheckpointConfig>,
+    /// The `[checkpoint]` section, used only when the builder sets none.
+    checkpoint_file: Option<crate::config::CheckpointFileConfig>,
     /// Whether `SIGTERM` should start a drain.
     drain_on_sigterm: bool,
 }
@@ -1614,6 +1759,32 @@ impl ActonAIBuilder {
         self.audit(crate::audit::AuditConfig::new(path))
     }
 
+    /// Checkpoints every turn into a database at the configured path, and
+    /// applies the configured [`ResumePolicy`](crate::checkpoint::ResumePolicy)
+    /// to interrupted turns found at launch.
+    ///
+    /// Replaces any `[checkpoint]` section wholesale, whether it is called
+    /// before or after [`from_config`](Self::from_config).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::checkpoint::{CheckpointConfig, ResumePolicy};
+    ///
+    /// let ai = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .checkpoint(
+    ///         CheckpointConfig::new("checkpoints.db").policy(ResumePolicy::ResumeOnRequest),
+    ///     )
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn checkpoint(mut self, config: crate::checkpoint::CheckpointConfig) -> Self {
+        self.checkpoint = Some(config);
+        self
+    }
+
     /// Listens for control commands on a socket at `path`.
     ///
     /// As [`introspection`](Self::introspection), but at an address chosen by
@@ -1821,6 +1992,10 @@ impl ActonAIBuilder {
 
         if let Some(audit) = config.audit {
             self.audit_file = Some(audit);
+        }
+
+        if let Some(checkpoint) = config.checkpoint {
+            self.checkpoint_file = Some(checkpoint);
         }
 
         // Stash `[context]` settings — resolved at launch after the default
@@ -2311,6 +2486,7 @@ impl ActonAIBuilder {
         // than silently dropping every entry.
         let tool_policy = self.resolve_tool_policy()?;
         let audit_config = self.resolve_audit()?;
+        let checkpoint_config = self.resolve_checkpoint();
 
         // Idempotent, and here for embedders who never run this crate's
         // `main`: a FIPS build must have its provider installed before the
@@ -2472,6 +2648,15 @@ impl ActonAIBuilder {
             None => None,
         };
 
+        // The checkpoint store, resolved builder-first like audit. Brought up
+        // before any prompt can run, so the turns a dead process left behind
+        // are settled under the configured policy ahead of new work — and so
+        // a runtime with no `[checkpoint]` section opens nothing at all.
+        let checkpoint = match checkpoint_config {
+            Some(config) => Some(launch_checkpoints(&mut runtime, &config).await?),
+            None => None,
+        };
+
         // Spawned after the accountant so the subscription is in place before
         // anything can broadcast. Only when a callback was actually
         // registered — an actor whose closure is `None` is pure overhead.
@@ -2537,7 +2722,7 @@ impl ActonAIBuilder {
             &default_provider_model,
         );
 
-        Ok(ActonAI {
+        let ai = ActonAI {
             inner: Arc::new(ActonAIInner {
                 runtime,
                 providers,
@@ -2559,9 +2744,33 @@ impl ActonAIBuilder {
                 tool_policy,
                 audit,
                 audit_config,
+                checkpoint,
                 is_shutdown: AtomicBool::new(false),
             }),
-        })
+        };
+
+        // Under `ResumeAuto`, the interrupted turns pick themselves back up
+        // in the background — launch itself stays fast and infallible on
+        // their account, and each turn that fails to resume is logged and
+        // marked failed rather than wedging the runtime.
+        if ai.inner.checkpoint.as_ref().is_some_and(|checkpoint| {
+            checkpoint.policy == crate::checkpoint::ResumePolicy::ResumeAuto
+        }) {
+            let handle = ai.clone();
+            tokio::spawn(async move {
+                match handle.resume_interrupted().await {
+                    Ok(resumed) if !resumed.is_empty() => {
+                        tracing::info!(count = resumed.len(), "resumed interrupted turns");
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, "could not resume interrupted turns");
+                    }
+                }
+            });
+        }
+
+        Ok(ai)
     }
 
     /// Resolves the effective introspection: builder first, then
@@ -2737,6 +2946,17 @@ impl ActonAIBuilder {
         Ok(resolved)
     }
 
+    /// Resolves the effective checkpoint settings: builder first, then
+    /// `[checkpoint]` TOML. `None` means the feature is off and nothing —
+    /// not even the store — comes to exist.
+    fn resolve_checkpoint(&mut self) -> Option<crate::checkpoint::CheckpointConfig> {
+        self.checkpoint.take().or_else(|| {
+            self.checkpoint_file
+                .as_ref()
+                .map(crate::config::CheckpointFileConfig::to_checkpoint)
+        })
+    }
+
     /// Resolves the default provider name from configuration.
     fn resolve_default_provider_name(&self) -> Result<String, ActonAIError> {
         // If explicitly set, validate it exists
@@ -2799,6 +3019,123 @@ impl ActonAIBuilder {
 ///   deliberate opt-out, which counts that usage as `$0`.
 ///
 /// Pure: everything it inspects is an argument.
+/// Brings the checkpoint store up and settles the turns a previous process
+/// left behind, according to the configured policy.
+///
+/// The listing doubles as the readiness barrier: the store's mailbox is FIFO,
+/// so an answered list proves the initialization ahead of it completed too.
+async fn launch_checkpoints(
+    runtime: &mut ActorRuntime,
+    config: &crate::checkpoint::CheckpointConfig,
+) -> Result<CheckpointRuntime, ActonAIError> {
+    use crate::checkpoint::ResumePolicy;
+
+    let store = crate::memory::MemoryStore::spawn(runtime).await;
+    store
+        .send(crate::memory::InitMemoryStore {
+            config: crate::memory::PersistenceConfig::new(&config.db_path),
+        })
+        .await;
+
+    // Initialization is two-phase: the handler opens the database in an
+    // attached future and mails the connection back to the actor. This first
+    // ask is only a barrier — its reply proves the handler ran to completion,
+    // which is what puts the connection message ahead of everything sent
+    // after this point. Its own answer may predate the connection, so it is
+    // deliberately not read; the listings below are the ones that must land.
+    let _barrier: crate::memory::CheckpointList = store
+        .ask(crate::memory::ListCheckpoints { status: None })
+        .await
+        .map_err(|e| {
+            ActonAIError::checkpoint_without_id(format!(
+                "the checkpoint store did not come up: {e}"
+            ))
+        })?;
+
+    let mut interrupted =
+        list_checkpoints_with_status(&store, crate::checkpoint::CheckpointStatus::InProgress)
+            .await?;
+    interrupted.extend(
+        list_checkpoints_with_status(&store, crate::checkpoint::CheckpointStatus::Failed).await?,
+    );
+
+    match config.policy {
+        // The default: close the books. Every interrupted turn is marked
+        // abandoned — a recorded outcome an operator can list later — and
+        // nothing runs, which is what makes enabling checkpoints safe by
+        // default.
+        ResumePolicy::Abandon => {
+            for record in interrupted {
+                let id = record.id.clone();
+                let saved: crate::memory::CheckpointSaved = store
+                    .ask(crate::memory::SaveCheckpoint {
+                        record: crate::checkpoint::abandon(record),
+                    })
+                    .await
+                    .map_err(|e| {
+                        ActonAIError::checkpoint(
+                            id.clone(),
+                            format!("the store did not answer the abandon write: {e}"),
+                        )
+                    })?;
+                saved.result.map_err(|e| {
+                    ActonAIError::checkpoint(
+                        id.clone(),
+                        format!("could not record the abandoned outcome: {e}"),
+                    )
+                })?;
+                tracing::info!(checkpoint = %id, "abandoned an interrupted turn by policy");
+            }
+        }
+        ResumePolicy::ResumeOnRequest => {
+            if !interrupted.is_empty() {
+                tracing::info!(
+                    count = interrupted.len(),
+                    "interrupted turns are waiting; list them with interrupted_turns() and \
+                     resume the ones worth finishing"
+                );
+            }
+        }
+        // The turns themselves are picked up after launch returns, from a
+        // background task holding the finished `ActonAI` handle — resuming
+        // needs the providers and tools, which do not exist yet here.
+        ResumePolicy::ResumeAuto => {
+            if !interrupted.is_empty() {
+                tracing::info!(
+                    count = interrupted.len(),
+                    "interrupted turns found; resuming them in the background"
+                );
+            }
+        }
+    }
+
+    Ok(CheckpointRuntime {
+        store,
+        policy: config.policy,
+    })
+}
+
+/// Lists the checkpoints in one status, through the store actor.
+async fn list_checkpoints_with_status(
+    store: &ActorHandle,
+    status: crate::checkpoint::CheckpointStatus,
+) -> Result<Vec<crate::checkpoint::CheckpointRecord>, ActonAIError> {
+    let listed: crate::memory::CheckpointList = store
+        .ask(crate::memory::ListCheckpoints {
+            status: Some(status),
+        })
+        .await
+        .map_err(|e| {
+            ActonAIError::checkpoint_without_id(format!(
+                "the store did not answer the checkpoint listing: {e}"
+            ))
+        })?;
+
+    listed.result.map_err(|e| {
+        ActonAIError::checkpoint_without_id(format!("could not list checkpoints: {e}"))
+    })
+}
+
 fn validate_budget_coverage(
     budget: &BudgetConfig,
     providers: &HashMap<String, ProviderConfig>,

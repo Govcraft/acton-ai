@@ -80,6 +80,10 @@ impl GrepTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            // A pure read (or pure computation): running it twice with the same
+            // arguments observes, never mutates, so checkpoint resume may safely
+            // re-run it after a crash left its first execution uncertain.
+            idempotent: true,
             name: "grep".to_string(),
             description: "Search file contents using regex patterns. Returns matching lines with optional context.".to_string(),
             input_schema: json!({

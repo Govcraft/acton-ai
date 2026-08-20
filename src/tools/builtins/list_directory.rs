@@ -58,6 +58,10 @@ impl ListDirectoryTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            // A pure read (or pure computation): running it twice with the same
+            // arguments observes, never mutates, so checkpoint resume may safely
+            // re-run it after a crash left its first execution uncertain.
+            idempotent: true,
             name: "list_directory".to_string(),
             description: "List directory contents with metadata (type, size, modified time)."
                 .to_string(),

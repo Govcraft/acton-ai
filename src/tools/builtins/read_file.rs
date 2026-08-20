@@ -65,6 +65,10 @@ impl ReadFileTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            // A pure read (or pure computation): running it twice with the same
+            // arguments observes, never mutates, so checkpoint resume may safely
+            // re-run it after a crash left its first execution uncertain.
+            idempotent: true,
             name: "read_file".to_string(),
             description: "Read file contents with optional line offset and limit. Returns content with line numbers.".to_string(),
             input_schema: json!({

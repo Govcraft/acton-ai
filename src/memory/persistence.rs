@@ -4,16 +4,19 @@
 //! connections as parameters and returning results. All functions are
 //! async and use libSQL for database access.
 
+use crate::checkpoint::{
+    decode_row, encode_record, CheckpointColumns, CheckpointRecord, CheckpointStatus,
+};
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
 use crate::messages::{Message, MessageRole};
-use crate::types::{AgentId, ConversationId, MemoryId, MessageId};
+use crate::types::{AgentId, CheckpointId, ConversationId, MemoryId, MessageId};
 use libsql::{Connection, Database};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// SQL statements for schema creation.
 const CREATE_SCHEMA: &str = r"
@@ -101,6 +104,29 @@ CREATE TABLE IF NOT EXISTS memory_tags (
 );
 
 CREATE INDEX IF NOT EXISTS idx_memory_tags_tag ON memory_tags(tag);
+
+CREATE TABLE IF NOT EXISTS turn_checkpoints (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT,
+    fingerprint TEXT NOT NULL,
+    format_version INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    rounds_completed INTEGER NOT NULL,
+    token_count INTEGER NOT NULL,
+    usage TEXT NOT NULL,
+    messages TEXT NOT NULL,
+    tool_calls TEXT NOT NULL,
+    final_text TEXT,
+    stop_reason TEXT,
+    structured_output TEXT,
+    pending_round TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_status ON turn_checkpoints(status);
+CREATE INDEX IF NOT EXISTS idx_turn_checkpoints_conversation
+    ON turn_checkpoints(conversation_id);
 ";
 
 /// Configuration for the persistence layer.
@@ -1397,6 +1423,208 @@ pub async fn find_memories_by_tag(
     }
 
     Ok(memories)
+}
+
+// =============================================================================
+// Turn checkpoints
+// =============================================================================
+
+/// Every column of `turn_checkpoints`, in the order the queries below select
+/// them. Named once so the SELECT list and the row parser cannot drift apart.
+const CHECKPOINT_COLUMNS: &str = "id, conversation_id, fingerprint, format_version, status, \
+                                  rounds_completed, token_count, usage, messages, tool_calls, \
+                                  final_text, stop_reason, structured_output, pending_round";
+
+/// Saves a checkpoint, replacing any earlier record under the same ID.
+///
+/// An upsert rather than an insert: a turn writes its checkpoint after every
+/// round, and the point of the record is the latest progress, not a history of
+/// it. `created_at` survives the update so the row still says when the turn
+/// first started.
+///
+/// # Errors
+///
+/// Returns an error if the record cannot be encoded or the write fails.
+pub async fn save_checkpoint(
+    conn: &Connection,
+    record: &CheckpointRecord,
+) -> Result<(), PersistenceError> {
+    let columns =
+        encode_record(record).map_err(|e| PersistenceError::serialization_failed(e.to_string()))?;
+
+    conn.execute(
+        "INSERT INTO turn_checkpoints
+             (id, conversation_id, fingerprint, format_version, status, rounds_completed,
+              token_count, usage, messages, tool_calls, final_text, stop_reason,
+              structured_output, pending_round)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+         ON CONFLICT(id) DO UPDATE SET
+             conversation_id = excluded.conversation_id,
+             fingerprint = excluded.fingerprint,
+             format_version = excluded.format_version,
+             status = excluded.status,
+             rounds_completed = excluded.rounds_completed,
+             token_count = excluded.token_count,
+             usage = excluded.usage,
+             messages = excluded.messages,
+             tool_calls = excluded.tool_calls,
+             final_text = excluded.final_text,
+             stop_reason = excluded.stop_reason,
+             structured_output = excluded.structured_output,
+             pending_round = excluded.pending_round,
+             updated_at = datetime('now')",
+        libsql::params![
+            columns.id,
+            columns.conversation_id,
+            columns.fingerprint,
+            columns.format_version,
+            columns.status,
+            columns.rounds_completed,
+            columns.token_count,
+            columns.usage,
+            columns.messages,
+            columns.tool_calls,
+            columns.final_text,
+            columns.stop_reason,
+            columns.structured_output,
+            columns.pending_round,
+        ],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("save_checkpoint", e.to_string()))?;
+
+    Ok(())
+}
+
+/// Loads a checkpoint by ID.
+///
+/// `Ok(None)` means no such checkpoint, which is the ordinary answer on a
+/// turn's first run and never an error.
+///
+/// # Errors
+///
+/// Returns an error if the query fails or a stored column will not decode.
+pub async fn load_checkpoint(
+    conn: &Connection,
+    id: &CheckpointId,
+) -> Result<Option<CheckpointRecord>, PersistenceError> {
+    let sql = format!("SELECT {CHECKPOINT_COLUMNS} FROM turn_checkpoints WHERE id = ?1");
+    let mut rows = conn
+        .query(&sql, [id.to_string()])
+        .await
+        .map_err(|e| PersistenceError::query_failed("load_checkpoint", e.to_string()))?;
+
+    let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("load_checkpoint", e.to_string()))?
+    else {
+        return Ok(None);
+    };
+
+    parse_checkpoint_row(&row).map(Some)
+}
+
+/// Lists checkpoints, newest first, optionally narrowed to one status.
+///
+/// # Errors
+///
+/// Returns an error if the query fails or a stored column will not decode.
+pub async fn list_checkpoints(
+    conn: &Connection,
+    status: Option<CheckpointStatus>,
+) -> Result<Vec<CheckpointRecord>, PersistenceError> {
+    let mut rows = match status {
+        Some(status) => {
+            let sql = format!(
+                "SELECT {CHECKPOINT_COLUMNS} FROM turn_checkpoints
+                 WHERE status = ?1 ORDER BY updated_at DESC, id DESC"
+            );
+            conn.query(&sql, [status.as_str().to_string()]).await
+        }
+        None => {
+            let sql = format!(
+                "SELECT {CHECKPOINT_COLUMNS} FROM turn_checkpoints
+                 ORDER BY updated_at DESC, id DESC"
+            );
+            conn.query(&sql, ()).await
+        }
+    }
+    .map_err(|e| PersistenceError::query_failed("list_checkpoints", e.to_string()))?;
+
+    let mut records = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::query_failed("list_checkpoints", e.to_string()))?
+    {
+        records.push(parse_checkpoint_row(&row)?);
+    }
+
+    Ok(records)
+}
+
+/// Deletes a checkpoint. Deleting one that is not there is not an error.
+///
+/// # Errors
+///
+/// Returns an error if the delete fails.
+pub async fn delete_checkpoint(
+    conn: &Connection,
+    id: &CheckpointId,
+) -> Result<(), PersistenceError> {
+    conn.execute(
+        "DELETE FROM turn_checkpoints WHERE id = ?1",
+        [id.to_string()],
+    )
+    .await
+    .map_err(|e| PersistenceError::query_failed("delete_checkpoint", e.to_string()))?;
+
+    Ok(())
+}
+
+/// Turns one `turn_checkpoints` row into a record.
+///
+/// Reading the columns is all this does; interpreting them is
+/// [`decode_row`]'s job, which is pure and tested without a database.
+fn parse_checkpoint_row(row: &libsql::Row) -> Result<CheckpointRecord, PersistenceError> {
+    let text = |index: i32| -> Result<String, PersistenceError> {
+        row.get::<String>(index)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))
+    };
+    let maybe_text = |index: i32| -> Result<Option<String>, PersistenceError> {
+        row.get::<Option<String>>(index)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))
+    };
+    let count = |index: i32| -> Result<u32, PersistenceError> {
+        let raw = row
+            .get::<i64>(index)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        u32::try_from(raw).map_err(|_| {
+            PersistenceError::deserialization_failed(format!(
+                "checkpoint column {index} holds {raw}, which is not a count"
+            ))
+        })
+    };
+
+    let columns = CheckpointColumns {
+        id: text(0)?,
+        conversation_id: maybe_text(1)?,
+        fingerprint: text(2)?,
+        format_version: count(3)?,
+        status: text(4)?,
+        rounds_completed: count(5)?,
+        token_count: count(6)?,
+        usage: text(7)?,
+        messages: text(8)?,
+        tool_calls: text(9)?,
+        final_text: maybe_text(10)?,
+        stop_reason: maybe_text(11)?,
+        structured_output: maybe_text(12)?,
+        pending_round: maybe_text(13)?,
+    };
+
+    decode_row(&columns).map_err(|e| PersistenceError::deserialization_failed(e.to_string()))
 }
 
 #[cfg(test)]

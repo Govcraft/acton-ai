@@ -339,6 +339,7 @@ fn test_stop_reason_variants() {
 #[test]
 fn test_tool_definition() {
     let tool = ToolDefinition {
+        idempotent: false,
         name: "calculator".to_string(),
         description: "Performs mathematical calculations".to_string(),
         input_schema: serde_json::json!({
@@ -416,6 +417,7 @@ async fn test_register_tool() {
 
     // Create a tool definition
     let tool_def = ToolDefinition {
+        idempotent: false,
         name: "echo".to_string(),
         description: "Echoes input back".to_string(),
         input_schema: serde_json::json!({
@@ -496,6 +498,7 @@ fn test_tool_error_validation_failed() {
 #[test]
 fn test_tool_config_builder() {
     let tool_def = ToolDefinition {
+        idempotent: false,
         name: "test".to_string(),
         description: "Test tool".to_string(),
         input_schema: serde_json::json!({"type": "object"}),

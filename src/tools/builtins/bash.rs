@@ -79,6 +79,7 @@ impl BashTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "bash".to_string(),
             description: "Use to execute a shell command and capture its output. Use for system operations, git commands, build tools, and anything else that requires a shell.".to_string(),
             input_schema: json!({

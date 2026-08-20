@@ -39,6 +39,11 @@
 //! ```
 
 use crate::accounting::{BudgetDecision, CheckBudget};
+use crate::checkpoint::{
+    plan_from_record, resolve_pending_call, CheckpointRecord, CheckpointSink, FinalAnswer,
+    PendingCallAction, PendingCallState, PendingRound, PendingToolCall, ResumePlan, RoundProgress,
+    TurnFingerprint, TurnInputs,
+};
 use crate::conversation::StreamToken;
 use crate::error::ActonAIError;
 use crate::extract::{
@@ -271,6 +276,19 @@ pub struct PromptBuilder {
     /// does, and an auditor reading the trail needs to be able to tell which
     /// calls belonged to the same exchange.
     conversation_id: Option<crate::types::ConversationId>,
+    /// Where this turn records its progress, and where a rerun looks for it.
+    ///
+    /// Empty unless [`PromptBuilder::checkpoint`] filled it in, and every call
+    /// on an empty sink is a no-op — a prompt that did not ask for
+    /// checkpointing pays nothing for the feature existing.
+    checkpoint: CheckpointSink,
+    /// A record handed over by [`ActonAI::resume_turn`](crate::ActonAI::resume_turn),
+    /// which the loop trusts in place of a fingerprint-checked lookup.
+    ///
+    /// The operator path holds only the record — the original inputs were
+    /// never stored — so the facade, not the fingerprint, is the authority
+    /// that it belongs to this turn. `None` on every other prompt.
+    resume_seed: Option<Box<CheckpointRecord>>,
 }
 
 impl PromptBuilder {
@@ -295,6 +313,8 @@ impl PromptBuilder {
             sampling: None,
             structured: None,
             conversation_id: None,
+            checkpoint: CheckpointSink::disabled(),
+            resume_seed: None,
         }
     }
 
@@ -471,6 +491,7 @@ impl PromptBuilder {
         Fut: Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
     {
         let definition = ToolDefinition {
+            idempotent: false,
             name: name.into(),
             description: description.into(),
             input_schema,
@@ -567,6 +588,7 @@ impl PromptBuilder {
         T: crate::tools::Tool,
     {
         let definition = ToolDefinition {
+            idempotent: false,
             name: tool.name().to_string(),
             description: tool.description().to_string(),
             input_schema: tool.input_schema(),
@@ -786,6 +808,63 @@ impl PromptBuilder {
     #[must_use]
     pub fn conversation_id(mut self, id: crate::types::ConversationId) -> Self {
         self.conversation_id = Some(id);
+        self
+    }
+
+    /// Makes this turn resumable, recording its progress under `id` through
+    /// the given [`MemoryStore`](crate::memory::MemoryStore) handle.
+    ///
+    /// The turn saves a checkpoint after every round that completes, so a
+    /// process that dies mid-turn leaves behind the conversation so far, the
+    /// rounds already spent, and the tools already executed. Running the same
+    /// prompt again with the same `id` picks up from there instead of
+    /// re-dispatching and re-executing everything; running it again after the
+    /// turn finished replays the stored answer without contacting a provider
+    /// at all.
+    ///
+    /// The `id` is the caller's to keep. Persist it alongside whatever work
+    /// the turn belongs to — a job row, a queue message — because a
+    /// `CheckpointId` that nobody wrote down is a checkpoint nobody can
+    /// resume.
+    ///
+    /// # What counts as the same turn
+    ///
+    /// A resume is refused, with
+    /// [`ActonAIErrorKind::Checkpoint`](crate::error::ActonAIErrorKind::Checkpoint),
+    /// when the prompt, system prompt, tool set, provider, or round ceiling
+    /// differ from the ones the checkpoint was written for. That is
+    /// deliberate: resuming a record written for a different question would
+    /// splice two turns together. Change any of those and start a new
+    /// checkpoint.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::types::CheckpointId;
+    ///
+    /// let id = CheckpointId::new();
+    /// let answer = runtime
+    ///     .prompt("Summarize every .rs file under src/")
+    ///     .use_builtins()
+    ///     .checkpoint(store.clone(), id.clone())
+    ///     .collect()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn checkpoint(mut self, store: ActorHandle, id: crate::types::CheckpointId) -> Self {
+        self.checkpoint = CheckpointSink::to_store(store, id);
+        self
+    }
+
+    /// Seeds this turn from a record the caller vouches for.
+    ///
+    /// Used by [`ActonAI::resume_turn`](crate::ActonAI::resume_turn): the record's own
+    /// messages are the turn, so the loop skips the fingerprint check and
+    /// picks up exactly where the record says the turn stopped. Progress
+    /// keeps being written under the record's own ID.
+    pub(crate) fn resume_from(mut self, store: ActorHandle, record: CheckpointRecord) -> Self {
+        self.checkpoint = CheckpointSink::to_store(store, record.id.clone());
+        self.resume_seed = Some(Box::new(record));
         self
     }
 
@@ -1056,8 +1135,24 @@ impl PromptBuilder {
         let turn =
             crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
 
+        // Cloned before the builder is consumed, so a turn that fails can be
+        // marked failed on the way out. The sink is a handle and an ID; the
+        // clone costs nothing and is empty when no checkpoint was configured.
+        let checkpoint = self.checkpoint.clone();
+
         let mut stats = TurnStats::default();
         let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
+
+        // A failed turn's record stays exactly as it was, so it is still
+        // resumable; only its status changes, which is what lets an operator
+        // list the turns that fell over separately from the ones still
+        // running. A failure to record that must not replace the error the
+        // caller actually needs to see.
+        if result.is_err() && checkpoint.is_enabled() {
+            if let Err(error) = checkpoint.mark_failed().await {
+                tracing::warn!(%error, "could not mark the turn's checkpoint failed");
+            }
+        }
 
         broker
             .broadcast(TurnLifecycle::TurnFinished { turn_id })
@@ -1101,6 +1196,8 @@ impl PromptBuilder {
             sampling,
             structured,
             conversation_id,
+            checkpoint,
+            resume_seed,
         } = self;
 
         // Resolve the provider handle
@@ -1179,6 +1276,164 @@ impl PromptBuilder {
         // Loop iterations, which is what `max_tool_rounds` bounds. Distinct
         // from `stats.rounds`, which counts dispatches that actually happened.
         let mut iteration = 0;
+
+        // Checkpoint state, resolved once. `checkpoint_inputs` is what decides
+        // whether a stored record describes *this* turn; the fingerprint
+        // derived from it is written onto every record below. Both are built
+        // even when no checkpoint is configured, because they cost a hash over
+        // strings the loop already holds and building them unconditionally
+        // keeps the branching flat.
+        let checkpoint_tool_names: Vec<String> = tool_definitions
+            .iter()
+            .map(|definition| definition.name.clone())
+            .collect();
+        let checkpoint_schema = structured
+            .as_ref()
+            .map(|spec| spec.tool_definition().input_schema.to_string());
+        let checkpoint_inputs = TurnInputs {
+            system_prompt: system_prompt.as_deref(),
+            user_content: &user_content,
+            tool_names: &checkpoint_tool_names,
+            provider: &billed_provider,
+            max_tool_rounds,
+            structured_schema: checkpoint_schema.as_deref(),
+        };
+        let checkpoint_fingerprint = TurnFingerprint::of(&checkpoint_inputs);
+
+        // The seed path is the operator's authority; the sink path is the
+        // fingerprint's. Exactly one of the two produces the plan.
+        let plan = match resume_seed {
+            Some(record) => plan_from_record(&record, max_tool_rounds)?,
+            None => checkpoint.plan(&checkpoint_inputs).await?,
+        };
+
+        // Whether this turn picked up an earlier attempt's work. Stamped onto
+        // every audit entry the turn writes, so a reader of the trail can
+        // tell first-run executions from post-crash ones.
+        let mut turn_resumed = false;
+        // The interrupted round to settle before anything is dispatched, when
+        // the previous attempt died between a round's tool calls.
+        let mut pending_settlement: Option<PendingRound> = None;
+
+        match plan {
+            ResumePlan::Start => {}
+            ResumePlan::Replay {
+                response,
+                structured_output,
+            } => {
+                // The turn already finished. Handing its answer straight back
+                // is the whole point of having saved it: re-running finished
+                // work must not cost a round, or a retry-on-restart loop pays
+                // for the same answer every time it comes up.
+                tracing::info!(
+                    checkpoint = %DisplayId(checkpoint.id()),
+                    "replaying a finished turn from its checkpoint",
+                );
+                return Ok((*response, structured_output));
+            }
+            ResumePlan::Resume {
+                messages: saved,
+                rounds_completed,
+                tool_calls,
+                token_count,
+                usage,
+                pending_round,
+            } => {
+                // `iteration` is seeded rather than reset, so the resumed turn
+                // runs under what is left of the original round budget instead
+                // of a fresh one.
+                tracing::info!(
+                    checkpoint = %DisplayId(checkpoint.id()),
+                    rounds_completed,
+                    "resuming a turn from its checkpoint",
+                );
+                messages = saved;
+                iteration = rounds_completed;
+                executed_tool_calls = tool_calls;
+                total_token_count = token_count;
+                stats.usage = usage;
+                turn_resumed = true;
+                pending_settlement = pending_round;
+            }
+        }
+
+        // Settle an interrupted round before the model hears anything. Each
+        // call the dead process left behind is resolved on the tool's own
+        // idempotency declaration: a finished result is reused, an unstarted
+        // call runs, a started idempotent call runs again, and a started
+        // non-idempotent call is NOT re-run — its uncertainty becomes the
+        // tool result the model reads.
+        if let Some(pending) = pending_settlement.take() {
+            let PendingRound {
+                assistant_text,
+                calls,
+            } = pending;
+            let settle_correlation_id = CorrelationId::new();
+            let mut results: Vec<String> = Vec::with_capacity(calls.len());
+            for entry in &calls {
+                let idempotent = tools.iter().any(|spec| {
+                    spec.definition.name == entry.call.name && spec.definition.idempotent
+                });
+                match resolve_pending_call(&entry.state, &entry.call.name, idempotent) {
+                    PendingCallAction::UseStored { result } => results.push(result),
+                    PendingCallAction::Uncertain { feedback } => {
+                        // The caller's record says the same thing the model
+                        // reads: the call was not run again, and why.
+                        executed_tool_calls.push(ExecutedToolCall::error(
+                            &entry.call.id,
+                            &entry.call.name,
+                            entry.call.arguments.clone(),
+                            feedback.clone(),
+                        ));
+                        results.push(feedback);
+                    }
+                    PendingCallAction::Execute => {
+                        let step = ToolStep {
+                            provider_handle: &provider_handle,
+                            turn,
+                            turn_id,
+                            correlation_id: &settle_correlation_id,
+                            conversation_id: conversation_id.as_ref(),
+                            policy: tool_policy.as_ref(),
+                            audit: audit.as_ref(),
+                            resumed: true,
+                        };
+                        let (outcome, executed) =
+                            step.run(&mut tools, &mut turn_counts, &entry.call).await;
+                        results.push(outcome.as_tool_result());
+                        executed_tool_calls.push(executed);
+                    }
+                }
+            }
+
+            // Close the round out in the conversation exactly as the loop
+            // below would have, had the first attempt survived it.
+            let raw_calls: Vec<ToolCall> = calls.into_iter().map(|entry| entry.call).collect();
+            messages.push(Message::assistant_with_tools(
+                assistant_text,
+                raw_calls.clone(),
+            ));
+            for (call, result) in raw_calls.iter().zip(results) {
+                messages.push(Message::tool(&call.id, result));
+            }
+
+            // And in the checkpoint: the settled round is a boundary now, so
+            // a second crash resumes past it rather than settling it twice.
+            checkpoint
+                .record_progress(
+                    conversation_id.as_ref(),
+                    &checkpoint_fingerprint,
+                    RoundProgress {
+                        rounds_completed: iteration,
+                        messages: messages.clone(),
+                        tool_calls: executed_tool_calls.clone(),
+                        token_count: total_token_count,
+                        usage: stats.usage,
+                        pending_round: None,
+                    },
+                )
+                .await?;
+        }
 
         // The providers this turn may dispatch to, in order, resolved once.
         // The first entry is always the caller's provider; the rest is its
@@ -1505,9 +1760,64 @@ impl PromptBuilder {
 
             match stop_reason {
                 StopReason::ToolUse if !tool_calls.is_empty() => {
+                    // The per-call ledger, kept only when this turn
+                    // checkpoints. Written before the first tool runs and
+                    // rewritten around every call — each write one upsert of
+                    // the whole record, so the ledger and the progress it
+                    // belongs to can never disagree. A process that dies
+                    // mid-round leaves behind exactly which calls finished,
+                    // which never began, and which are in doubt.
+                    let mut pending = checkpoint.is_enabled().then(|| PendingRound {
+                        assistant_text: text.clone(),
+                        calls: tool_calls
+                            .iter()
+                            .map(|call| PendingToolCall {
+                                call: call.clone(),
+                                state: PendingCallState::Pending,
+                            })
+                            .collect(),
+                    });
+                    if let Some(ref ledger) = pending {
+                        checkpoint
+                            .record_progress(
+                                conversation_id.as_ref(),
+                                &checkpoint_fingerprint,
+                                RoundProgress {
+                                    rounds_completed: iteration,
+                                    messages: messages.clone(),
+                                    tool_calls: executed_tool_calls.clone(),
+                                    token_count: total_token_count,
+                                    usage: stats.usage,
+                                    pending_round: Some(ledger.clone()),
+                                },
+                            )
+                            .await?;
+                    }
+
                     // Execute tools and continue
                     let mut tool_results = Vec::new();
-                    for tool_call in &tool_calls {
+                    for (index, tool_call) in tool_calls.iter().enumerate() {
+                        // `Started` lands before execution begins, so a crash
+                        // during the call is distinguishable from one before
+                        // it — the distinction the idempotency rules turn on.
+                        if let Some(ref mut ledger) = pending {
+                            ledger.calls[index].state = PendingCallState::Started;
+                            checkpoint
+                                .record_progress(
+                                    conversation_id.as_ref(),
+                                    &checkpoint_fingerprint,
+                                    RoundProgress {
+                                        rounds_completed: iteration,
+                                        messages: messages.clone(),
+                                        tool_calls: executed_tool_calls.clone(),
+                                        token_count: total_token_count,
+                                        usage: stats.usage,
+                                        pending_round: Some(ledger.clone()),
+                                    },
+                                )
+                                .await?;
+                        }
+
                         let step = ToolStep {
                             provider_handle: &provider_handle,
                             turn,
@@ -1516,12 +1826,34 @@ impl PromptBuilder {
                             conversation_id: conversation_id.as_ref(),
                             policy: tool_policy.as_ref(),
                             audit: audit.as_ref(),
+                            resumed: turn_resumed,
                         };
 
                         let (outcome, executed) =
                             step.run(&mut tools, &mut turn_counts, tool_call).await;
 
                         executed_tool_calls.push(executed);
+                        // `Completed` lands with the result in the same write,
+                        // so a resume can reuse it instead of running anything.
+                        if let Some(ref mut ledger) = pending {
+                            ledger.calls[index].state = PendingCallState::Completed {
+                                result: outcome.as_tool_result(),
+                            };
+                            checkpoint
+                                .record_progress(
+                                    conversation_id.as_ref(),
+                                    &checkpoint_fingerprint,
+                                    RoundProgress {
+                                        rounds_completed: iteration,
+                                        messages: messages.clone(),
+                                        tool_calls: executed_tool_calls.clone(),
+                                        token_count: total_token_count,
+                                        usage: stats.usage,
+                                        pending_round: Some(ledger.clone()),
+                                    },
+                                )
+                                .await?;
+                        }
                         tool_results.push(outcome);
                     }
 
@@ -1534,6 +1866,29 @@ impl PromptBuilder {
                     // and dressing it as a failure invites a retry.
                     for (tool_call, outcome) in tool_calls.iter().zip(tool_results.iter()) {
                         messages.push(Message::tool(&tool_call.id, outcome.as_tool_result()));
+                    }
+
+                    // The resumable point. `messages` is now exactly what the
+                    // next round would send, so a run that dies after this
+                    // write picks up here rather than re-executing the tools
+                    // above. Guarded on `is_enabled` because building the
+                    // progress clones the whole conversation, which an
+                    // uncheckpointed turn has no reason to pay for.
+                    if checkpoint.is_enabled() {
+                        checkpoint
+                            .record_progress(
+                                conversation_id.as_ref(),
+                                &checkpoint_fingerprint,
+                                RoundProgress {
+                                    rounds_completed: iteration,
+                                    messages: messages.clone(),
+                                    tool_calls: executed_tool_calls.clone(),
+                                    token_count: total_token_count,
+                                    usage: stats.usage,
+                                    pending_round: None,
+                                },
+                            )
+                            .await?;
                     }
                 }
                 // The round produced no answer and nothing left to execute:
@@ -1562,6 +1917,31 @@ impl PromptBuilder {
             }
         }
 
+        // One completion write covers both ways out of the loop — a recorded
+        // structured answer and an ordinary end of turn — so there is exactly
+        // one place a finished turn is marked finished.
+        if checkpoint.is_enabled() {
+            checkpoint
+                .record_completion(
+                    conversation_id.as_ref(),
+                    &checkpoint_fingerprint,
+                    RoundProgress {
+                        rounds_completed: iteration,
+                        messages,
+                        tool_calls: executed_tool_calls.clone(),
+                        token_count: total_token_count,
+                        usage: stats.usage,
+                        pending_round: None,
+                    },
+                    FinalAnswer {
+                        text: final_text.clone(),
+                        stop_reason: final_stop_reason,
+                        structured_output: captured.clone(),
+                    },
+                )
+                .await?;
+        }
+
         Ok((
             CollectedResponse::with_tool_calls(
                 final_text,
@@ -1572,6 +1952,22 @@ impl PromptBuilder {
             .with_usage(stats.usage),
             captured,
         ))
+    }
+}
+
+/// Renders an optional checkpoint ID for a tracing field.
+///
+/// A `None` prints as `-` rather than as `None`, so an operator grepping the
+/// logs of a mixed workload can tell an unconfigured turn from a configured
+/// one at a glance.
+struct DisplayId<'a>(Option<&'a crate::types::CheckpointId>);
+
+impl std::fmt::Display for DisplayId<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.0 {
+            Some(id) => write!(f, "{id}"),
+            None => f.write_str("-"),
+        }
     }
 }
 
@@ -1612,6 +2008,7 @@ fn outcome_for(error: &ActonAIError) -> &'static str {
         // spent. A team draining for a deploy needs these separable from real
         // errors, or a clean rollout looks like an incident.
         Kind::TurnsNotAdmitted { .. } => "turns_not_admitted",
+        Kind::Checkpoint { .. } => "checkpoint",
     }
 }
 
@@ -2039,6 +2436,12 @@ struct ToolStep<'a> {
     policy: Option<&'a crate::policy::ToolPolicy>,
     /// The audit log and its settings, when a trail is configured.
     audit: Option<&'a (ActorHandle, crate::audit::AuditConfig)>,
+    /// Whether the call runs inside a turn resumed from a checkpoint.
+    ///
+    /// Stamped onto the audit entry, so the trail distinguishes a first-run
+    /// execution from one performed by a restarted process picking up an
+    /// interrupted turn.
+    resumed: bool,
 }
 
 impl ToolStep<'_> {
@@ -2307,6 +2710,7 @@ impl ToolStep<'_> {
             outcome,
             decision,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            resumed: self.resumed,
         };
 
         handle
@@ -2457,6 +2861,7 @@ mod tests {
     fn tool_spec_debug_impl() {
         let spec = ToolSpec {
             definition: ToolDefinition {
+                idempotent: false,
                 name: "test".to_string(),
                 description: "Test tool".to_string(),
                 input_schema: serde_json::json!({}),
@@ -2475,6 +2880,7 @@ mod tests {
     fn tool_spec_clone() {
         let spec = ToolSpec {
             definition: ToolDefinition {
+                idempotent: false,
                 name: "test".to_string(),
                 description: "Test tool".to_string(),
                 input_schema: serde_json::json!({}),

@@ -188,6 +188,7 @@ async fn a_cap_refuses_the_tool_round_as_well_as_the_first_request() {
         .prompt("use the tool")
         .with_tool(
             ToolDefinition {
+                idempotent: false,
                 name: "echo".to_string(),
                 description: "Echoes its argument back.".to_string(),
                 input_schema: serde_json::json!({
