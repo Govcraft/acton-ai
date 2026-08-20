@@ -1819,6 +1819,27 @@ impl PromptBuilder {
                 }
             }
 
+            // The hard bound the gate above is not: compaction is
+            // best-effort and often absent entirely, and without this check
+            // the request goes out raw — one oversized tool result then
+            // costs the whole turn when the provider rejects the prompt.
+            // Applied only on overflow, so a fitting history is sent
+            // exactly as the round built it.
+            if let Some(window) = runtime.context_window() {
+                let estimated = window.estimate_total_tokens(&messages);
+                if estimated > window.available_tokens() {
+                    let fitted = window.fit_messages(&messages);
+                    tracing::warn!(
+                        estimated_tokens = estimated,
+                        available_tokens = window.available_tokens(),
+                        messages_before = messages.len(),
+                        messages_after = fitted.len(),
+                        "history exceeded the context window; truncated to fit"
+                    );
+                    messages = fitted;
+                }
+            }
+
             // Constrain the choice only while extracting. Plain `collect()`
             // keeps sending no `tool_choice` at all, so nothing changes for
             // callers who never ask for a typed answer.
