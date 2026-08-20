@@ -182,6 +182,8 @@ struct ChatCompletionChoice {
 /// Streaming chunk from OpenAI API.
 #[derive(Debug, Clone, Deserialize)]
 struct ChatCompletionChunk {
+    /// Compatible providers do not all send an id on every chunk.
+    #[serde(default)]
     id: String,
     /// Empty on the final usage chunk when `stream_options.include_usage` is
     /// set — the parser must tolerate that rather than index `choices[0]`.
@@ -509,6 +511,18 @@ impl OpenAIClient {
 
         if data == "[DONE]" {
             return None;
+        }
+
+        // A mid-stream failure arrives as an in-band `{"error": ...}`
+        // object, not an HTTP status — the headers were already 200 by the
+        // time the provider hit trouble. Checked before the chunk parse
+        // because the chunk's fields are all defaulted, so an error object
+        // would otherwise deserialize as an empty chunk and vanish.
+        if let Ok(api_error) = serde_json::from_str::<OpenAIErrorResponse>(data) {
+            return Some(Err(LLMError::stream_error(format!(
+                "provider reported an error mid-stream: {}",
+                api_error.error.message
+            ))));
         }
 
         Some(
@@ -861,6 +875,28 @@ impl LLMClient for OpenAIClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_sse_in_band_error_surfaces_the_provider_message() {
+        let line = r#"data: {"error":{"message":"Please try again","type":"internal_server_error","code":"service_unavailable"}}"#;
+        let error = OpenAIClient::parse_sse_line(line)
+            .expect("an error event is an event")
+            .expect_err("an error object must not parse as a chunk");
+        assert!(
+            error.to_string().contains("Please try again"),
+            "the provider's message must survive: {error}"
+        );
+    }
+
+    #[test]
+    fn parse_sse_chunk_without_id_still_parses() {
+        let line = r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        let chunk = OpenAIClient::parse_sse_line(line)
+            .expect("a chunk is an event")
+            .expect("an id-less chunk must parse");
+        assert!(chunk.id.is_empty());
+        assert_eq!(chunk.choices[0].delta.content.as_deref(), Some("hi"));
+    }
 
     fn tool_choice_body(choice: Option<&ToolChoice>) -> serde_json::Value {
         let request = ChatCompletionRequest {
