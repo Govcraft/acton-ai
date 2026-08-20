@@ -1163,7 +1163,25 @@ impl PromptBuilder {
     ///     .await?;
     /// ```
     #[must_use]
-    pub fn use_builtins(mut self) -> Self {
+    pub fn use_builtins(self) -> Self {
+        self.register_builtins(None)
+    }
+
+    /// Registers the configured built-in tools, confined to `root`.
+    ///
+    /// The same set [`use_builtins`](Self::use_builtins) registers, except
+    /// that every filesystem-capable one may touch `root` and nothing else —
+    /// not the process working directory, not the system temp directory. A
+    /// daemon serving one workspace per session scopes each prompt this way
+    /// so the session's boundary is the tools' boundary.
+    #[must_use]
+    pub fn use_builtins_in(self, root: &std::path::Path) -> Self {
+        self.register_builtins(Some(root))
+    }
+
+    /// The body of both: one registration path, so the confined and
+    /// unconfined forms cannot drift.
+    fn register_builtins(mut self, root: Option<&std::path::Path>) -> Self {
         if let Some(builtins) = self.runtime.builtins() {
             for (name, config) in builtins.configs() {
                 // `builtin_executor` owns the sandbox-or-in-process decision:
@@ -1171,7 +1189,11 @@ impl PromptBuilder {
                 // subprocess, and only when a sandbox factory exists. Going
                 // through the facade keeps this the same executor an
                 // embedder gets from `ActonAI::builtin_executor`.
-                if let Some(executor) = self.runtime.builtin_executor(name) {
+                let executor = match root {
+                    Some(root) => self.runtime.builtin_executor_in(name, root),
+                    None => self.runtime.builtin_executor(name),
+                };
+                if let Some(executor) = executor {
                     self.tools.push(ToolSpec {
                         definition: config.definition.clone(),
                         executor: Arc::new(executor),

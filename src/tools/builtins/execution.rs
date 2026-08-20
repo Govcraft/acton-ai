@@ -9,6 +9,7 @@
 //! applied, instead of choosing between "call the raw executor and lose the
 //! sandbox" and "re-implement the sandbox wiring".
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde_json::Value;
@@ -45,6 +46,11 @@ pub struct BuiltinExecutor {
     executor: Arc<BoxedToolExecutor>,
     /// The sandbox this tool's calls route through, when configured.
     sandbox: Option<SandboxedExecution>,
+    /// The directory this tool is confined to, for the sandboxed path.
+    ///
+    /// The in-process executor already carries its own root — it was built
+    /// with one — but the sandbox child is a fresh process and has to be told.
+    root: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for BuiltinExecutor {
@@ -52,6 +58,7 @@ impl std::fmt::Debug for BuiltinExecutor {
         f.debug_struct("BuiltinExecutor")
             .field("tool_name", &self.tool_name)
             .field("sandboxed", &self.sandbox.is_some())
+            .field("root", &self.root)
             .finish_non_exhaustive()
     }
 }
@@ -80,7 +87,26 @@ impl BuiltinExecutor {
             tool_name: tool_name.into(),
             executor,
             sandbox,
+            root: None,
         }
+    }
+
+    /// Confines this executor's sandboxed calls to `root`.
+    ///
+    /// Pair it with an executor built for the same root — which is what
+    /// [`ActonAI::builtin_executor_in`](crate::facade::ActonAI::builtin_executor_in)
+    /// does — so the in-process and sandboxed paths enforce one boundary
+    /// rather than two.
+    #[must_use]
+    pub fn in_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The directory this executor's calls are confined to, if any.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
     }
 
     /// The tool's registered name.
@@ -117,7 +143,8 @@ impl BuiltinExecutor {
             Some(sandbox) => {
                 let sandbox = sandbox.clone();
                 let tool_name = self.tool_name.clone();
-                Box::pin(async move { sandbox.execute(&tool_name, args).await })
+                let root = self.root.clone();
+                Box::pin(async move { sandbox.execute_in(root.as_deref(), &tool_name, args).await })
             }
             None => {
                 let executor = Arc::clone(&self.executor);

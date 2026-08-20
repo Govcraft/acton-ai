@@ -6,7 +6,7 @@
 //! the whole child process group so bash-spawned grandchildren are reaped
 //! along with the supervisor.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -119,6 +119,10 @@ impl ProcessSandbox {
 
 impl Sandbox for ProcessSandbox {
     fn execute(&self, code: &str, args: Value) -> SandboxExecutionFuture {
+        self.execute_in(None, code, args)
+    }
+
+    fn execute_in(&self, root: Option<&Path>, code: &str, args: Value) -> SandboxExecutionFuture {
         if self.destroyed.load(Ordering::Relaxed) {
             return Box::pin(async {
                 Err(ToolError::sandbox_error(
@@ -148,8 +152,20 @@ impl Sandbox for ProcessSandbox {
                 });
             }
         };
-        cmd.current_dir(tmp.path());
         cmd.env("TMPDIR", tmp.path());
+        // A confined call runs *in* its root: that is what the child's tools
+        // validate against, and on Linux it is also what landlock grants
+        // write access to. Unconfined, the child starts in the throwaway
+        // tempdir and can reach nothing else worth reaching.
+        match root {
+            Some(root) => {
+                cmd.current_dir(root);
+                cmd.env(env_vars::ROOT, root);
+            }
+            None => {
+                cmd.current_dir(tmp.path());
+            }
+        }
 
         Box::pin(async move {
             let mut child = cmd

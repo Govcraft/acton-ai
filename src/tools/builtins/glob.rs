@@ -10,13 +10,21 @@ use acton_reactive::prelude::*;
 use glob::glob as glob_match;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Glob pattern matching tool executor.
 ///
 /// Finds files matching a glob pattern like `**/*.rs`.
 #[derive(Debug, Default, Clone)]
-pub struct GlobTool;
+pub struct GlobTool {
+    /// The one directory this tool may touch, when it is confined to one.
+    ///
+    /// `None` keeps the historical behaviour: the process working directory
+    /// and the system temp directory. A host serving more than one workspace
+    /// sets this per workspace so the boundary is the workspace's, not the
+    /// daemon's.
+    root: Option<PathBuf>,
+}
 
 /// Glob tool actor state.
 ///
@@ -41,7 +49,25 @@ impl GlobTool {
     /// Creates a new glob tool.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Confines this tool to `root` and nothing else.
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The directory this tool is confined to, if any.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// The validator this tool's calls are checked against.
+    fn validator(&self) -> PathValidator {
+        super::scoped_validator(self.root.as_ref())
     }
 
     /// Returns the tool configuration for registration.
@@ -76,13 +102,16 @@ impl GlobTool {
 
 impl ToolExecutorTrait for GlobTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
+        // Built here, not inside the future: the block is `move` and
+        // does not capture `self`.
+        let validator = self.validator();
+        let root = self.root.clone();
         Box::pin(async move {
             let args: GlobArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::validation_failed("glob", format!("invalid arguments: {e}"))
             })?;
 
             // Determine and validate base path
-            let validator = PathValidator::new();
             let base_path = match &args.path {
                 Some(p) => {
                     let path = Path::new(p);
@@ -97,12 +126,18 @@ impl ToolExecutorTrait for GlobTool {
                         .validate_directory(path)
                         .map_err(|e| ToolError::validation_failed("glob", e.to_string()))?
                 }
-                None => std::env::current_dir().map_err(|e| {
-                    ToolError::execution_failed(
-                        "glob",
-                        format!("failed to get current directory: {e}"),
-                    )
-                })?,
+                // Unqualified, the search starts where the tool is
+                // confined; only an unconfined tool falls back to whatever
+                // directory the host process happens to be in.
+                None => match root {
+                    Some(root) => root,
+                    None => std::env::current_dir().map_err(|e| {
+                        ToolError::execution_failed(
+                            "glob",
+                            format!("failed to get current directory: {e}"),
+                        )
+                    })?,
+                },
             };
 
             // Construct the full pattern

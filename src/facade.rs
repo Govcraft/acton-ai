@@ -964,6 +964,48 @@ impl ActonAI {
         ))
     }
 
+    /// Returns the named builtin's execution path, confined to `root`.
+    ///
+    /// The same executor [`builtin_executor`](Self::builtin_executor) hands
+    /// out, except that every filesystem-capable builtin is built for exactly
+    /// one directory: `root` and nothing else. The process working directory
+    /// and the system temp directory — which the unconfined defaults allow —
+    /// are *not* reachable, which is the point for a host that serves more
+    /// than one workspace from one runtime and must not let a caller's tools
+    /// wander into the daemon's own files or a shared `/tmp`.
+    ///
+    /// The confinement holds on both paths: in-process the executor validates
+    /// against `root`, and a sandboxed tool carries `root` into the child, so
+    /// the two cannot enforce different boundaries.
+    ///
+    /// Tools with no filesystem reach (`calculate`, `web_fetch`, …) are
+    /// returned unchanged.
+    ///
+    /// `None` when builtins were not configured on this runtime, or the name
+    /// is not among them.
+    #[must_use]
+    pub fn builtin_executor_in(
+        &self,
+        name: &str,
+        root: &std::path::Path,
+    ) -> Option<crate::tools::builtins::BuiltinExecutor> {
+        let builtins = self.inner.builtins.as_ref()?;
+        let config = builtins.get_config(name)?;
+        let executor = match crate::tools::builtins::scoped_executor(name, root) {
+            Some(scoped) => Arc::new(scoped),
+            None => builtins.get_executor(name)?,
+        };
+        let sandbox = if config.sandboxed {
+            self.sandboxed_execution()
+        } else {
+            None
+        };
+        Some(
+            crate::tools::builtins::BuiltinExecutor::new(name, executor, sandbox)
+                .in_root(root.to_path_buf()),
+        )
+    }
+
     /// Returns the MCP tools discovered at launch, if any server is configured.
     ///
     /// `None` means no `[mcp_servers.*]` entry and no

@@ -130,8 +130,33 @@ impl SandboxedExecution {
     /// child breaches its wall-clock deadline or resource limits, or when the
     /// tool itself fails.
     pub async fn execute(&self, tool_name: &str, args: Value) -> Result<Value, ToolError> {
+        self.execute_in(None, tool_name, args).await
+    }
+
+    /// Runs one tool invocation confined to a single directory.
+    ///
+    /// `root` is the only directory the invocation may read or write: the
+    /// shipped [`ProcessSandbox`](super::ProcessSandbox) starts the child
+    /// there, hands it to the child's path validation, and — where landlock
+    /// is available — makes it the only writable path the kernel allows.
+    /// `None` is [`execute`](Self::execute).
+    ///
+    /// This is what makes one sandbox usable by a host serving several
+    /// workspaces: the boundary travels with the call instead of being fixed
+    /// when the sandbox was configured.
+    ///
+    /// # Errors
+    ///
+    /// As [`execute`](Self::execute), plus a [`ToolError`] when the
+    /// underlying sandbox cannot confine work to a directory at all.
+    pub async fn execute_in(
+        &self,
+        root: Option<&std::path::Path>,
+        tool_name: &str,
+        args: Value,
+    ) -> Result<Value, ToolError> {
         let mut sandbox = self.factory.create().await?;
-        let result = sandbox.execute(tool_name, args).await;
+        let result = sandbox.execute_in(root, tool_name, args).await;
         sandbox.destroy();
         result
     }

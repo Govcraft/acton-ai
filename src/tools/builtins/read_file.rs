@@ -9,14 +9,22 @@ use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Read file tool executor.
 ///
 /// Reads file contents with optional offset and limit,
 /// returning content with line numbers.
 #[derive(Debug, Default, Clone)]
-pub struct ReadFileTool;
+pub struct ReadFileTool {
+    /// The one directory this tool may touch, when it is confined to one.
+    ///
+    /// `None` keeps the historical behaviour: the process working directory
+    /// and the system temp directory. A host serving more than one workspace
+    /// sets this per workspace so the boundary is the workspace's, not the
+    /// daemon's.
+    root: Option<PathBuf>,
+}
 
 /// Read file tool actor state.
 ///
@@ -56,7 +64,25 @@ impl ReadFileTool {
     /// Creates a new read file tool.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Confines this tool to `root` and nothing else.
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The directory this tool is confined to, if any.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// The validator this tool's calls are checked against.
+    fn validator(&self) -> PathValidator {
+        super::scoped_validator(self.root.as_ref())
     }
 
     /// Returns the tool configuration for registration.
@@ -160,6 +186,9 @@ impl ReadFileTool {
 
 impl ToolExecutorTrait for ReadFileTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
+        // Built here, not inside the future: the block is `move` and
+        // does not capture `self`.
+        let validator = self.validator();
         Box::pin(async move {
             let args: ReadFileArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::validation_failed("read_file", format!("invalid arguments: {e}"))
@@ -175,8 +204,6 @@ impl ToolExecutorTrait for ReadFileTool {
                 ));
             }
 
-            // Validate path using PathValidator for security
-            let validator = PathValidator::new();
             let canonical_path = validator
                 .validate_file(path)
                 .map_err(|e| ToolError::validation_failed("read_file", e.to_string()))?;

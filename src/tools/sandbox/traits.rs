@@ -6,6 +6,7 @@ use crate::tools::error::ToolError;
 use serde_json::Value;
 use std::fmt::Debug;
 use std::future::Future;
+use std::path::Path;
 use std::pin::Pin;
 
 /// The result type for sandbox execution futures.
@@ -54,6 +55,38 @@ pub trait Sandbox: Send + Sync + Debug {
     ///
     /// Returns `ToolError::SandboxError` if execution fails within the sandbox.
     fn execute(&self, code: &str, args: Value) -> SandboxExecutionFuture;
+
+    /// Executes code confined to a single directory.
+    ///
+    /// `root` is the only directory the work may read or write. A host that
+    /// serves several workspaces from one process passes the caller's
+    /// workspace here, so the boundary belongs to the request rather than to
+    /// the daemon that happens to be running it.
+    ///
+    /// # Default implementation
+    ///
+    /// `None` delegates to [`execute`](Self::execute). A `Some` root fails,
+    /// because a sandbox that silently ignored the confinement it was handed
+    /// would report success while running the work unbounded. Implementations
+    /// that can honour a root override this.
+    ///
+    /// # Errors
+    ///
+    /// Returns `ToolError::SandboxError` if execution fails within the
+    /// sandbox, or if this sandbox cannot confine work to a directory.
+    fn execute_in(&self, root: Option<&Path>, code: &str, args: Value) -> SandboxExecutionFuture {
+        match root {
+            None => self.execute(code, args),
+            Some(root) => {
+                let root = root.display().to_string();
+                Box::pin(async move {
+                    Err(ToolError::sandbox_error(format!(
+                        "this sandbox cannot confine execution to '{root}'"
+                    )))
+                })
+            }
+        }
+    }
 
     /// Destroys the sandbox, releasing all resources.
     ///

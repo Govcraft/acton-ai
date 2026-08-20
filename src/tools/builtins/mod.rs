@@ -108,6 +108,7 @@ pub use skill_list::{ListSkillsTool, ListSkillsToolActor};
 
 use crate::messages::ToolDefinition;
 use crate::tools::actor::ToolActor;
+use crate::tools::security::PathValidator;
 use crate::tools::{BoxedToolExecutor, ToolConfig, ToolError, ToolErrorKind};
 use acton_reactive::prelude::*;
 use std::collections::HashMap;
@@ -123,6 +124,43 @@ pub struct BuiltinTools {
     configs: HashMap<String, ToolConfig>,
     /// Tool executors by name
     executors: HashMap<String, Arc<BoxedToolExecutor>>,
+}
+
+/// The path validator a builtin checks its arguments against.
+///
+/// One place decides what "confined" means, so six tools cannot drift into
+/// six different boundaries. Without a root the defaults stand — the process
+/// working directory plus the system temp directory — which is what a
+/// single-workspace CLI wants and what a multi-tenant daemon must not have.
+pub(crate) fn scoped_validator(root: Option<&std::path::PathBuf>) -> PathValidator {
+    root.map_or_else(PathValidator::new, |root| {
+        PathValidator::scoped(root.clone())
+    })
+}
+
+/// Builds a filesystem-capable builtin confined to `root`.
+///
+/// `None` means the named tool has no filesystem boundary to confine — a
+/// calculator does not gain safety from a directory — and the registry's
+/// shared executor is the right one to use.
+///
+/// Confinement is a construction-time property because
+/// [`ToolExecutorTrait::execute`](crate::tools::ToolExecutorTrait::execute)
+/// takes only arguments: there is nowhere to pass a per-call boundary, so a
+/// host serving several workspaces builds one executor per workspace.
+#[must_use]
+pub fn scoped_executor(name: &str, root: &std::path::Path) -> Option<BoxedToolExecutor> {
+    let root = root.to_path_buf();
+    match name {
+        "read_file" => Some(Box::new(ReadFileTool::new().with_root(root))),
+        "write_file" => Some(Box::new(WriteFileTool::new().with_root(root))),
+        "edit_file" => Some(Box::new(EditFileTool::new().with_root(root))),
+        "list_directory" => Some(Box::new(ListDirectoryTool::new().with_root(root))),
+        "glob" => Some(Box::new(GlobTool::new().with_root(root))),
+        "grep" => Some(Box::new(GrepTool::new().with_root(root))),
+        "bash" => Some(Box::new(BashTool::new().with_root(root))),
+        _ => None,
+    }
 }
 
 impl BuiltinTools {

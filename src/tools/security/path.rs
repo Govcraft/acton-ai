@@ -136,6 +136,23 @@ impl PathValidator {
         }
     }
 
+    /// Creates a validator confined to exactly one directory.
+    ///
+    /// Unlike [`new`](Self::new) this adds neither the process working
+    /// directory nor the system temp directory: the caller has named the
+    /// boundary and nothing else is implied by it. That distinction matters
+    /// for a multi-tenant host, where the daemon's own directory and a shared
+    /// `/tmp` are precisely the places a session must not reach.
+    ///
+    /// The default denied patterns (`..`, `.git`, `.env`) still apply.
+    #[must_use]
+    pub fn scoped(root: PathBuf) -> Self {
+        Self {
+            allowed_roots: vec![root],
+            denied_patterns: vec!["..".to_string(), ".git".to_string(), ".env".to_string()],
+        }
+    }
+
     /// Adds an allowed root directory.
     ///
     /// Paths must be within at least one allowed root to pass validation.

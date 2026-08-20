@@ -10,14 +10,22 @@ use acton_reactive::prelude::*;
 use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Grep content search tool executor.
 ///
 /// Searches file contents using regex patterns.
 #[derive(Debug, Default, Clone)]
-pub struct GrepTool;
+pub struct GrepTool {
+    /// The one directory this tool may touch, when it is confined to one.
+    ///
+    /// `None` keeps the historical behaviour: the process working directory
+    /// and the system temp directory. A host serving more than one workspace
+    /// sets this per workspace so the boundary is the workspace's, not the
+    /// daemon's.
+    root: Option<PathBuf>,
+}
 
 /// Grep tool actor state.
 ///
@@ -71,7 +79,25 @@ impl GrepTool {
     /// Creates a new grep tool.
     #[must_use]
     pub fn new() -> Self {
-        Self
+        Self::default()
+    }
+
+    /// Confines this tool to `root` and nothing else.
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The directory this tool is confined to, if any.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
+    /// The validator this tool's calls are checked against.
+    fn validator(&self) -> PathValidator {
+        super::scoped_validator(self.root.as_ref())
     }
 
     /// Returns the tool configuration for registration.
@@ -184,6 +210,10 @@ impl GrepTool {
 
 impl ToolExecutorTrait for GrepTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
+        // Built here, not inside the future: the block is `move` and
+        // does not capture `self`.
+        let validator = self.validator();
+        let root = self.root.clone();
         Box::pin(async move {
             let args: GrepArgs = serde_json::from_value(args).map_err(|e| {
                 ToolError::validation_failed("grep", format!("invalid arguments: {e}"))
@@ -201,7 +231,6 @@ impl ToolExecutorTrait for GrepTool {
             })?;
 
             // Determine and validate search path
-            let validator = PathValidator::new();
             let search_path = match &args.path {
                 Some(p) => {
                     let path = Path::new(p);
@@ -216,12 +245,18 @@ impl ToolExecutorTrait for GrepTool {
                         .validate(path)
                         .map_err(|e| ToolError::validation_failed("grep", e.to_string()))?
                 }
-                None => std::env::current_dir().map_err(|e| {
-                    ToolError::execution_failed(
-                        "grep",
-                        format!("failed to get current directory: {e}"),
-                    )
-                })?,
+                // Unqualified, the search starts where the tool is
+                // confined; only an unconfined tool falls back to whatever
+                // directory the host process happens to be in.
+                None => match root {
+                    Some(root) => root,
+                    None => std::env::current_dir().map_err(|e| {
+                        ToolError::execution_failed(
+                            "grep",
+                            format!("failed to get current directory: {e}"),
+                        )
+                    })?,
+                },
             };
 
             let context_lines = args.context_lines.unwrap_or(0).min(10);

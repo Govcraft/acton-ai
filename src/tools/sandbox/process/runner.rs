@@ -25,6 +25,7 @@
 //! without spawning a subprocess.
 
 use std::io::{self, BufWriter};
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use acton_reactive::prelude::tokio::runtime::Builder;
@@ -51,6 +52,11 @@ pub mod env_vars {
     pub const FSIZE_BYTES: &str = "ACTON_AI_SANDBOX_FSIZE_BYTES";
     /// Hardening mode: `"off"`, `"besteffort"`, or `"enforce"`.
     pub const HARDENING: &str = "ACTON_AI_SANDBOX_HARDENING";
+    /// The single directory the child's tools may read and write.
+    ///
+    /// Absent means unconfined, which for the child amounts to the
+    /// throwaway directory it was started in.
+    pub const ROOT: &str = "ACTON_AI_SANDBOX_ROOT";
 }
 
 /// Detours into the sandbox runner when this process was re-exec'd as a
@@ -89,20 +95,39 @@ pub fn run_if_sandbox_child() {
 /// to decide, before spawning a child, whether a name will resolve inside it.
 #[must_use]
 pub fn supports(tool_name: &str) -> bool {
-    sandbox_tool(tool_name).is_some()
+    sandbox_tool(tool_name, None).is_some()
 }
 
 /// The single source of truth for what the child can run.
 ///
 /// [`supports`] and [`dispatch_async`] both consult this, so the advertised
 /// set and the dispatched set cannot drift apart.
-fn sandbox_tool(tool_name: &str) -> Option<Box<dyn ToolExecutorTrait>> {
+///
+/// `root`, when the parent named one, is the only directory these tools may
+/// touch — the same boundary the caller's session is held to, carried across
+/// the process edge rather than re-derived from wherever the child landed.
+fn sandbox_tool(tool_name: &str, root: Option<&Path>) -> Option<Box<dyn ToolExecutorTrait>> {
+    let root = root.map(Path::to_path_buf);
     match tool_name {
-        "bash" => Some(Box::new(BashTool::new())),
-        "write_file" => Some(Box::new(WriteFileTool::new())),
-        "edit_file" => Some(Box::new(EditFileTool::new())),
+        "bash" => Some(Box::new(match root {
+            Some(root) => BashTool::new().with_root(root),
+            None => BashTool::new(),
+        }) as Box<dyn ToolExecutorTrait>),
+        "write_file" => Some(Box::new(match root {
+            Some(root) => WriteFileTool::new().with_root(root),
+            None => WriteFileTool::new(),
+        }) as Box<dyn ToolExecutorTrait>),
+        "edit_file" => Some(Box::new(match root {
+            Some(root) => EditFileTool::new().with_root(root),
+            None => EditFileTool::new(),
+        }) as Box<dyn ToolExecutorTrait>),
         _ => None,
     }
+}
+
+/// The directory the parent confined this child to, if any.
+fn root_from_env() -> Option<PathBuf> {
+    std::env::var_os(env_vars::ROOT).map(PathBuf::from)
 }
 
 /// Child entry point.
@@ -168,10 +193,11 @@ pub async fn dispatch_async(req: Request) -> Response {
         tool_name, args, ..
     } = req;
 
-    let result: Result<Value, ToolError> = match sandbox_tool(&tool_name) {
-        Some(tool) => tool.execute(args).await,
-        None => Err(ToolError::not_found(&tool_name)),
-    };
+    let result: Result<Value, ToolError> =
+        match sandbox_tool(&tool_name, root_from_env().as_deref()) {
+            Some(tool) => tool.execute(args).await,
+            None => Err(ToolError::not_found(&tool_name)),
+        };
 
     match result {
         Ok(value) => Response::ok(value),

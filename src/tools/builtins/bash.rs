@@ -8,7 +8,7 @@ use crate::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait
 use acton_reactive::prelude::*;
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -24,6 +24,11 @@ pub struct BashTool {
     default_timeout: u64,
     /// Maximum allowed timeout in seconds
     max_timeout: u64,
+    /// The directory commands run in, and may not leave.
+    ///
+    /// `None` runs them wherever the host process is, which is right for a
+    /// single-workspace CLI and wrong for a daemon serving several.
+    root: Option<PathBuf>,
 }
 
 /// Bash tool actor state.
@@ -37,6 +42,7 @@ impl Default for BashTool {
         Self {
             default_timeout: 120,
             max_timeout: 600,
+            root: None,
         }
     }
 }
@@ -64,12 +70,27 @@ impl BashTool {
         Self::default()
     }
 
+    /// Confines commands to `root`: they start there, and may not name a
+    /// working directory outside it.
+    #[must_use]
+    pub fn with_root(mut self, root: PathBuf) -> Self {
+        self.root = Some(root);
+        self
+    }
+
+    /// The directory commands are confined to, if any.
+    #[must_use]
+    pub fn root(&self) -> Option<&Path> {
+        self.root.as_deref()
+    }
+
     /// Creates a new bash tool with custom timeout settings.
     #[must_use]
     pub fn with_timeouts(default_timeout: u64, max_timeout: u64) -> Self {
         Self {
             default_timeout,
             max_timeout,
+            root: None,
         }
     }
 
@@ -129,6 +150,8 @@ impl ToolExecutorTrait for BashTool {
     fn execute(&self, args: Value) -> ToolExecutionFuture {
         let default_timeout = self.default_timeout;
         let max_timeout = self.max_timeout;
+        let root = self.root.clone();
+        let validator = super::scoped_validator(self.root.as_ref());
 
         Box::pin(async move {
             let args: BashArgs = serde_json::from_value(args).map_err(|e| {
@@ -146,28 +169,42 @@ impl ToolExecutorTrait for BashTool {
             // Validate and set timeout
             let timeout_secs = args.timeout.unwrap_or(default_timeout).min(max_timeout);
 
-            // Validate working directory if provided
-            if let Some(ref cwd) = args.cwd {
-                let path = Path::new(cwd);
-                if !path.is_absolute() {
-                    return Err(ToolError::validation_failed(
-                        "bash",
-                        "cwd must be an absolute path",
-                    ));
+            // Where the command runs. A confined tool starts in its root
+            // and checks any requested directory against it; an unconfined
+            // one keeps the older, looser checks.
+            let working_dir = match args.cwd.as_deref() {
+                Some(cwd) => {
+                    let path = Path::new(cwd);
+                    if !path.is_absolute() {
+                        return Err(ToolError::validation_failed(
+                            "bash",
+                            "cwd must be an absolute path",
+                        ));
+                    }
+                    if root.is_some() {
+                        Some(
+                            validator
+                                .validate_directory(path)
+                                .map_err(|e| ToolError::validation_failed("bash", e.to_string()))?,
+                        )
+                    } else {
+                        if !path.exists() {
+                            return Err(ToolError::execution_failed(
+                                "bash",
+                                format!("working directory does not exist: {cwd}"),
+                            ));
+                        }
+                        if !path.is_dir() {
+                            return Err(ToolError::execution_failed(
+                                "bash",
+                                format!("cwd is not a directory: {cwd}"),
+                            ));
+                        }
+                        Some(path.to_path_buf())
+                    }
                 }
-                if !path.exists() {
-                    return Err(ToolError::execution_failed(
-                        "bash",
-                        format!("working directory does not exist: {cwd}"),
-                    ));
-                }
-                if !path.is_dir() {
-                    return Err(ToolError::execution_failed(
-                        "bash",
-                        format!("cwd is not a directory: {cwd}"),
-                    ));
-                }
-            }
+                None => root,
+            };
 
             // Build the command
             let mut cmd = Command::new("bash");
@@ -177,8 +214,7 @@ impl ToolExecutorTrait for BashTool {
                 .stderr(Stdio::piped())
                 .stdin(Stdio::null());
 
-            // Set working directory if provided
-            if let Some(ref cwd) = args.cwd {
+            if let Some(ref cwd) = working_dir {
                 cmd.current_dir(cwd);
             }
 
