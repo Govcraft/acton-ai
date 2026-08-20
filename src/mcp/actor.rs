@@ -585,6 +585,7 @@ mod tests {
         DiscoveredTool {
             remote_name: remote.to_string(),
             definition: ToolDefinition {
+                idempotent: false,
                 name: prefixed_tool_name("fs", remote),
                 description: String::new(),
                 input_schema: json!({"type": "object"}),

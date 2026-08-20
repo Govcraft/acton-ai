@@ -333,6 +333,7 @@ impl WebFetchTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "web_fetch".to_string(),
             description:
                 "Fetch content from a URL. Supports GET and POST methods with custom headers."

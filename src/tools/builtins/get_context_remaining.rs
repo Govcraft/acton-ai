@@ -145,6 +145,10 @@ impl GetContextRemainingTool {
     #[must_use]
     pub fn config() -> ToolConfig {
         ToolConfig::new(ToolDefinition {
+            // Pure arithmetic over state the prompt loop injects at call
+            // time: re-running it after a crash observes, never mutates, so
+            // checkpoint resume may safely execute it again.
+            idempotent: true,
             name: GET_CONTEXT_REMAINING_TOOL.to_string(),
             description: "Report the conversation's context-window budget: total tokens, an \
                           estimate of tokens used by the current history, tokens remaining, and \

@@ -78,6 +78,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Define the calculator tool
     let calculator = ToolDefinition {
+        idempotent: false,
         name: "calculator".to_string(),
         description: "Evaluates mathematical expressions. Use this for any math calculations."
             .to_string(),
@@ -95,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
 
     // Define the time tool
     let get_time = ToolDefinition {
+        idempotent: false,
         name: "get_current_time".to_string(),
         description: "Returns the current UTC time.".to_string(),
         input_schema: serde_json::json!({

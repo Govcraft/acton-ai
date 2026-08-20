@@ -11,6 +11,7 @@
 //! - **MCP Client**: Consumes tools from external Model Context Protocol servers,
 //!   one supervised actor per connection (see [`mcp`])
 //! - **Memory Store**: Persistence via Turso/libSQL
+//! - **Checkpoints**: Resumable turns — see [`checkpoint`]
 //!
 //! ## Quick Start (High-Level API)
 //!
@@ -63,6 +64,7 @@
 pub mod accounting;
 pub mod agent;
 pub mod audit;
+pub mod checkpoint;
 pub mod cli;
 pub mod config;
 pub mod conversation;
@@ -131,6 +133,10 @@ pub mod prelude {
         ChainBreak, ChainBreakKind, ChainHead, InvocationRecord, Redactor, DEFAULT_REDACT_PATTERNS,
         GENESIS_HASH,
     };
+    pub use crate::checkpoint::{
+        CheckpointError, CheckpointErrorKind, CheckpointRecord, CheckpointSink, CheckpointStatus,
+        ResumePlan, TurnFingerprint, TurnInputs,
+    };
     pub use crate::config::{
         ActonAIConfig, ActonAIDefaults, AuditFileConfig, BudgetFileConfig,
         CircuitBreakerFileConfig, IntrospectionFileConfig, McpServerConfig, NamedProviderConfig,
@@ -168,12 +174,13 @@ pub mod prelude {
         LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
     };
     pub use crate::memory::{
-        AgentStateSnapshot, CompactionConfig, CompactionOutcome, CompactionRecord,
-        CompactionThreshold, ContextStats, ContextWindow, ContextWindowConfig, ContextWindowData,
-        ContextWindowResponse, Embedding, EmbeddingError, EmbeddingProvider, GetContextWindow,
-        InitMemoryStore, KeepRecentTurns, LoadMemories, MemoriesLoaded, Memory,
-        MemorySearchResults, MemoryStore, MemoryStoreMetrics, MemoryStoreMetricsSnapshot,
-        MemoryStored, OperationCompleted, PersistenceConfig, PersistenceError, ScoredMemory,
+        AgentStateSnapshot, CheckpointList, CheckpointLoaded, CheckpointSaved, CompactionConfig,
+        CompactionOutcome, CompactionRecord, CompactionThreshold, ContextStats, ContextWindow,
+        ContextWindowConfig, ContextWindowData, ContextWindowResponse, DeleteCheckpoint, Embedding,
+        EmbeddingError, EmbeddingProvider, GetContextWindow, InitMemoryStore, KeepRecentTurns,
+        ListCheckpoints, LoadCheckpoint, LoadMemories, MemoriesLoaded, Memory, MemorySearchResults,
+        MemoryStore, MemoryStoreMetrics, MemoryStoreMetricsSnapshot, MemoryStored,
+        OperationCompleted, PersistenceConfig, PersistenceError, SaveCheckpoint, ScoredMemory,
         SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
@@ -191,8 +198,8 @@ pub mod prelude {
     #[cfg(feature = "derive")]
     pub use crate::tool;
     pub use crate::types::{
-        AgentId, ConversationId, CorrelationId, InvalidTaskId, MemoryId, MessageId, TaskId,
-        ToolName, TurnId,
+        AgentId, CheckpointId, ConversationId, CorrelationId, InvalidTaskId, MemoryId, MessageId,
+        TaskId, ToolName, TurnId,
     };
 
     // Re-export acton-reactive prelude

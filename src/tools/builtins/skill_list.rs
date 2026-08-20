@@ -78,6 +78,7 @@ impl ListSkillsTool {
     #[must_use]
     pub fn config() -> ToolConfig {
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "list_skills".to_string(),
             description: "List available agent skills with their descriptions. Use this to discover what skills are available before activating one.".to_string(),
             input_schema: json!({

@@ -295,6 +295,21 @@ pub enum ActonAIErrorKind {
         /// What the gate was set to when the turn was refused.
         state: crate::introspection::AdmissionState,
     },
+    /// A turn's checkpoint could not be read, written, or resumed from.
+    ///
+    /// Raised by the prompt loop only when a checkpoint was configured. It
+    /// covers both the storage failures (the memory store did not answer, the
+    /// write was refused) and the planner's refusals (the turn's inputs
+    /// changed, the round budget is spent, the record came from another
+    /// build). A refused resume is deliberately an error rather than a silent
+    /// fresh start: discarding saved progress without saying so is the outcome
+    /// a checkpoint exists to prevent.
+    Checkpoint {
+        /// The checkpoint concerned, when one was named.
+        checkpoint_id: Option<crate::types::CheckpointId>,
+        /// What went wrong, already rendered.
+        reason: String,
+    },
 }
 
 /// One provider's turn in a failover chain, and how it ended.
@@ -459,6 +474,31 @@ impl ActonAIError {
         Self::new(ActonAIErrorKind::TurnsNotAdmitted { state })
     }
 
+    /// Creates a checkpoint error naming the checkpoint it concerns.
+    #[must_use]
+    pub fn checkpoint(id: crate::types::CheckpointId, reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::Checkpoint {
+            checkpoint_id: Some(id),
+            reason: reason.into(),
+        })
+    }
+
+    /// Creates a checkpoint error raised before any particular checkpoint was
+    /// identified.
+    #[must_use]
+    pub fn checkpoint_without_id(reason: impl Into<String>) -> Self {
+        Self::new(ActonAIErrorKind::Checkpoint {
+            checkpoint_id: None,
+            reason: reason.into(),
+        })
+    }
+
+    /// Returns true if this error concerns a turn checkpoint.
+    #[must_use]
+    pub fn is_checkpoint(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::Checkpoint { .. })
+    }
+
     /// Returns true if this error indicates a configuration problem.
     #[must_use]
     pub fn is_configuration(&self) -> bool {
@@ -566,6 +606,13 @@ impl fmt::Display for ActonAIError {
                      or ActonAI::resume() in-process",
                 )
             }
+            ActonAIErrorKind::Checkpoint {
+                checkpoint_id,
+                reason,
+            } => match checkpoint_id {
+                Some(id) => write!(f, "checkpoint {id}: {reason}"),
+                None => write!(f, "checkpoint: {reason}"),
+            },
             ActonAIErrorKind::AllProvidersFailed { attempts } => {
                 write!(
                     f,

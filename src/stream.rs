@@ -163,7 +163,12 @@ pub trait StreamHandler: Send + 'static {
 ///
 /// This captures all information about a tool invocation, including
 /// the arguments passed and the result returned.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable so a turn's executed calls survive in a
+/// [`CheckpointRecord`](crate::checkpoint::CheckpointRecord): a resumed turn
+/// has to hand back the tools it ran before the interruption as well as the
+/// ones it runs after, or the caller sees half a turn.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct ExecutedToolCall {
     /// The unique ID of the tool call (assigned by the LLM)
     pub id: String,

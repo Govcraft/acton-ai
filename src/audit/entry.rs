@@ -99,6 +99,12 @@ pub struct InvocationRecord {
     pub decision: AuditDecision,
     /// How long the call took, in milliseconds. Zero for a refused call.
     pub duration_ms: u64,
+    /// Whether the call ran inside a turn resumed from a checkpoint.
+    ///
+    /// `false` for every first-run call. A restarted process finishing an
+    /// interrupted turn stamps `true` on everything it executes, so the trail
+    /// shows which effects came from crash recovery.
+    pub resumed: bool,
 }
 
 /// One sealed, chained record of a tool invocation.
@@ -128,6 +134,13 @@ pub struct AuditEntry {
     pub decision: AuditDecision,
     /// How long the call took, in milliseconds.
     pub duration_ms: u64,
+    /// Whether the call ran inside a turn resumed from a checkpoint.
+    ///
+    /// Serialized only when `true`, so entries written before this field
+    /// existed — and every ordinary first-run entry since — keep the exact
+    /// bytes their hashes were computed over.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub resumed: bool,
     /// The hash of the entry before this one, or [`GENESIS_HASH`].
     pub prev_hash: String,
     /// This entry's hash, covering every field above.
@@ -151,7 +164,18 @@ struct HashPreimage<'a> {
     outcome: &'a AuditOutcome,
     decision: &'a AuditDecision,
     duration_ms: u64,
+    /// `Some(true)` only on a resumed call; skipped when absent. A field that
+    /// serialized `false` on every pre-existing entry would change their
+    /// pre-image bytes and break verification of every chain already written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resumed: Option<bool>,
     prev_hash: &'a str,
+}
+
+/// Whether a bool is `false`, for `skip_serializing_if` — which requires the
+/// reference-taking signature.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 /// Hashes a pre-image with BLAKE3, hex-encoded.
@@ -188,6 +212,7 @@ impl AuditEntry {
             outcome,
             decision,
             duration_ms,
+            resumed,
         } = record;
 
         let hash = hash_preimage(&HashPreimage {
@@ -201,6 +226,7 @@ impl AuditEntry {
             outcome: &outcome,
             decision: &decision,
             duration_ms,
+            resumed: resumed.then_some(true),
             prev_hash,
         });
 
@@ -215,6 +241,7 @@ impl AuditEntry {
             outcome,
             decision,
             duration_ms,
+            resumed,
             prev_hash: prev_hash.to_string(),
             hash,
         }
@@ -237,6 +264,7 @@ impl AuditEntry {
             outcome: &self.outcome,
             decision: &self.decision,
             duration_ms: self.duration_ms,
+            resumed: self.resumed.then_some(true),
             prev_hash: &self.prev_hash,
         })
     }
@@ -271,6 +299,7 @@ mod tests {
             },
             decision: AuditDecision::approved(Decider::NoPolicy),
             duration_ms: 5,
+            resumed: false,
         }
     }
 
@@ -341,6 +370,48 @@ mod tests {
             entry.hash,
             "the hash must survive serialization, or verification of a written file is meaningless"
         );
+    }
+
+    #[test]
+    fn a_first_run_entry_serializes_without_the_resumed_field() {
+        // The marker must not change the bytes of ordinary entries: every
+        // chain written before the field existed has to keep verifying.
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let line = entry.to_jsonl().unwrap();
+        assert!(!line.contains("resumed"), "{line}");
+
+        // A line written by a build that predates the field reads back and
+        // verifies, because absence and `false` are the same thing.
+        let parsed: AuditEntry = serde_json::from_str(&line).unwrap();
+        assert!(!parsed.resumed);
+        assert_eq!(parsed.recompute_hash(), entry.hash);
+    }
+
+    #[test]
+    fn a_resumed_entry_is_marked_and_hashes_differently() {
+        let plain = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let resumed = AuditEntry::seal(
+            InvocationRecord {
+                resumed: true,
+                correlation_id: plain.correlation_id.clone(),
+                turn_id: plain.turn_id.clone(),
+                ..record("bash")
+            },
+            1,
+            GENESIS_HASH,
+        );
+
+        assert!(resumed.resumed);
+        assert_ne!(
+            plain.hash, resumed.hash,
+            "the marker must be covered by the hash, or it could be stripped undetected"
+        );
+
+        let line = resumed.to_jsonl().unwrap();
+        assert!(line.contains("\"resumed\":true"), "{line}");
+        let parsed: AuditEntry = serde_json::from_str(&line).unwrap();
+        assert!(parsed.resumed);
+        assert_eq!(parsed.recompute_hash(), resumed.hash);
     }
 
     #[test]

@@ -62,6 +62,7 @@ impl ActivateSkillTool {
     #[must_use]
     pub fn config() -> ToolConfig {
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "activate_skill".to_string(),
             description: "Activate a skill and receive its full instructions. Call list_skills first to see available skills.".to_string(),
             input_schema: json!({

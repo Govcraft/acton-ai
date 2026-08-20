@@ -161,3 +161,15 @@ tokens_per_minute = 1000000
 # # Trailing turns kept verbatim, counted in whole exchanges: an assistant
 # # turn and the tool results answering it are ONE exchange, never split.
 # keep_recent_turns = 3
+
+# ---------------------------------------------------------------------------
+# Checkpoint and resume. Absent, nothing is recorded and a restart loses any
+# in-progress turn. With the section present every turn checkpoints its
+# progress, and `policy` decides what a restarted process does about turns a
+# dead one left behind: "abandon" (default) records the outcome and runs
+# nothing, "resume_on_request" waits for interrupted_turns()/resume_turn(),
+# "resume_auto" picks them back up in the background.
+# ---------------------------------------------------------------------------
+# [checkpoint]
+# db_path = "acton-ai-checkpoints.db"
+# policy = "abandon"

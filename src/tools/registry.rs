@@ -483,6 +483,7 @@ mod tests {
         // We can't easily test RegisteredTool without a real executor,
         // but we can test the ToolConfig part
         let def = ToolDefinition {
+            idempotent: false,
             name: "test".to_string(),
             description: "desc".to_string(),
             input_schema: serde_json::json!({"type": "object"}),

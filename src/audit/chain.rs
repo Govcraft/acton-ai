@@ -196,6 +196,7 @@ mod tests {
             },
             decision: AuditDecision::approved(Decider::NoPolicy),
             duration_ms: index,
+            resumed: false,
         }
     }
 

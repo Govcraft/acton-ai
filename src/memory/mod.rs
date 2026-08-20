@@ -99,6 +99,15 @@ pub use persistence::{
     create_memory_relation, find_memories_by_tag, get_related_memories, tag_memory, MemoryRelation,
 };
 
+// Re-export checkpoint persistence
+pub use persistence::{delete_checkpoint, list_checkpoints, load_checkpoint, save_checkpoint};
+
+// Re-export checkpoint store messages
+pub use store::{
+    CheckpointList, CheckpointLoaded, CheckpointSaved, DeleteCheckpoint, ListCheckpoints,
+    LoadCheckpoint, SaveCheckpoint,
+};
+
 // Re-export store types and messages
 pub use store::{
     // Agent state messages

@@ -200,6 +200,7 @@ impl std::fmt::Debug for ChatConfig {
 /// Creates the exit tool definition for conversation termination.
 fn exit_tool_definition() -> ToolDefinition {
     ToolDefinition {
+        idempotent: false,
         name: "exit_conversation".to_string(),
         description: "Call this tool when the user wants to end the conversation, \
                       say goodbye, or leave. Examples: 'bye', 'goodbye', 'I'm done', \

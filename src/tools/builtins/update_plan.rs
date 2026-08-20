@@ -54,6 +54,10 @@ impl UpdatePlanTool {
     #[must_use]
     pub fn config() -> ToolConfig {
         ToolConfig::new(ToolDefinition {
+            // Validate-and-echo over its own arguments: sending the same
+            // plan twice records the same plan, so checkpoint resume may
+            // safely re-run a call a crash left uncertain.
+            idempotent: true,
             name: UPDATE_PLAN_TOOL.to_string(),
             description: "Maintain a structured plan for the current task and show your \
                  progress through it. Use it only for genuinely multi-step work: skip \

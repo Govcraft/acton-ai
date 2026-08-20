@@ -48,6 +48,10 @@ impl CalculateTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            // A pure read (or pure computation): running it twice with the same
+            // arguments observes, never mutates, so checkpoint resume may safely
+            // re-run it after a crash left its first execution uncertain.
+            idempotent: true,
             name: "calculate".to_string(),
             description: "Evaluate mathematical expressions. Supports arithmetic (+, -, *, /, ^, %), comparison, and built-in functions (sin, cos, tan, log, abs, min, max, floor, ceil, round, etc.).".to_string(),
             input_schema: json!({

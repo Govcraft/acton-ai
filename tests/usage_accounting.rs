@@ -50,6 +50,7 @@ async fn runtime_from_toml(toml: &str, app_name: &str) -> ActonAI {
 /// requests and exercise cross-round usage summation.
 fn echo_tool() -> ToolDefinition {
     ToolDefinition {
+        idempotent: false,
         name: "echo".to_string(),
         description: "Echoes its argument back.".to_string(),
         input_schema: json!({

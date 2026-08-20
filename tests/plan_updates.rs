@@ -441,6 +441,7 @@ async fn a_different_tool_publishes_no_plan() {
     ai.prompt("Call the impostor.")
         .with_tool(
             ToolDefinition {
+                idempotent: false,
                 name: "impostor".to_string(),
                 description: "Returns something plan-shaped.".to_string(),
                 input_schema: json!({"type": "object", "properties": {}}),

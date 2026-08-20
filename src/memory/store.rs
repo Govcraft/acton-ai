@@ -18,12 +18,13 @@
 //! envelope back at the *receiving* actor unless the caller used `ask`, so a
 //! reply to a `send` goes nowhere.
 
+use crate::checkpoint::{CheckpointRecord, CheckpointStatus};
 use crate::memory::context::{ContextStats, ContextWindow, ContextWindowConfig};
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
 use crate::memory::persistence::{self, AgentStateSnapshot, PersistenceConfig};
 use crate::messages::Message;
-use crate::types::{AgentId, ConversationId, MemoryId, MessageId};
+use crate::types::{AgentId, CheckpointId, ConversationId, MemoryId, MessageId};
 use acton_reactive::prelude::*;
 use libsql::{Connection, Database};
 use std::future::Future;
@@ -328,6 +329,84 @@ impl Request for GetContextWindow {
     type Response = ContextWindowResponse;
 }
 
+// -----------------------------------------------------------------------------
+// Checkpoint Messages
+// -----------------------------------------------------------------------------
+
+/// Request to save a turn checkpoint, replacing any earlier one under the same
+/// ID.
+///
+/// Handled on a mutable handler so writes for one turn land in the order they
+/// were issued: the later checkpoint is the one that must survive, and
+/// overlapping writes could otherwise leave the earlier progress in place.
+#[acton_message]
+pub struct SaveCheckpoint {
+    /// The record to persist.
+    pub record: CheckpointRecord,
+}
+
+/// Reply to [`SaveCheckpoint`].
+#[acton_message]
+pub struct CheckpointSaved {
+    /// Whether the write landed, and why not if it did not.
+    pub result: Result<(), PersistenceError>,
+}
+
+impl Request for SaveCheckpoint {
+    type Response = CheckpointSaved;
+}
+
+/// Request to load a turn checkpoint by ID.
+#[acton_message]
+pub struct LoadCheckpoint {
+    /// The checkpoint to look up.
+    pub id: CheckpointId,
+}
+
+/// Reply to [`LoadCheckpoint`].
+#[acton_message]
+pub struct CheckpointLoaded {
+    /// The record, `None` when no checkpoint is stored under that ID, or why
+    /// the lookup failed.
+    pub result: Result<Option<CheckpointRecord>, PersistenceError>,
+}
+
+impl Request for LoadCheckpoint {
+    type Response = CheckpointLoaded;
+}
+
+/// Request to list stored checkpoints, newest first.
+#[acton_message]
+pub struct ListCheckpoints {
+    /// Narrow the listing to one status, or `None` for every checkpoint.
+    pub status: Option<CheckpointStatus>,
+}
+
+/// Reply to [`ListCheckpoints`].
+#[acton_message]
+pub struct CheckpointList {
+    /// The matching records, or why they could not be listed.
+    pub result: Result<Vec<CheckpointRecord>, PersistenceError>,
+}
+
+impl Request for ListCheckpoints {
+    type Response = CheckpointList;
+}
+
+/// Request to delete a turn checkpoint.
+///
+/// Deleting one that is not there succeeds: the caller wanted it gone, and it
+/// is gone.
+#[acton_message]
+pub struct DeleteCheckpoint {
+    /// The checkpoint to remove.
+    pub id: CheckpointId,
+}
+
+impl Request for DeleteCheckpoint {
+    type Response = OperationCompleted;
+}
+
 // =============================================================================
 // Metrics
 // =============================================================================
@@ -572,6 +651,99 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     configure_state_handlers(builder);
     configure_memory_write_handlers(builder);
     configure_memory_read_handlers(builder);
+    configure_checkpoint_write_handlers(builder);
+    configure_checkpoint_read_handlers(builder);
+}
+
+// -----------------------------------------------------------------------------
+// Checkpoint handlers
+//
+// Writes are `mutate_on` for the same reason conversation writes are: a turn
+// checkpoints after every round, and the newest record has to be the one left
+// standing. Reads are `act_on` and overlap freely.
+// -----------------------------------------------------------------------------
+
+/// Configures the checkpoint handlers that write.
+fn configure_checkpoint_write_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.mutate_on::<SaveCheckpoint>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let record = envelope.message().record.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, CheckpointSaved { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::save_checkpoint(&conn, &record).await;
+            log_failure("save_checkpoint", &result);
+            reply.send(CheckpointSaved { result }).await;
+        })
+    });
+
+    builder.mutate_on::<DeleteCheckpoint>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let id = envelope.message().id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => {
+                return reply_now(
+                    reply,
+                    OperationCompleted {
+                        operation: "delete_checkpoint",
+                        result: Err(e),
+                    },
+                );
+            }
+        };
+
+        attached(async move {
+            let result = persistence::delete_checkpoint(&conn, &id).await;
+            log_failure("delete_checkpoint", &result);
+            reply
+                .send(OperationCompleted {
+                    operation: "delete_checkpoint",
+                    result,
+                })
+                .await;
+        })
+    });
+}
+
+/// Configures the checkpoint handlers that only read.
+fn configure_checkpoint_read_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.act_on::<LoadCheckpoint>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let id = envelope.message().id.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, CheckpointLoaded { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::load_checkpoint(&conn, &id).await;
+            log_failure("load_checkpoint", &result);
+            reply.send(CheckpointLoaded { result }).await;
+        })
+    });
+
+    builder.act_on::<ListCheckpoints>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let status = envelope.message().status;
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, CheckpointList { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::list_checkpoints(&conn, status).await;
+            log_failure("list_checkpoints", &result);
+            reply.send(CheckpointList { result }).await;
+        })
+    });
 }
 
 /// Configures the initialization handler.

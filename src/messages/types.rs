@@ -770,6 +770,29 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for the tool's input parameters
     pub input_schema: serde_json::Value,
+    /// Whether re-running a completed invocation with the same arguments is
+    /// safe.
+    ///
+    /// Checkpoint resume consults this after a crash: a tool that *may* have
+    /// run before the process died is only re-executed when it declares
+    /// itself idempotent (`read_file` trivially is; `bash` never is by
+    /// default). The declaration is metadata for the loop, not for the model
+    /// — providers never see it on the wire.
+    ///
+    /// Defaults to `false`: a tool that says nothing is assumed to have side
+    /// effects, because the cost of wrongly re-running one is a double
+    /// execution the checkpoint exists to prevent.
+    #[serde(default)]
+    pub idempotent: bool,
+}
+
+impl ToolDefinition {
+    /// Declares this tool safe to re-run after an uncertain first execution.
+    #[must_use]
+    pub fn idempotent(mut self) -> Self {
+        self.idempotent = true;
+        self
+    }
 }
 
 /// A tool call requested by the LLM.
@@ -1080,6 +1103,7 @@ mod tests {
     #[test]
     fn tool_definition_serialization() {
         let tool = ToolDefinition {
+            idempotent: false,
             name: "calculator".to_string(),
             description: "Performs basic arithmetic".to_string(),
             input_schema: serde_json::json!({
@@ -1196,6 +1220,7 @@ mod tests {
     #[test]
     fn llm_request_builder_with_tools() {
         let tool = ToolDefinition {
+            idempotent: false,
             name: "calculator".to_string(),
             description: "Math".to_string(),
             input_schema: serde_json::json!({}),
@@ -1215,11 +1240,13 @@ mod tests {
     fn llm_request_builder_with_multiple_tools() {
         let tools = vec![
             ToolDefinition {
+                idempotent: false,
                 name: "calc".to_string(),
                 description: "Math".to_string(),
                 input_schema: serde_json::json!({}),
             },
             ToolDefinition {
+                idempotent: false,
                 name: "search".to_string(),
                 description: "Search".to_string(),
                 input_schema: serde_json::json!({}),

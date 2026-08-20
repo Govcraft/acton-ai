@@ -71,6 +71,7 @@ pub fn prefixed_tool_name(server: &str, tool: &str) -> String {
 #[must_use]
 pub fn tool_definition(server: &str, tool: &RmcpTool) -> ToolDefinition {
     ToolDefinition {
+        idempotent: false,
         name: prefixed_tool_name(server, &tool.name),
         description: tool
             .description

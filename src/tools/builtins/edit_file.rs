@@ -50,6 +50,7 @@ impl EditFileTool {
         use crate::messages::ToolDefinition;
 
         ToolConfig::new(ToolDefinition {
+            idempotent: false,
             name: "edit_file".to_string(),
             description: "Make targeted string replacements in a file. The old_string must be found exactly once unless replace_all is true.".to_string(),
             input_schema: json!({

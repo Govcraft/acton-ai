@@ -20,6 +20,7 @@ use std::path::Path;
 /// A tool the scripted rounds can call.
 fn tool_definition(name: &str) -> ToolDefinition {
     ToolDefinition {
+        idempotent: false,
         name: name.to_string(),
         description: "Echoes its argument back.".to_string(),
         input_schema: json!({
