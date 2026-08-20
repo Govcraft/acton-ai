@@ -126,9 +126,10 @@ mod tests {
     #[test]
     fn crlf_terminators_are_stripped() {
         let mut assembler = LineAssembler::default();
-        assert_eq!(assembler.push(b"data: a\r\ndata: b\r\n"), vec![
-            "data: a", "data: b"
-        ]);
+        assert_eq!(
+            assembler.push(b"data: a\r\ndata: b\r\n"),
+            vec!["data: a", "data: b"]
+        );
     }
 
     #[test]

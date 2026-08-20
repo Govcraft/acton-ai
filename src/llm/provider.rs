@@ -531,6 +531,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                         stop_reason: StopReason::Error,
                         usage: Usage::default(),
                         model,
+                        // A refusal is deliberate — an open circuit or a
+                        // full queue — so an immediate re-dispatch would be
+                        // refused identically.
+                        transient_error: None,
                     })
                     .await;
             })
@@ -636,6 +640,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, LLMProvider>) {
                     // A request that never reached the API spent nothing.
                     usage: Usage::default(),
                     model,
+                    // The provider already retried this request to its
+                    // configured limit before dropping it; another loop of
+                    // retries on top would just extend the same rate limit.
+                    transient_error: None,
                 })
                 .await;
         })
@@ -972,6 +980,20 @@ struct DispatchContext {
     pending_event: Option<FailoverEvent>,
 }
 
+/// Whether an in-band stream error event names a failure worth re-running.
+///
+/// These are wire error types (Anthropic's `error` stream event carries
+/// them): overload, rate limiting, timeouts, and the provider's own internal
+/// errors clear on their own, while anything else — an invalid request, bad
+/// credentials, a too-large prompt — will fail identically on every retry
+/// and is deliberately left out.
+fn in_band_error_is_transient(error_type: &str) -> bool {
+    matches!(
+        error_type,
+        "overloaded_error" | "api_error" | "rate_limit_error" | "timeout_error"
+    )
+}
+
 /// Processes a streaming request using the unified LLMClient trait.
 async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) {
     let correlation_id = &request.correlation_id;
@@ -1009,6 +1031,10 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
             let mut tool_calls = Vec::new();
             let mut stop_reason = StopReason::EndTurn;
             let mut usage = Usage::default();
+            // Carries the failure out of the event loop's two error arms so
+            // the terminal broadcast can say whether re-dispatching the
+            // round is worth anything.
+            let mut transient_error: Option<String> = None;
 
             // Taken once per round and cleared by the first token, which is
             // what keeps a long stream from re-recording on every chunk.
@@ -1068,6 +1094,9 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                                     message = %message,
                                     "Stream error"
                                 );
+                                if in_band_error_is_transient(&error_type) {
+                                    transient_error = Some(format!("{error_type}: {message}"));
+                                }
                                 stop_reason = StopReason::Error;
                                 break;
                             }
@@ -1086,6 +1115,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                         // truncated answer with no error, the history would
                         // record it as final, and — because the round looked
                         // successful — no failover would be attempted.
+                        transient_error = e.is_transient().then(|| e.to_string());
                         stop_reason = StopReason::Error;
                         break;
                     }
@@ -1104,6 +1134,7 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                     stop_reason,
                     usage,
                     model: ctx.model.clone(),
+                    transient_error,
                 })
                 .await;
 
@@ -1148,6 +1179,14 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
                         stop_reason: StopReason::Error,
                         usage: Usage::default(),
                         model: ctx.model.clone(),
+                        // Deliberately not marked transient even when the
+                        // failure is: nothing streamed yet, so this failure
+                        // class already has owners — the provider's own
+                        // retry machinery for anything with a retry-after,
+                        // the circuit breaker, and the failover chain. The
+                        // caller-side re-dispatch exists only for streams
+                        // that died after they started.
+                        transient_error: None,
                     })
                     .await;
             }

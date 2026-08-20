@@ -288,6 +288,7 @@ fn test_streaming_messages() {
         correlation_id: corr_id.clone(),
         stop_reason: StopReason::EndTurn,
         model: "mock-model".to_string(),
+        transient_error: None,
     };
     assert_eq!(end.stop_reason, StopReason::EndTurn);
     assert_eq!(

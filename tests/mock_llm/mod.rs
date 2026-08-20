@@ -87,6 +87,10 @@ pub struct Round {
     tool_calls: Vec<ScriptedToolCall>,
     usage: Option<ScriptedUsage>,
     failure: Option<ScriptedFailure>,
+    /// An in-band `data: {"error": …}` event that kills the stream after
+    /// any scripted text, standing in for a provider whose 200 response
+    /// dies mid-flight.
+    mid_stream_error: Option<String>,
 }
 
 impl Round {
@@ -117,6 +121,20 @@ impl Round {
                 status: 500,
                 retry_after_secs: None,
             }),
+            ..Self::default()
+        }
+    }
+
+    /// A round that starts streaming, emits its text, then dies with an
+    /// in-band `data: {"error": …}` event instead of finishing.
+    ///
+    /// This is what a hosted provider's mid-stream failure actually looks
+    /// like on the wire: the HTTP status was already 200 when the stream
+    /// broke, so the only place the error can go is into the stream itself.
+    pub fn mid_stream_error(text: &str, message: &str) -> Self {
+        Self {
+            text: Some(text.to_string()),
+            mid_stream_error: Some(message.to_string()),
             ..Self::default()
         }
     }
@@ -211,6 +229,20 @@ impl Round {
                     }]},
                 }],
             }));
+        }
+
+        // A stream that dies mid-flight never reaches a finish chunk or
+        // the `[DONE]` sentinel — the error event is the last thing sent.
+        if let Some(ref message) = self.mid_stream_error {
+            body.push_str("data: ");
+            body.push_str(
+                &serde_json::to_string(&json!({
+                    "error": {"message": message, "type": "internal_server_error"},
+                }))
+                .expect("error event must serialize"),
+            );
+            body.push_str("\n\n");
+            return body;
         }
 
         let finish_reason = if self.tool_calls.is_empty() {
@@ -467,6 +499,43 @@ fn scripted_rounds_render_the_wire_shape_the_client_parses() {
         plain.ends_with("data: [DONE]\n\n"),
         "the stream must terminate"
     );
+}
+
+/// Pins the shape of a stream that dies mid-flight.
+///
+/// The whole point of [`Round::mid_stream_error`] is what it does NOT send:
+/// no finish chunk, no `[DONE]` sentinel — the in-band error event is the
+/// last thing on the wire, exactly as a hosted provider's dropped stream
+/// looks after the 200 headers have already gone out.
+#[test]
+fn a_mid_stream_error_round_dies_without_finishing() {
+    let body = Round::mid_stream_error("partial ", "connection reset").to_sse();
+
+    assert!(body.contains(r#""content":"partial ""#), "{body}");
+    assert!(
+        body.contains(r#""message":"connection reset""#),
+        "the error event must carry the scripted message: {body}"
+    );
+    assert!(
+        !body.contains("[DONE]") && !body.contains("finish_reason"),
+        "a dying stream must never look finished: {body}"
+    );
+}
+
+/// Keeps the bare tool-call constructor and the request-inspection helpers
+/// exercised in every binary, per this module's own compile-per-suite rule.
+#[test]
+fn request_helpers_pick_tools_out_of_a_captured_body() {
+    let body = Round::tool_call("call_9", "echo", json!({"value": "hi"})).to_sse();
+    assert!(body.contains(r#""finish_reason":"tool_calls""#), "{body}");
+
+    let request = json!({"tools": [
+        {"type": "function", "function": {"name": "echo", "parameters": {"type": "object"}}},
+    ]});
+    assert!(tool_named(&request, "echo").is_some());
+    assert!(tool_named(&request, "missing").is_none());
+    assert!(!contains_ref(&request));
+    assert!(contains_ref(&json!({"schema": {"$ref": "#/defs/x"}})));
 }
 
 /// Pins the TOML this harness renders, and that it round-trips through the

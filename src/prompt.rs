@@ -78,6 +78,16 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 /// that forces the `structured_output` call.
 const STRUCTURED_OUTPUT_NUDGE: &str = "Record your final answer now by calling structured_output.";
 
+/// How many times one candidate's round is re-dispatched after a transient
+/// failure before the failure stands — three requests per candidate at most.
+const MAX_STREAM_RETRIES: u32 = 2;
+
+/// Base delay before a transient-failure re-dispatch; grows linearly with
+/// the attempt number. Short on purpose: the provider's own retry machinery
+/// already absorbed anything with a server-stated retry-after, so what lands
+/// here is a dropped connection that a fresh request usually clears.
+const STREAM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Type alias for start callbacks.
 ///
 /// The [`StreamContext`] names the turn and the round that is starting, so a
@@ -1896,148 +1906,175 @@ impl PromptBuilder {
                         }
                     }
 
-                    // Generate new IDs for this dispatch. A second candidate
-                    // is a second request, so it gets its own correlation ID
-                    // rather than reusing the failed one's.
-                    let correlation_id = CorrelationId::new();
-                    let agent_id = AgentId::new();
-                    // Kept for the round span, which is opened after the
-                    // request has taken ownership of the original.
-                    let round_agent_id = agent_id.to_string();
+                    // A transiently failed round is re-dispatched from
+                    // scratch below. The counter is per-candidate, so a
+                    // failover onto the next provider starts fresh.
+                    let mut stream_retries: u32 = 0;
+                    let (round_correlation_id, round) = loop {
+                        // Generate new IDs for this dispatch. A second candidate
+                        // is a second request, so it gets its own correlation ID
+                        // rather than reusing the failed one's.
+                        let correlation_id = CorrelationId::new();
+                        let agent_id = AgentId::new();
+                        // Kept for the round span, which is opened after the
+                        // request has taken ownership of the original.
+                        let round_agent_id = agent_id.to_string();
 
-                    let request = LLMRequest {
-                        correlation_id: correlation_id.clone(),
-                        agent_id,
-                        messages: messages.clone(),
-                        tools: if has_tools {
-                            Some(tool_definitions.clone())
-                        } else {
-                            None
-                        },
-                        sampling: sampling.clone(),
-                        tool_choice: tool_choice.clone(),
-                    };
+                        let request = LLMRequest {
+                            correlation_id: correlation_id.clone(),
+                            agent_id,
+                            messages: messages.clone(),
+                            tools: if has_tools {
+                                Some(tool_definitions.clone())
+                            } else {
+                                None
+                            },
+                            sampling: sampling.clone(),
+                            tool_choice: tool_choice.clone(),
+                        };
 
-                    // Collect stream response — reuses the caller-owned
-                    // collector. Keep a clone so we can tag tool-result
-                    // broadcasts with the round's correlation ID further down.
-                    let round_correlation_id = correlation_id.clone();
-                    let round_callbacks = StreamRoundCallbacks {
-                        context: Some(StreamContext::new(
-                            turn_id.clone(),
-                            round_correlation_id.clone(),
-                        )),
-                        on_start: on_start.clone(),
-                        on_token: on_token.clone(),
-                        on_end: on_end.clone(),
-                        token_target: token_target.clone(),
-                    };
-                    // Counted here rather than at the top of the loop, so a
-                    // turn refused by the budget check reports the rounds that
-                    // actually dispatched — not the iteration that never got
-                    // to. A failover dispatch is another round by the same
-                    // rule: it went out.
-                    stats.rounds += 1;
+                        // Collect stream response — reuses the caller-owned
+                        // collector. Keep a clone so we can tag tool-result
+                        // broadcasts with the round's correlation ID further down.
+                        let round_correlation_id = correlation_id.clone();
+                        let round_callbacks = StreamRoundCallbacks {
+                            context: Some(StreamContext::new(
+                                turn_id.clone(),
+                                round_correlation_id.clone(),
+                            )),
+                            on_start: on_start.clone(),
+                            on_token: on_token.clone(),
+                            on_end: on_end.clone(),
+                            token_target: token_target.clone(),
+                        };
+                        // Counted here rather than at the top of the loop, so a
+                        // turn refused by the budget check reports the rounds that
+                        // actually dispatched — not the iteration that never got
+                        // to. A failover dispatch is another round by the same
+                        // rule: it went out.
+                        stats.rounds += 1;
 
-                    // One span and one latency sample per provider dispatch,
-                    // opened as a child of the turn.
-                    let round_span = turn.round(
-                        candidate,
-                        &round_correlation_id.to_string(),
-                        &round_agent_id,
-                        stats.rounds,
-                    );
-                    let round_started = std::time::Instant::now();
+                        // One span and one latency sample per provider dispatch,
+                        // opened as a child of the turn.
+                        let round_span = turn.round(
+                            candidate,
+                            &round_correlation_id.to_string(),
+                            &round_agent_id,
+                            stats.rounds,
+                        );
+                        let round_started = std::time::Instant::now();
 
-                    let round = run_stream_round(
-                        session,
-                        handle,
-                        &request,
-                        correlation_id,
-                        round_callbacks,
-                    )
-                    .await;
+                        let round = run_stream_round(
+                            session,
+                            handle,
+                            &request,
+                            correlation_id,
+                            round_callbacks,
+                        )
+                        .await;
 
-                    let elapsed = round_started.elapsed().as_secs_f64();
+                        let elapsed = round_started.elapsed().as_secs_f64();
 
-                    // A transport failure never reaches the collector, so the
-                    // round still has to be closed and measured before the
-                    // error escapes. Nothing was served, so the only model to
-                    // label it with is the configured one.
-                    let round = match round {
-                        Ok(round) => round,
-                        Err(error) => {
-                            let configured = runtime
+                        // A transport failure never reaches the collector, so the
+                        // round still has to be closed and measured before the
+                        // error escapes. Nothing was served, so the only model to
+                        // label it with is the configured one.
+                        let round = match round {
+                            Ok(round) => round,
+                            Err(error) => {
+                                let configured = runtime
+                                    .provider_model(candidate)
+                                    .unwrap_or_default()
+                                    .to_string();
+                                crate::telemetry::metrics::record_request_duration(
+                                    candidate,
+                                    &configured,
+                                    crate::telemetry::metrics::OUTCOME_ERROR,
+                                    elapsed,
+                                );
+                                round_span.finish(
+                                    &Usage::default(),
+                                    StopReason::Error,
+                                    crate::telemetry::metrics::OUTCOME_ERROR,
+                                    &configured,
+                                );
+                                if !chained {
+                                    return Err(error);
+                                }
+                                break 'candidate Err(error.to_string());
+                            }
+                        };
+
+                        // The model that actually served, which a rate limit may
+                        // have degraded away from the configured one. Empty only
+                        // on a round the provider refused before dispatching.
+                        let served_model = if round.model.is_empty() {
+                            runtime
                                 .provider_model(candidate)
                                 .unwrap_or_default()
-                                .to_string();
-                            crate::telemetry::metrics::record_request_duration(
-                                candidate,
-                                &configured,
-                                crate::telemetry::metrics::OUTCOME_ERROR,
-                                elapsed,
-                            );
-                            round_span.finish(
-                                &Usage::default(),
-                                StopReason::Error,
-                                crate::telemetry::metrics::OUTCOME_ERROR,
-                                &configured,
-                            );
-                            if !chained {
-                                return Err(error);
-                            }
-                            break 'candidate Err(error.to_string());
-                        }
-                    };
+                                .to_string()
+                        } else {
+                            round.model.clone()
+                        };
 
-                    // The model that actually served, which a rate limit may
-                    // have degraded away from the configured one. Empty only
-                    // on a round the provider refused before dispatching.
-                    let served_model = if round.model.is_empty() {
-                        runtime
-                            .provider_model(candidate)
-                            .unwrap_or_default()
-                            .to_string()
-                    } else {
-                        round.model.clone()
-                    };
-
-                    // A round that ends in `StopReason::Error` cost time and
-                    // possibly tokens, so it is recorded as a round that
-                    // happened and failed — not as one that never ran.
-                    let round_outcome = if round.stop_reason == StopReason::Error {
-                        crate::telemetry::metrics::OUTCOME_ERROR
-                    } else {
-                        crate::telemetry::metrics::OUTCOME_OK
-                    };
-                    crate::telemetry::metrics::record_request_duration(
-                        candidate,
-                        &served_model,
-                        round_outcome,
-                        elapsed,
-                    );
-                    round_span.finish(
-                        &round.usage,
-                        round.stop_reason,
-                        round_outcome,
-                        &served_model,
-                    );
-
-                    // Folded even for a failed candidate: those tokens were
-                    // spent whether or not the answer was usable.
-                    total_token_count += round.token_count;
-                    stats.usage += round.usage;
-
-                    if round.stop_reason == StopReason::Error {
-                        if !chained {
-                            return Err(ActonAIError::prompt_failed(
-                                "LLM request failed; see provider logs for details",
-                            ));
-                        }
-                        break 'candidate Err(
-                            "the round failed; see provider logs for details".to_string()
+                        // A round that ends in `StopReason::Error` cost time and
+                        // possibly tokens, so it is recorded as a round that
+                        // happened and failed — not as one that never ran.
+                        let round_outcome = if round.stop_reason == StopReason::Error {
+                            crate::telemetry::metrics::OUTCOME_ERROR
+                        } else {
+                            crate::telemetry::metrics::OUTCOME_OK
+                        };
+                        crate::telemetry::metrics::record_request_duration(
+                            candidate,
+                            &served_model,
+                            round_outcome,
+                            elapsed,
                         );
-                    }
+                        round_span.finish(
+                            &round.usage,
+                            round.stop_reason,
+                            round_outcome,
+                            &served_model,
+                        );
+
+                        // Folded even for a failed candidate: those tokens were
+                        // spent whether or not the answer was usable.
+                        total_token_count += round.token_count;
+                        stats.usage += round.usage;
+
+                        if round.stop_reason == StopReason::Error {
+                            // A transient failure — a dropped stream, a 5xx, an
+                            // overload — is worth another request before it
+                            // stands; a permanent one never is. Each retry is a
+                            // fresh dispatch: new correlation ID, its own round
+                            // span, its own latency sample.
+                            if let Some(reason) = round.transient_error.as_deref() {
+                                if stream_retries < MAX_STREAM_RETRIES {
+                                    stream_retries += 1;
+                                    tracing::warn!(
+                                        provider = %candidate,
+                                        attempt = stream_retries,
+                                        max_attempts = MAX_STREAM_RETRIES + 1,
+                                        reason,
+                                        "round failed transiently; dispatching it again"
+                                    );
+                                    tokio::time::sleep(STREAM_RETRY_BACKOFF * stream_retries).await;
+                                    continue;
+                                }
+                            }
+                            if !chained {
+                                return Err(ActonAIError::prompt_failed(
+                                    "LLM request failed; see provider logs for details",
+                                ));
+                            }
+                            break 'candidate Err(
+                                "the round failed; see provider logs for details".to_string(),
+                            );
+                        }
+
+                        break (round_correlation_id, round);
+                    };
 
                     Ok((round_correlation_id, round))
                 };
@@ -2916,6 +2953,7 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
                 usage: actor.model.usage,
                 tool_calls: std::mem::take(&mut actor.model.tool_calls),
                 model: envelope.message().model.clone(),
+                transient_error: envelope.message().transient_error.clone(),
             });
         }
         // Clear the correlation-ID filter and drop callbacks + target so
@@ -3055,6 +3093,7 @@ pub(crate) async fn run_stream_round(
         usage: result.usage,
         tool_calls: result.tool_calls,
         model: result.model,
+        transient_error: result.transient_error,
     })
 }
 
@@ -3075,6 +3114,12 @@ pub(crate) struct RoundResult {
     pub(crate) tool_calls: Vec<ToolCall>,
     /// The model that actually served the round.
     pub(crate) model: String,
+    /// Why the round failed, when re-dispatching it may succeed.
+    ///
+    /// `Some` only alongside [`StopReason::Error`]; see
+    /// [`LLMStreamEnd::transient_error`]. The prompt loop keys its bounded
+    /// re-dispatch off this, so a permanent failure is never retried.
+    pub(crate) transient_error: Option<String>,
 }
 
 /// Render a successful tool result as a single-line preview for the
@@ -3607,6 +3652,8 @@ struct CollectorResultData {
     /// `fallback_model`, which is exactly why it is carried out of the
     /// terminal event rather than read back from configuration.
     model: String,
+    /// The provider's transient-failure note, carried through verbatim.
+    transient_error: Option<String>,
 }
 
 #[cfg(test)]

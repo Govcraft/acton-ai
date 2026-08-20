@@ -514,6 +514,16 @@ pub struct LLMStreamEnd {
     /// histogram are then labelled with. Empty when no dispatch reached a
     /// client at all.
     pub model: String,
+    /// Why the round failed, when re-dispatching it may succeed.
+    ///
+    /// `Some` only alongside [`StopReason::Error`], and only when the
+    /// failure was transient — a stream dropped mid-flight, a network
+    /// error, a 5xx. Permanent failures (bad credentials, an invalid
+    /// request) and rounds the provider already retried to exhaustion
+    /// leave this `None`, so a caller can key a bounded retry off it
+    /// without re-running requests that are doomed to fail identically.
+    #[serde(default)]
+    pub transient_error: Option<String>,
 }
 
 // =============================================================================

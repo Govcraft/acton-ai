@@ -224,6 +224,20 @@ impl LLMError {
         )
     }
 
+    /// Returns true when re-dispatching the whole request may succeed.
+    ///
+    /// A superset of [`is_retriable`](Self::is_retriable): a stream that
+    /// died mid-flight ([`LLMErrorKind::StreamError`]) is not something the
+    /// provider retries in place — partial tokens already went out — but a
+    /// caller that owns the whole round can safely run the round again from
+    /// scratch. Permanent failures (bad credentials, an invalid request, an
+    /// unparseable response) stay non-transient: they would fail identically
+    /// on every retry.
+    #[must_use]
+    pub fn is_transient(&self) -> bool {
+        self.is_retriable() || matches!(self.kind, LLMErrorKind::StreamError { .. })
+    }
+
     /// Returns the retry-after duration if this is a rate limit error.
     #[must_use]
     pub fn retry_after(&self) -> Option<Duration> {
@@ -391,6 +405,16 @@ mod tests {
     #[test]
     fn is_not_retriable_for_auth_errors() {
         assert!(!LLMError::authentication_failed("invalid key").is_retriable());
+    }
+
+    #[test]
+    fn transient_covers_broken_streams_but_not_permanent_failures() {
+        assert!(LLMError::stream_error("error decoding response body").is_transient());
+        assert!(LLMError::network("connection reset").is_transient());
+        assert!(LLMError::api_error(503, "service unavailable", None).is_transient());
+        assert!(!LLMError::api_error(400, "bad request", None).is_transient());
+        assert!(!LLMError::authentication_failed("invalid key").is_transient());
+        assert!(!LLMError::parse_error("garbled chunk").is_transient());
     }
 
     #[test]

@@ -890,7 +890,8 @@ mod tests {
 
     #[test]
     fn parse_sse_chunk_without_id_still_parses() {
-        let line = r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
+        let line =
+            r#"data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}"#;
         let chunk = OpenAIClient::parse_sse_line(line)
             .expect("a chunk is an event")
             .expect("an id-less chunk must parse");
