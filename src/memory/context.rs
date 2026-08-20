@@ -254,6 +254,16 @@ fn resolve_encoding_name(model: &str) -> &'static str {
     }
 }
 
+/// What replaces a tool result too large for the context window.
+///
+/// Mirrors what production agents (e.g. Codex) tell the model in this spot:
+/// the call happened, the output existed, and it is gone for size reasons —
+/// so the model reruns the tool with a narrower query instead of trusting a
+/// silently absent result.
+pub(crate) const OVERSIZED_TOOL_RESULT_PLACEHOLDER: &str =
+    "[tool output exceeded the available model context and was dropped; \
+     re-run the tool with a narrower query if the output is still needed]";
+
 /// Splits a history into runs that must not be broken apart.
 ///
 /// An assistant turn carrying tool calls forms one run with the tool results
@@ -405,6 +415,15 @@ impl ContextWindow {
     }
 
     /// Takes whole exchanges from the end of `messages` while they fit.
+    ///
+    /// An exchange too large to fit whole is not dropped outright: when its
+    /// bulk is tool results, those are replaced — largest first — with
+    /// [`OVERSIZED_TOOL_RESULT_PLACEHOLDER`] until the exchange fits, keeping
+    /// the call/result pairing the providers require. Only when an exchange
+    /// cannot fit even emptied of tool output does taking stop. Without this,
+    /// one giant tool result either emptied the history (estimated honestly)
+    /// or oversized the request (estimated low) — both of which end the
+    /// conversation rather than the one tool round.
     fn take_recent_exchanges(
         &self,
         messages: &[Message],
@@ -416,14 +435,49 @@ impl ContextWindow {
 
         for run in exchanges(messages).into_iter().rev() {
             let tokens = self.estimate_run_tokens(run);
-            if total + tokens > available {
-                break;
+            if total + tokens <= available {
+                result.splice(0..0, run.iter().cloned());
+                total += tokens;
+                continue;
             }
-            result.splice(0..0, run.iter().cloned());
-            total += tokens;
+            let budget = available.saturating_sub(total);
+            let Some(rewritten) = self.rewrite_run_to_fit(run, budget) else {
+                break;
+            };
+            total += self.estimate_run_tokens(&rewritten);
+            result.splice(0..0, rewritten);
         }
 
         result
+    }
+
+    /// Shrinks one exchange by replacing tool results with a placeholder,
+    /// largest first, until it fits `budget`.
+    ///
+    /// Returns `None` when the run holds no tool results, or still exceeds
+    /// the budget with every tool result replaced — the caller drops it
+    /// whole, as before.
+    fn rewrite_run_to_fit(&self, run: &[Message], budget: usize) -> Option<Vec<Message>> {
+        let mut messages: Vec<Message> = run.to_vec();
+        let mut tool_indices: Vec<usize> = messages
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| m.role == MessageRole::Tool)
+            .map(|(i, _)| i)
+            .collect();
+        if tool_indices.is_empty() {
+            return None;
+        }
+        tool_indices.sort_by_key(|&i| std::cmp::Reverse(self.estimate_tokens(&messages[i])));
+
+        for index in tool_indices {
+            if self.estimate_run_tokens(&messages) <= budget {
+                break;
+            }
+            messages[index].content = OVERSIZED_TOOL_RESULT_PLACEHOLDER.to_string();
+        }
+
+        (self.estimate_run_tokens(&messages) <= budget).then_some(messages)
     }
 
     /// Truncation strategy: keep most recent messages.
@@ -476,7 +530,7 @@ impl ContextWindow {
             if tokens <= available {
                 return first.to_vec();
             }
-            return Vec::new();
+            return self.truncate_keep_recent(messages, available);
         }
 
         let first_tokens = self.estimate_run_tokens(first);
@@ -675,6 +729,87 @@ mod tests {
             .collect();
 
         calls.len() == results.len() && calls.iter().all(|id| results.contains(id))
+    }
+
+    #[test]
+    fn an_oversized_tool_result_is_rewritten_not_dropped() {
+        // One exchange whose tool result alone dwarfs the window: dropping
+        // it wholesale would hand the provider an empty history mid-turn.
+        let messages = tool_exchange("huge", 4000);
+
+        for strategy in [
+            TruncationStrategy::KeepRecent,
+            TruncationStrategy::KeepSystemAndRecent,
+            TruncationStrategy::KeepEnds,
+        ] {
+            let fitted = tight_window(200, strategy).fit_messages(&messages);
+
+            assert!(
+                !fitted.is_empty(),
+                "{strategy:?} emptied the history: {fitted:#?}"
+            );
+            assert!(
+                tool_pairing_is_intact(&fitted),
+                "{strategy:?} split the exchange: {fitted:#?}"
+            );
+            let result = fitted
+                .iter()
+                .find(|m| m.role == MessageRole::Tool)
+                .expect("the tool result must survive as a placeholder");
+            assert_eq!(result.content, OVERSIZED_TOOL_RESULT_PLACEHOLDER);
+        }
+    }
+
+    #[test]
+    fn a_small_tool_result_survives_beside_a_rewritten_giant() {
+        // An assistant turn answered by two results, one giant and one small:
+        // only the giant should give way.
+        let messages = vec![
+            msg(MessageRole::User, "ask both"),
+            Message::assistant_with_tools(
+                "calling both".to_string(),
+                vec![
+                    ToolCall {
+                        id: "tc_big".to_string(),
+                        name: "search".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                    ToolCall {
+                        id: "tc_small".to_string(),
+                        name: "search".to_string(),
+                        arguments: serde_json::json!({}),
+                    },
+                ],
+            ),
+            Message::tool("tc_big", "r".repeat(4000)),
+            Message::tool("tc_small", "tiny result"),
+        ];
+
+        let fitted = tight_window(200, TruncationStrategy::KeepRecent).fit_messages(&messages);
+
+        let content_of = |id: &str| {
+            fitted
+                .iter()
+                .find(|m| m.tool_call_id.as_deref() == Some(id))
+                .map(|m| m.content.clone())
+                .expect("both results must survive")
+        };
+        assert_eq!(content_of("tc_big"), OVERSIZED_TOOL_RESULT_PLACEHOLDER);
+        assert_eq!(content_of("tc_small"), "tiny result");
+    }
+
+    #[test]
+    fn an_oversized_run_without_tool_results_is_still_dropped() {
+        // A lone user message beyond the window has nothing to rewrite;
+        // the old drop behavior stands.
+        let older = vec![msg(MessageRole::User, &"q".repeat(4000))];
+        let mut messages = older;
+        messages.extend(tool_exchange("new", 40));
+
+        let fitted = tight_window(120, TruncationStrategy::KeepRecent).fit_messages(&messages);
+
+        assert!(fitted.iter().all(|m| m.content.len() < 4000));
+        assert!(tool_pairing_is_intact(&fitted));
     }
 
     #[test]

@@ -2801,6 +2801,10 @@ impl ActonAIBuilder {
             .get(&default_provider_name)
             .map(|p| p.model.clone())
             .unwrap_or_default();
+        let default_provider_completion = self
+            .providers
+            .get(&default_provider_name)
+            .map(|p| p.max_tokens as usize);
 
         // Budgets are settled before anything is spawned. Every failure here
         // is a cap that would not have held, and discovering that after the
@@ -3091,6 +3095,7 @@ impl ActonAIBuilder {
                 .get(&default_provider_name)
                 .copied(),
             &default_provider_model,
+            default_provider_completion,
         );
 
         let compaction = resolve_compaction(
@@ -3879,6 +3884,7 @@ fn resolve_context_window(
     context_config: Option<&crate::config::ContextFileConfig>,
     per_provider_tokens: Option<usize>,
     default_provider_model: &str,
+    completion_tokens: Option<usize>,
 ) -> Option<crate::memory::ContextWindow> {
     use crate::memory::{
         ContextWindow, ContextWindowConfig, TiktokenEstimator, TokenEstimator, TruncationStrategy,
@@ -3897,8 +3903,14 @@ fn resolve_context_window(
         .or_else(|| context_config.and_then(|c| c.max_tokens))
         .unwrap_or(default_cfg.max_tokens);
 
+    // The providers enforce `prompt + completion <= window`, so the fit
+    // budget must reserve the full completion the request will ask for —
+    // reserving less admits prompts the API then rejects as too long.
+    // Clamped to half the window so a completion cap that rivals a small
+    // window cannot starve the prompt entirely.
     let reserved_for_response = context_config
         .and_then(|c| c.reserved_for_response)
+        .or_else(|| completion_tokens.map(|t| t.min(max_tokens / 2)))
         .unwrap_or(default_cfg.reserved_for_response);
 
     let strategy = context_config
