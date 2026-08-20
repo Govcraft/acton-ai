@@ -580,7 +580,9 @@ async fn spawn_lifecycle_spy(runtime: &mut ActorRuntime) -> ActorHandle {
             TurnLifecycle::TurnStarted { turn_id, .. } => {
                 actor.model.started.push(turn_id.to_string());
             }
-            TurnLifecycle::TurnFinished { turn_id, outcome, .. } => {
+            TurnLifecycle::TurnFinished {
+                turn_id, outcome, ..
+            } => {
                 actor
                     .model
                     .finished
