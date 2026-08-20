@@ -629,6 +629,14 @@ pub struct UsageReport {
 pub struct LLMStreamToolResult {
     /// Correlation ID for the stream this result belongs to
     pub correlation_id: CorrelationId,
+    /// The turn the call belongs to.
+    ///
+    /// A turn spans every round of the tool loop, so the correlation ID above
+    /// names only the round that asked for this call. A consumer routing
+    /// events into one client session needs the coarser identity, and the
+    /// same one appears on the [`TurnLifecycle::ToolStarted`] and
+    /// [`TurnLifecycle::ToolFinished`] events for this call.
+    pub turn_id: TurnId,
     /// ID of the tool call that produced this result (matches
     /// [`ToolCall::id`]).
     pub tool_call_id: String,
@@ -663,18 +671,39 @@ pub struct LLMStreamToolResult {
 /// Published unconditionally, like [`UsageReport`]: these are tiny messages
 /// and a broadcast with no subscriber is a no-op, so a runtime that never
 /// arms introspection pays nothing but the send.
+///
+/// # The tool bracket is total
+///
+/// Every [`Self::ToolFinished`] — and every [`LLMStreamToolResult`] — is
+/// preceded by exactly one [`Self::ToolStarted`] carrying the same `turn_id`
+/// and `tool_call_id`. That holds for a call the policy gate **refused** as
+/// well as one that ran: the start event is published before the gate is
+/// consulted, and a refusal is reported as a finish with `success: false`.
+///
+/// A consumer that maps these onto a protocol where a result may only follow
+/// an announced call (ACP's `tool_call` / `tool_call_update`, say) therefore
+/// never has to synthesize a start event it did not see.
 #[acton_message]
 #[derive(Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TurnLifecycle {
     /// A turn was admitted and is now running.
+    #[non_exhaustive]
     TurnStarted {
         /// Identifies this turn across its whole lifecycle.
+        ///
+        /// Either minted by the prompt loop or supplied by the caller through
+        /// [`PromptBuilder::turn_id`](crate::prompt::PromptBuilder::turn_id);
+        /// either way it is the id
+        /// [`CollectedResponse::turn_id`](crate::stream::CollectedResponse::turn_id)
+        /// reports when the turn ends.
         turn_id: TurnId,
     },
     /// A turn ended, successfully or with an error.
     ///
     /// Always published for a turn that published [`Self::TurnStarted`],
     /// whatever the outcome.
+    #[non_exhaustive]
     TurnFinished {
         /// The turn that ended.
         turn_id: TurnId,
@@ -685,7 +714,12 @@ pub enum TurnLifecycle {
     /// pair, never alongside it: a refused turn never ran, so counting it as
     /// in-flight even momentarily would make a drain look unfinished.
     TurnRefused,
-    /// A tool call started executing inside a turn.
+    /// A tool call was dispatched inside a turn.
+    ///
+    /// Published *before* the approval gate runs, so a call the gate goes on
+    /// to refuse is announced like any other. See the type-level note on the
+    /// bracket for why.
+    #[non_exhaustive]
     ToolStarted {
         /// The turn running this tool.
         turn_id: TurnId,
@@ -693,13 +727,31 @@ pub enum TurnLifecycle {
         tool_call_id: String,
         /// The tool being executed.
         tool_name: String,
+        /// The arguments **the model proposed**, verbatim.
+        ///
+        /// Not the arguments that necessarily ran: an approval hook may
+        /// rewrite them, and the gate may refuse the call outright. This is
+        /// what the model asked for, which is the thing a client renders next
+        /// to the tool's name, and it is the only version that exists at the
+        /// point the call is announced. What actually ran is in the audit
+        /// trail.
+        arguments: serde_json::Value,
     },
-    /// A tool call finished executing, successfully or not.
+    /// A tool call finished, successfully or not — including a call the gate
+    /// refused, which finishes without ever having run.
+    #[non_exhaustive]
     ToolFinished {
         /// The turn that ran this tool.
         turn_id: TurnId,
         /// The call that finished.
         tool_call_id: String,
+        /// True when the tool ran and returned a value; false when it failed
+        /// or when the gate refused it.
+        success: bool,
+        /// A bounded one-line preview of the result, the error, or the
+        /// denial reason — the same text [`LLMStreamToolResult::summary`]
+        /// carries for this call.
+        summary: String,
     },
 }
 
