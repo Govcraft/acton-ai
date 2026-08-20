@@ -79,6 +79,12 @@ async fn every_executed_tool_call_lands_in_the_trail() {
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tool_name, "echo");
 
+    // The provider's own ID for the call, not one the loop invented. This is
+    // the join key between the trail and the lifecycle events an observer
+    // saw live, so a value that only the audit path knows would make the two
+    // records impossible to line up.
+    assert_eq!(entries[0].tool_call_id, "call_1");
+
     // The name in the trail must be the name the model was offered. An
     // auditor matching entries against a tool inventory has only the name to
     // go on, and a schema with a `$ref` in it would not be checkable against
@@ -148,6 +154,11 @@ async fn a_denied_call_is_recorded_as_denied_with_the_rule_that_refused_it() {
     assert!(!entries[0].decision.approved);
     assert_eq!(entries[0].decision.decided_by, Decider::Denylist);
     assert!(matches!(entries[0].outcome, AuditOutcome::Denied { .. }));
+
+    // A refused call is identified exactly like one that ran. Anything else
+    // would leave the one kind of entry an investigator most wants to trace
+    // as the one kind that cannot be traced.
+    assert_eq!(entries[0].tool_call_id, "call_1");
 
     ai.shutdown().await.expect("clean shutdown");
 }
