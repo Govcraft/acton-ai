@@ -51,7 +51,7 @@ use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
     StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, TurnOutcome, Usage,
 };
-use crate::stream::{CollectedResponse, ExecutedToolCall};
+use crate::stream::{CollectedResponse, ExecutedToolCall, StreamContext};
 use crate::tools::ToolError;
 use crate::types::{AgentId, CorrelationId, TurnId};
 use acton_reactive::prelude::*;
@@ -74,13 +74,20 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 const STRUCTURED_OUTPUT_NUDGE: &str = "Record your final answer now by calling structured_output.";
 
 /// Type alias for start callbacks.
-type StartCallback = Box<dyn FnMut() + Send + 'static>;
+///
+/// The [`StreamContext`] names the turn and the round that is starting, so a
+/// caller multiplexing several concurrent prompts can route the event without
+/// inventing a correlation scheme of its own.
+type StartCallback = Box<dyn FnMut(&StreamContext) + Send + 'static>;
 
 /// Type alias for token callbacks.
 type TokenCallback = Box<dyn FnMut(&str) + Send + 'static>;
 
 /// Type alias for end callbacks.
-type EndCallback = Box<dyn FnMut(StopReason) + Send + 'static>;
+///
+/// Receives the same [`StreamContext`] the round's start callback saw,
+/// alongside the reason the provider stopped.
+type EndCallback = Box<dyn FnMut(&StreamContext, StopReason) + Send + 'static>;
 
 /// Type alias for tool result callbacks.
 ///
@@ -290,6 +297,9 @@ pub struct PromptBuilder {
     /// does, and an auditor reading the trail needs to be able to tell which
     /// calls belonged to the same exchange.
     conversation_id: Option<crate::types::ConversationId>,
+    /// Caller-supplied turn identity, when the caller wants to know the id
+    /// before the loop runs. `None` mints a fresh one at admission.
+    turn_id: Option<TurnId>,
 }
 
 impl PromptBuilder {
@@ -314,6 +324,7 @@ impl PromptBuilder {
             sampling: None,
             structured: None,
             conversation_id: None,
+            turn_id: None,
         }
     }
 
@@ -383,21 +394,27 @@ impl PromptBuilder {
 
     /// Sets a callback to be called when the stream starts.
     ///
-    /// This is useful for displaying a "thinking" indicator or spinner.
+    /// This is useful for displaying a "thinking" indicator or spinner. The
+    /// callback receives the [`StreamContext`] naming the turn and the round
+    /// that is starting, so an embedder driving several prompts at once (an
+    /// ACP agent fanning turns out to client sessions, say) can route the
+    /// event without keeping a side table. The callback fires once per
+    /// provider round, so a turn that loops through tools fires it several
+    /// times under the same [`StreamContext::turn_id`].
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// runtime
     ///     .prompt("Hello")
-    ///     .on_start(|| println!("Thinking..."))
+    ///     .on_start(|ctx| println!("Thinking... (turn {})", ctx.turn_id))
     ///     .collect()
     ///     .await?;
     /// ```
     #[must_use]
     pub fn on_start<F>(mut self, f: F) -> Self
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(&StreamContext) + Send + 'static,
     {
         self.on_start = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
@@ -428,22 +445,23 @@ impl PromptBuilder {
 
     /// Sets a callback to be called when the stream ends.
     ///
-    /// The callback receives the stop reason indicating why the LLM
-    /// stopped generating.
+    /// The callback receives the [`StreamContext`] the round's start callback
+    /// saw, plus the stop reason indicating why the LLM stopped generating.
+    /// Like [`on_start`](Self::on_start) it fires once per provider round.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// runtime
     ///     .prompt("Hello")
-    ///     .on_end(|reason| println!("\n[Finished: {reason:?}]"))
+    ///     .on_end(|_ctx, reason| println!("\n[Finished: {reason:?}]"))
     ///     .collect()
     ///     .await?;
     /// ```
     #[must_use]
     pub fn on_end<F>(mut self, f: F) -> Self
     where
-        F: FnMut(StopReason) + Send + 'static,
+        F: FnMut(&StreamContext, StopReason) + Send + 'static,
     {
         self.on_end = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
@@ -808,6 +826,39 @@ impl PromptBuilder {
         self
     }
 
+    /// Supplies the turn's identity instead of letting the loop mint one.
+    ///
+    /// Exists for embedders that must announce a turn to their own client
+    /// before the loop starts — an ACP agent has to answer a `session/prompt`
+    /// with an id it can immediately bind lifecycle events to, and minting
+    /// the id itself is the only way to have it that early. Every
+    /// [`TurnLifecycle`] event, every
+    /// [`LLMStreamToolResult`](crate::messages::LLMStreamToolResult), the
+    /// audit trail, and [`CollectedResponse::turn_id`] then carry exactly
+    /// this id.
+    ///
+    /// Callers that only need the id *after* the turn can skip this and read
+    /// it from [`CollectedResponse::turn_id`] instead.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let turn_id = TurnId::new();
+    /// notify_client_of_new_turn(&turn_id);
+    ///
+    /// let response = runtime
+    ///     .prompt("Deploy the fix")
+    ///     .turn_id(turn_id.clone())
+    ///     .collect()
+    ///     .await?;
+    /// assert_eq!(response.turn_id, turn_id);
+    /// ```
+    #[must_use]
+    pub fn turn_id(mut self, id: TurnId) -> Self {
+        self.turn_id = Some(id);
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -1059,7 +1110,11 @@ impl PromptBuilder {
         // one the compiler cannot see: the caller dropping this future
         // mid-await. The guard owns that duty, so cancellation publishes an
         // `Interrupted` finish instead of leaving the start unmatched.
-        let turn_id = TurnId::new();
+        //
+        // The caller's id when one was supplied, so an embedder that
+        // announced the turn to its own client before calling `collect` sees
+        // that exact id on every event; minted here otherwise.
+        let turn_id = self.turn_id.clone().unwrap_or_default();
         broker
             .broadcast(TurnLifecycle::TurnStarted {
                 turn_id: turn_id.clone(),
@@ -1118,6 +1173,9 @@ impl PromptBuilder {
             sampling,
             structured,
             conversation_id,
+            // Already resolved into the `turn_id` parameter by
+            // `run_prompt_loop`, which needed it before the span opened.
+            turn_id: _,
         } = self;
 
         // Resolve the provider handle
@@ -1317,6 +1375,10 @@ impl PromptBuilder {
                     // broadcasts with the round's correlation ID further down.
                     let round_correlation_id = correlation_id.clone();
                     let round_callbacks = StreamRoundCallbacks {
+                        context: Some(StreamContext::new(
+                            turn_id.clone(),
+                            round_correlation_id.clone(),
+                        )),
                         on_start: on_start.clone(),
                         on_token: on_token.clone(),
                         on_end: on_end.clone(),
@@ -1583,7 +1645,11 @@ impl PromptBuilder {
                 total_token_count,
                 executed_tool_calls,
             )
-            .with_usage(stats.usage),
+            .with_usage(stats.usage)
+            // The id every lifecycle event of this turn carried — supplied by
+            // the caller or minted at admission — so the response can be
+            // matched against events observed while the turn ran.
+            .with_turn_id(turn_id.clone()),
             captured,
         ))
     }
@@ -1723,6 +1789,12 @@ fn outcome_for(error: &ActonAIError) -> &'static str {
 /// this type.
 #[derive(Clone, Default)]
 pub(crate) struct StreamRoundCallbacks {
+    /// The turn+round identity handed to the start and end callbacks.
+    ///
+    /// `Some` whenever the round loop installed this set; `None` only in the
+    /// idle state between rounds, where no callback can fire because the
+    /// correlation filter is also clear.
+    pub(crate) context: Option<StreamContext>,
     pub(crate) on_start: Option<WrappedStartCallback>,
     pub(crate) on_token: Option<WrappedTokenCallback>,
     pub(crate) on_end: Option<WrappedEndCallback>,
@@ -1732,6 +1804,7 @@ pub(crate) struct StreamRoundCallbacks {
 impl std::fmt::Debug for StreamRoundCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamRoundCallbacks")
+            .field("context", &self.context)
             .field("on_start", &self.on_start.is_some())
             .field("on_token", &self.on_token.is_some())
             .field("on_end", &self.on_end.is_some())
@@ -1823,9 +1896,11 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
         {
             return Reply::ready();
         }
-        if let Some(ref callback) = actor.model.round.on_start {
+        if let (Some(callback), Some(context)) =
+            (&actor.model.round.on_start, &actor.model.round.context)
+        {
             if let Ok(mut f) = callback.lock() {
-                f();
+                f(context);
             }
         }
         Reply::ready()
@@ -1878,9 +1953,11 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
         }
         actor.model.stop_reason = Some(envelope.message().stop_reason);
         actor.model.usage = envelope.message().usage;
-        if let Some(ref callback) = actor.model.round.on_end {
+        if let (Some(callback), Some(context)) =
+            (&actor.model.round.on_end, &actor.model.round.context)
+        {
             if let Ok(mut f) = callback.lock() {
-                f(envelope.message().stop_reason);
+                f(context, envelope.message().stop_reason);
             }
         }
 
@@ -2152,10 +2229,16 @@ impl ToolStep<'_> {
     ) -> (ToolOutcome, ExecutedToolCall) {
         let started = std::time::Instant::now();
 
-        // The gate comes first, ahead of the span and the lifecycle
-        // broadcast: a refused call never ran, and announcing it as started
-        // would put a tool in the observer's status line that no process ever
-        // executed.
+        // The bracket opens before the gate is consulted, so a call the gate
+        // goes on to refuse is announced exactly like one that runs. This is
+        // the doctrine `TurnLifecycle` documents: a consumer mapping these
+        // onto a protocol where a result may only follow an announced call
+        // must never have to synthesize a start it never saw. The cost is
+        // that a refused tool appears in an observer's status line for as
+        // long as the gate deliberates, which is the honest picture — the
+        // call was proposed, and something had to decide about it.
+        self.start_tool(tool_call).await;
+
         let gate = self.decide(tool_call, counts).await;
 
         let (arguments, decided_by) = match gate {
@@ -2176,6 +2259,51 @@ impl ToolStep<'_> {
             .await
     }
 
+    /// Opens the observation bracket for one call.
+    ///
+    /// Carries the arguments the *model* proposed, not the ones that will
+    /// run: at this point the gate has not been consulted, so a hook has had
+    /// no chance to rewrite them and the proposed set is the only one that
+    /// exists. What actually ran is the audit trail's business.
+    async fn start_tool(&self, tool_call: &ToolCall) {
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolStarted {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                arguments: tool_call.arguments.clone(),
+            })
+            .await;
+    }
+
+    /// Closes the bracket [`Self::start_tool`] opened, however the call ended.
+    ///
+    /// Both events carry the same verdict and the same text, so an observer
+    /// watching only one of them reaches the same conclusion. Callers settle
+    /// `success` and `summary` before calling this, which is what makes that
+    /// possible.
+    async fn finish_tool(&self, tool_call: &ToolCall, success: bool, summary: String) {
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolFinished {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                success,
+                summary: summary.clone(),
+            })
+            .await;
+
+        self.provider_handle
+            .broadcast(crate::messages::LLMStreamToolResult {
+                correlation_id: self.correlation_id.clone(),
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                success,
+                summary,
+            })
+            .await;
+    }
+
     /// Applies the policy, or admits everything when there is none.
     async fn decide(
         &self,
@@ -2194,6 +2322,7 @@ impl ToolStep<'_> {
                 crate::policy::ToolInvocation {
                     tool_name: tool_call.name.clone(),
                     arguments: tool_call.arguments.clone(),
+                    tool_call_id: tool_call.id.clone(),
                     correlation_id: self.correlation_id.clone(),
                     turn_id: self.turn_id.clone(),
                 },
@@ -2217,19 +2346,12 @@ impl ToolStep<'_> {
             "tool call refused by policy",
         );
 
-        // Observers still hear about it. A refusal is something an operator
-        // watching a chat session needs to see, and `success: false` is
-        // exactly what the REPL already renders as a failed call.
+        // Closes the bracket `run` opened before the gate was consulted. A
+        // refusal is something an operator watching a chat session needs to
+        // see, and `success: false` is exactly what the REPL already renders
+        // as a failed call.
         let summary = summarize_error(&reason.to_string(), 200);
-        self.provider_handle
-            .broadcast(crate::messages::LLMStreamToolResult {
-                correlation_id: self.correlation_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                success: false,
-                summary,
-            })
-            .await;
+        self.finish_tool(tool_call, false, summary).await;
 
         self.record(
             tool_call,
@@ -2274,17 +2396,6 @@ impl ToolStep<'_> {
         // when it ran.
         let tool_span = self.turn.tool(&tool_call.name);
 
-        // Bracketed for the same reason the turn is: a tool is where a turn
-        // spends most of its wall-clock, so "what is this process doing right
-        // now" is usually answered by the name of a running tool.
-        self.provider_handle
-            .broadcast(TurnLifecycle::ToolStarted {
-                turn_id: self.turn_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-            })
-            .await;
-
         // Kept only when there is a trail to write it to: the entry must
         // describe the call that actually ran, and a hook may have rewritten
         // it into something the model never proposed.
@@ -2292,12 +2403,15 @@ impl ToolStep<'_> {
 
         let result = execute_tool_with_callback(tools, tool_call, arguments).await;
 
-        self.provider_handle
-            .broadcast(TurnLifecycle::ToolFinished {
-                turn_id: self.turn_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-            })
-            .await;
+        // Settled before the bracket closes, because `finish_tool` puts the
+        // same verdict and the same text on both events it publishes: an
+        // observer watching only one of them has to reach the same conclusion
+        // as one watching the other.
+        let (success, summary) = match &result {
+            Ok(value) => (true, summarize_tool_value(value, 200)),
+            Err(e) => (false, summarize_error(&e.to_string(), 200)),
+        };
+        self.finish_tool(tool_call, success, summary.clone()).await;
 
         let tool_outcome = if result.is_ok() {
             crate::telemetry::metrics::OUTCOME_OK
@@ -2313,23 +2427,6 @@ impl ToolStep<'_> {
         // of unbounded size and are never recorded — see
         // `crate::telemetry::spans`.
         tool_span.finish(tool_outcome);
-
-        // Broadcast a compact result event so observers (the CLI chat REPL)
-        // can render success/failure inline alongside the preceding tool-call
-        // line.
-        let (success, summary) = match &result {
-            Ok(value) => (true, summarize_tool_value(value, 200)),
-            Err(e) => (false, summarize_error(&e.to_string(), 200)),
-        };
-        self.provider_handle
-            .broadcast(crate::messages::LLMStreamToolResult {
-                correlation_id: self.correlation_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                success,
-                summary: summary.clone(),
-            })
-            .await;
 
         let audit_outcome = match (&result, self.audit) {
             // Summarized from a redacted copy of the result, not the raw one.
@@ -2395,6 +2492,7 @@ impl ToolStep<'_> {
             correlation_id: self.correlation_id.clone(),
             conversation_id: self.conversation_id.cloned(),
             turn_id: self.turn_id.clone(),
+            tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             // Redacted here, at the boundary, so a secret never reaches the
             // actor's mailbox — let alone its file.

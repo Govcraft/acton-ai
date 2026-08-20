@@ -50,6 +50,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `runner::run_if_sandbox_child()` first thing — the same guard `acton-ai`'s
   own entry point now uses — and `runner::supports(name)` says which tools
   can cross the process boundary at all.
+- **Caller-supplied turn identity.** `PromptBuilder::turn_id(..)` lets an
+  embedder that already answered a session (an ACP daemon, say) name the turn
+  before the loop starts, and `CollectedResponse::turn_id` reports the turn's
+  ID back either way — supplied or minted — so no claim/bind side table is
+  needed to attribute a response.
+- **`StreamContext` on the stream callbacks.** `.on_start(..)` and
+  `.on_end(..)` now receive a `&StreamContext` carrying the turn ID and the
+  round's correlation ID, so a streaming consumer can attribute every round
+  to its turn without out-of-band bookkeeping. Exported from the prelude.
+- **Enriched tool lifecycle events.** `TurnLifecycle::ToolStarted` carries the
+  arguments the model proposed, verbatim; `ToolFinished` carries `success` and
+  a bounded `summary`; `LLMStreamToolResult` carries the `turn_id`. The enum
+  and its variants are now `#[non_exhaustive]`.
+- **The tool bracket is total.** `ToolStarted` is broadcast *before* the
+  policy gate deliberates, so every `ToolFinished` and `LLMStreamToolResult`
+  — including a call the policy refused — is preceded by exactly one
+  `ToolStarted` with the same `tool_call_id`, and a human approval hook
+  deliberates on a call the client has already been shown.
+- **`tool_call_id` end to end.** `policy::ToolInvocation` and every audit
+  entry now carry the provider's own ID for the call — the same ID the
+  lifecycle events broadcast — so an approval prompt and a trail read after
+  the fact both join cleanly against a session watched live.
 - **`fips` cargo feature.** Routes every TLS connection the framework opens
   through the FIPS 140-3 validated AWS-LC module instead of *ring*, installed
   as the process-wide rustls default before anything can connect. Off by
@@ -92,6 +114,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The stream callbacks take an identity.** `.on_start(..)` now receives
+  `&StreamContext` where it previously took no arguments, and `.on_end(..)`
+  receives `(&StreamContext, StopReason)` where it previously took only the
+  stop reason. **Existing callers must add the parameter**, typically
+  `.on_start(|_ctx| ..)` and `.on_end(|_ctx, reason| ..)`. `.on_token(..)` is
+  deliberately unchanged and still takes `&str`: it fires per token, where an
+  identity that is constant for the whole round would be repeated noise.
+- `TurnLifecycle` and its struct variants are now `#[non_exhaustive]`, so a
+  downstream `match` needs a wildcard arm. These are observation events and
+  later additions should not be breaking changes.
 - TLS backend selection moved behind features. The ordinary *ring* stack is
   now the `tls-ring` feature and is part of the default set, so a default
   build is unchanged. **A `--no-default-features` build that relied on TLS

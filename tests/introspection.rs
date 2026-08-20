@@ -577,10 +577,10 @@ async fn spawn_lifecycle_spy(runtime: &mut ActorRuntime) -> ActorHandle {
 
     builder.mutate_on::<TurnLifecycle>(|actor, envelope| {
         match envelope.message() {
-            TurnLifecycle::TurnStarted { turn_id } => {
+            TurnLifecycle::TurnStarted { turn_id, .. } => {
                 actor.model.started.push(turn_id.to_string());
             }
-            TurnLifecycle::TurnFinished { turn_id, outcome } => {
+            TurnLifecycle::TurnFinished { turn_id, outcome, .. } => {
                 actor
                     .model
                     .finished

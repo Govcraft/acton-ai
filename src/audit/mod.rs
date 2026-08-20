@@ -114,6 +114,7 @@ mod tests {
                 correlation_id: CorrelationId::new(),
                 conversation_id: None,
                 turn_id: TurnId::new(),
+                tool_call_id: "toolu_01".to_string(),
                 tool_name: "bash".to_string(),
                 arguments: json!({"command": "ls"}),
                 outcome: AuditOutcome::Success {

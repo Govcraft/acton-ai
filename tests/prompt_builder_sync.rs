@@ -52,9 +52,9 @@ async fn a_fully_loaded_prompt_keeps_the_contract() {
     let builder = assert_send_sync(
         ai.prompt("use the echo tool")
             .system("Echo things.")
-            .on_start(|| {})
+            .on_start(|_ctx| {})
             .on_token(|_t| {})
-            .on_end(|_reason| {})
+            .on_end(|_ctx, _reason| {})
             .with_tool_callback(
                 ToolDefinition {
                     name: "echo".to_string(),

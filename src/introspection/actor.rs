@@ -162,6 +162,7 @@ impl IntrospectionActor {
                 TurnLifecycle::ToolFinished {
                     turn_id,
                     tool_call_id,
+                    ..
                 } => {
                     actor
                         .model
