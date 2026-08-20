@@ -441,6 +441,12 @@ async fn a_generated_tool_works_behind_a_trait_object() {
 /// One `#[test]` rather than one per file because `trybuild` batches a whole
 /// directory into a single `cargo build`; splitting it would multiply the
 /// slowest part of this suite by the number of cases.
+///
+/// Unix only: `trybuild` drives a nested cargo build, which stalls
+/// indefinitely on the Windows CI runner, and rustc diagnostic snapshots
+/// need only one platform's coverage — the Linux and macOS lanes provide
+/// it.
+#[cfg(unix)]
 #[test]
 fn ui_cases() {
     let cases = trybuild::TestCases::new();

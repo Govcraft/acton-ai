@@ -96,9 +96,6 @@ jobs:
         with:
           key: ${{ matrix.target }}
 
-      - name: Build
-        run: cargo build --target ${{ matrix.target }}
-
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
