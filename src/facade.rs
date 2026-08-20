@@ -2273,9 +2273,12 @@ impl ActonAIBuilder {
     /// through the same policy gate and audit trail they do.
     ///
     /// Names are validated at [`launch`](Self::launch): a custom tool that
-    /// collides with an enabled built-in, a skill tool, an MCP tool, or
-    /// another custom tool fails the launch rather than silently shadowing
-    /// anything.
+    /// collides with an enabled built-in, a skill tool, an MCP tool, a name
+    /// the prompt loop reserves for itself
+    /// ([`STRUCTURED_OUTPUT_TOOL`](crate::extract::STRUCTURED_OUTPUT_TOOL),
+    /// [`EXIT_CONVERSATION_TOOL`](crate::conversation::EXIT_CONVERSATION_TOOL)),
+    /// or another custom tool fails the launch rather than silently
+    /// shadowing anything.
     ///
     /// # Example
     ///
@@ -3296,6 +3299,14 @@ async fn start_introspection(
 /// `manual_builtins()`, because `PromptBuilder::use_builtins()` can put them
 /// on any prompt later; a name that *might* be injected is not a name a
 /// custom tool can safely hold.
+///
+/// The prompt loop's own tool names are reserved on the same reasoning:
+/// `extract()` appends [`crate::extract::STRUCTURED_OUTPUT_TOOL`] to any
+/// prompt, and a conversation with the exit tool enabled appends
+/// [`crate::conversation::EXIT_CONVERSATION_TOOL`]. A custom tool holding
+/// either name would launch fine and then either fail every extraction at
+/// call time or silently swallow the model's exit call — exactly the
+/// mid-conversation discovery this check exists to prevent.
 fn validate_custom_tool_names(
     custom_tools: &[crate::prompt::SharedToolSpec],
     builtins: Option<&BuiltinTools>,
@@ -3303,6 +3314,14 @@ fn validate_custom_tool_names(
     mcp: Option<&crate::mcp::McpTools>,
 ) -> Result<(), ActonAIError> {
     let mut taken: HashMap<String, &'static str> = HashMap::new();
+    taken.insert(
+        crate::extract::STRUCTURED_OUTPUT_TOOL.to_string(),
+        "the reserved structured-output extraction tool",
+    );
+    taken.insert(
+        crate::conversation::EXIT_CONVERSATION_TOOL.to_string(),
+        "the reserved conversation-exit tool",
+    );
     if let Some(builtins) = builtins {
         for (_, config) in builtins.configs() {
             taken.insert(config.definition.name.clone(), "a built-in tool");

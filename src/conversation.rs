@@ -71,6 +71,19 @@ RESPONSE STYLE:
 ENDING:
 Call `exit_conversation` with a short friendly farewell when the user clearly wants to leave. Triggers include: bye, goodbye, quit, exit, stop, done, that's all, thanks that's it, see ya, later, no more questions, I'm good.";
 
+/// Name of the conversation-exit tool the chat loop injects.
+///
+/// Exists for embedders (and this crate's own launch validation) that need
+/// to know which tool name the framework reserves for itself:
+/// [`Conversation::run_chat`] and
+/// [`ConversationBuilder::with_exit_tool`] register a tool under this name,
+/// so a custom tool holding it would silently intercept the model's exit
+/// call and the chat could never end through the tool. Both
+/// [`ConversationBuilder`] registration and
+/// [`ActonAIBuilder::launch`](crate::ActonAIBuilder::launch) therefore
+/// refuse the name outright.
+pub const EXIT_CONVERSATION_TOOL: &str = "exit_conversation";
+
 // =========================================================================
 // ChatConfig (unchanged from original)
 // =========================================================================
@@ -200,7 +213,7 @@ impl std::fmt::Debug for ChatConfig {
 /// Creates the exit tool definition for conversation termination.
 fn exit_tool_definition() -> ToolDefinition {
     ToolDefinition {
-        name: "exit_conversation".to_string(),
+        name: EXIT_CONVERSATION_TOOL.to_string(),
         description: "Call this tool when the user wants to end the conversation, \
                       say goodbye, or leave. Examples: 'bye', 'goodbye', 'I'm done', \
                       'quit', 'exit', 'see ya', 'thanks, that's all'."
@@ -1308,7 +1321,7 @@ impl ConversationBuilder {
     /// clash discovered there would be exactly the silent shadow this check
     /// exists to prevent.
     fn ensure_tool_name_free(&self, name: &str) -> Result<(), ActonAIError> {
-        let collides_with = if name == "exit_conversation" {
+        let collides_with = if name == EXIT_CONVERSATION_TOOL {
             Some("the reserved exit_conversation tool")
         } else if self.tools.iter().any(|tool| tool.name() == name) {
             Some("a tool already registered on this conversation")

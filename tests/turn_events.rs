@@ -37,6 +37,7 @@ mod mock_llm;
 use acton_ai::prelude::*;
 use mock_llm::{contains_ref, runtime_pointed_at, tool_named, MockServer, Round};
 use serde_json::{json, Value};
+use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -536,6 +537,146 @@ async fn tool_started_carries_the_arguments_the_model_proposed() {
         !contains_ref(&offered["function"]["parameters"]),
         "provider support for $ref inside a tool schema is inconsistent, so it must be inlined"
     );
+}
+
+// =============================================================================
+// 5b. The announced arguments cross the same redaction boundary as the trail
+// =============================================================================
+
+#[tokio::test]
+async fn tool_started_arguments_are_redacted_when_a_trail_is_configured() {
+    // The audit file redacts at the boundary so a secret never reaches the
+    // audit actor's mailbox. `ToolStarted` fans out to *every* lifecycle
+    // subscriber's mailbox — the introspection actor, an embedder's
+    // forwarder rendering arguments in a client UI — so the same boundary
+    // must apply, or the redaction config keeps secrets out of the file
+    // while broadcasting them everywhere else.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let server = MockServer::start(vec![
+        Round::tool_call(
+            "call_1",
+            "echo",
+            json!({"api_key": "sk-live-do-not-broadcast-me", "value": "safe"}),
+        ),
+        Round::text("done"),
+    ])
+    .await;
+
+    let mut ai = ActonAI::builder()
+        .app_name("turn-args-redacted")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(dir.path().join("audit.jsonl"))
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+    let recorder = spawn_recorder(ai.runtime_mut()).await;
+
+    ai.prompt("go")
+        .with_tool(tool_definition("echo"), |args| async move { Ok(args) })
+        .collect()
+        .await
+        .expect("the turn must succeed");
+
+    let events = recorded(&ai, &recorder).await;
+    let arguments = events
+        .iter()
+        .find_map(|e| match e {
+            Seen::ToolStarted { arguments, .. } => Some(arguments.clone()),
+            _ => None,
+        })
+        .expect("a tool call must be announced");
+
+    assert!(
+        !arguments.contains("sk-live-do-not-broadcast-me"),
+        "a secret must never ride a lifecycle broadcast: {arguments}"
+    );
+    let parsed: Value =
+        serde_json::from_str(&arguments).expect("the arguments must be carried as real JSON");
+    assert_eq!(parsed["api_key"], json!("[redacted]"));
+    assert_eq!(
+        parsed["value"],
+        json!("safe"),
+        "redaction must be surgical, not wholesale"
+    );
+
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+// =============================================================================
+// 5c. A turn dropped on a foreign thread still balances its start
+// =============================================================================
+
+#[tokio::test]
+async fn a_turn_dropped_on_a_non_tokio_thread_still_publishes_its_finish() {
+    // The `Send + Sync` `collect()` future exists so an embedder can store a
+    // turn in its own session table; the thread that later drops that entry
+    // — a UI thread, a C-FFI callback, a watchdog `std::thread` — has no
+    // Tokio context. The drop guard must still publish the balancing
+    // `TurnFinished`, or the introspection actor counts the turn in-flight
+    // forever and `acton-ai drain --wait` wedges.
+    let server = MockServer::start(vec![Round::text("never read")]).await;
+    let mut ai = runtime_pointed_at(&server, "turn-drop-off-runtime").await;
+    let recorder = spawn_recorder(ai.runtime_mut()).await;
+
+    // Drive the future by hand so it can be abandoned mid-turn: poll until
+    // the recorder has seen `TurnStarted`, then never poll it again. The
+    // future cannot advance past our last poll, so it is still in flight
+    // when it is dropped. Bounded loop, no sleeps: `recorded` is the
+    // flush-barrier, `yield_now` lets the actors run.
+    let mut fut = Box::pin(ai.prompt("go").collect());
+    let waker = futures::task::noop_waker();
+    let mut started = false;
+    for _ in 0..10_000 {
+        let mut cx = std::task::Context::from_waker(&waker);
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "the turn must still be in flight when it is abandoned"
+        );
+        if recorded(&ai, &recorder)
+            .await
+            .iter()
+            .any(|e| matches!(e, Seen::TurnStarted { .. }))
+        {
+            started = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(started, "the turn must announce itself before the drop");
+
+    std::thread::spawn(move || {
+        assert!(
+            tokio::runtime::Handle::try_current().is_err(),
+            "this thread must have no ambient runtime, or the test proves nothing"
+        );
+        drop(fut);
+    })
+    .join()
+    .expect("the dropping thread must not panic");
+
+    // The guard spawned the balancing broadcast onto the runtime handle it
+    // captured at construction; yield until it lands.
+    let mut finished = false;
+    for _ in 0..10_000 {
+        if recorded(&ai, &recorder)
+            .await
+            .iter()
+            .any(|e| matches!(e, Seen::TurnFinished { .. }))
+        {
+            finished = true;
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        finished,
+        "a turn dropped on a non-Tokio thread must still balance its start"
+    );
+
+    ai.shutdown().await.expect("clean shutdown");
 }
 
 // =============================================================================

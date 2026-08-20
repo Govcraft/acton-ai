@@ -124,6 +124,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Launch-time custom tool validation now reserves the prompt loop's own tool
+  names. A runtime-wide custom tool named `structured_output` or
+  `exit_conversation` used to launch fine and misbehave later — every
+  `.extract::<T>()` failed at call time, and a conversation's exit tool was
+  silently shadowed so a chat could never end through it. Both names now fail
+  `launch()` like any other collision, and they are published as
+  `extract::STRUCTURED_OUTPUT_TOOL` and `conversation::EXIT_CONVERSATION_TOOL`
+  so an embedder can avoid them without hardcoding strings.
+- `TurnLifecycle::ToolStarted` no longer broadcasts secret-bearing arguments
+  past the audit redactor. Trail entries were redacted at the boundary, but
+  the lifecycle broadcast carried the model's arguments raw into every
+  subscriber's mailbox — an embedder forwarding lifecycle events to a UI or a
+  log received exactly what the redaction config promised to withhold. With a
+  trail configured, `ToolStarted` arguments now pass through the same
+  redactor; without one they are unchanged.
+- A turn future dropped from a thread outside any Tokio context now still
+  publishes its balancing `TurnFinished`. The drop guard used to look up the
+  ambient runtime at drop time and silently give up without one, so an
+  embedder storing the `Send + Sync` `collect()` future in a session table
+  and dropping it from a UI thread, C-FFI callback, or watchdog thread left
+  the turn counted in-flight forever and wedged `acton-ai drain --wait`. The
+  guard now captures the runtime handle at construction and spawns the
+  broadcast on it, falling back to the ambient handle as before.
+- Reused caller-supplied turn ids no longer corrupt the in-flight accounting.
+  The introspection actor kept live turns in a set, so two concurrent turns
+  sharing a `PromptBuilder::turn_id` — or a cancel-and-retry whose
+  interrupted finish landed after the retry started — let one finish erase
+  the other's live turn and sweep its in-flight tools, and a drain could
+  report drained mid-turn. Starts and finishes are now counted per id, an
+  unmatched finish is a no-op, and the tool sweep runs only when an id goes
+  fully dead.
 - A dropped sandbox execution no longer leaks the child process. Cancelling
   the execute future mid-flight — a caller-side timeout, an aborted turn —
   left the re-exec'd child running detached until its own resource limits

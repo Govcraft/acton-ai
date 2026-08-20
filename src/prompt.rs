@@ -969,6 +969,16 @@ impl PromptBuilder {
     /// Callers that only need the id *after* the turn can skip this and read
     /// it from [`CollectedResponse::turn_id`] instead.
     ///
+    /// # Uniqueness
+    ///
+    /// Nothing forces a supplied id to be unique, and the runtime's own
+    /// accounting does not need it to be: the introspection actor counts
+    /// starts and finishes per id, so a cancel-and-retry that reuses the id
+    /// it already announced stays correct even when the cancelled turn's
+    /// interrupted finish lands after the retry started. Avoid holding two
+    /// turns *live* under one id all the same — lifecycle events key on the
+    /// id, so your own subscribers cannot tell the two turns' events apart.
+    ///
     /// # Example
     ///
     /// ```rust,ignore
@@ -1802,9 +1812,16 @@ impl PromptBuilder {
 /// neither `.await` the broadcast nor block on it without risking a deadlock
 /// on the very runtime that is dropping the future. It therefore hands the
 /// send to a spawned task — the same fire-and-forget shape
-/// [`StreamCollectorSessionInner`]'s `Drop` already uses. Outside a Tokio
-/// runtime there is nothing to spawn on, and nothing to notify either: the
-/// process is past caring about its own drain.
+/// [`StreamCollectorSessionInner`]'s `Drop` already uses — on the runtime
+/// handle captured when the guard was built. Captured, not looked up at
+/// drop time: `Drop` can run on a thread with no Tokio context at all — an
+/// embedder stores the `Send + Sync` `collect()` future in its own session
+/// table and a UI thread, a C-FFI callback, or a watchdog `std::thread`
+/// drops the entry — and on that thread `Handle::try_current()` offers
+/// nothing while the runtime that started the turn is still healthy and
+/// still counting the turn in-flight. The ambient handle remains the
+/// fallback for the degenerate case of a guard built with no handle
+/// current.
 ///
 /// # Why the normal path cannot double-fire
 ///
@@ -1818,6 +1835,9 @@ impl PromptBuilder {
 struct TurnFinishedGuard {
     broker: BrokerRef,
     turn_id: TurnId,
+    /// Where `Drop` spawns the balancing broadcast. See the type-level note
+    /// on why this is captured at construction instead of looked up at drop.
+    handle: Option<tokio::runtime::Handle>,
     fired: bool,
 }
 
@@ -1827,6 +1847,10 @@ impl TurnFinishedGuard {
         Self {
             broker,
             turn_id,
+            // Effectively always `Some`: `new` runs inside the prompt loop's
+            // async context. `try_current` rather than `current` so a guard
+            // built anywhere stranger degrades instead of panicking.
+            handle: tokio::runtime::Handle::try_current().ok(),
             fired: false,
         }
     }
@@ -1852,7 +1876,11 @@ impl Drop for TurnFinishedGuard {
         }
         let broker = self.broker.clone();
         let turn_id = self.turn_id.clone();
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        let handle = self
+            .handle
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
+        if let Some(handle) = handle {
             handle.spawn(async move {
                 broker
                     .broadcast(TurnLifecycle::TurnFinished {
@@ -2394,13 +2422,26 @@ impl ToolStep<'_> {
     /// run: at this point the gate has not been consulted, so a hook has had
     /// no chance to rewrite them and the proposed set is the only one that
     /// exists. What actually ran is the audit trail's business.
+    ///
+    /// When a trail is configured, the arguments pass through its redactor
+    /// first, exactly as the trail's own entries do: this broadcast fans out
+    /// to every [`TurnLifecycle`] subscriber's mailbox — the introspection
+    /// actor, an embedder's lifecycle forwarder — and those mailboxes are
+    /// precisely the places the redaction config promises a secret never
+    /// reaches. Publishing raw here would keep the secret out of the audit
+    /// file while delivering it to every UI and log downstream of the
+    /// broker.
     async fn start_tool(&self, tool_call: &ToolCall) {
+        let arguments = match self.audit {
+            Some((_, config)) => config.redactor().redact(&tool_call.arguments),
+            None => tool_call.arguments.clone(),
+        };
         self.provider_handle
             .broadcast(TurnLifecycle::ToolStarted {
                 turn_id: self.turn_id.clone(),
                 tool_call_id: tool_call.id.clone(),
                 tool_name: tool_call.name.clone(),
-                arguments: tool_call.arguments.clone(),
+                arguments,
             })
             .await;
     }

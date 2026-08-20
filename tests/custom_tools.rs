@@ -324,6 +324,60 @@ async fn two_custom_tools_with_one_name_fail_launch() {
 }
 
 #[tokio::test]
+async fn a_custom_tool_claiming_the_extraction_tool_name_fails_launch() {
+    // Before launch reserved this name, the misconfiguration surfaced one
+    // call at a time: the runtime launched fine and then every later
+    // `.extract::<T>()` failed because the custom tool already held
+    // `structured_output`.
+    let server = MockServer::start(vec![]).await;
+
+    let result = ActonAI::builder()
+        .app_name("custom-collision-extraction")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .with_tool(tool_definition("structured_output"), |args| async move {
+            Ok(args)
+        })
+        .launch()
+        .await;
+
+    let error =
+        result.expect_err("a custom tool holding the extraction tool name must fail the launch");
+    let message = error.to_string();
+    assert!(message.contains("structured_output"), "{message}");
+    assert!(message.contains("reserved"), "{message}");
+}
+
+#[tokio::test]
+async fn a_custom_tool_claiming_the_exit_tool_name_fails_launch() {
+    // Worse than the extraction case: the conversation path injects
+    // runtime-wide tools *before* appending the real exit tool, and tool
+    // lookup is first-match — so this name would never error later, it
+    // would silently swallow the model's exit call and the chat could never
+    // end through the tool.
+    let server = MockServer::start(vec![]).await;
+
+    let result = ActonAI::builder()
+        .app_name("custom-collision-exit")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .with_tool(tool_definition("exit_conversation"), |args| async move {
+            Ok(args)
+        })
+        .launch()
+        .await;
+
+    let error = result.expect_err("a custom tool holding the exit tool name must fail the launch");
+    let message = error.to_string();
+    assert!(message.contains("exit_conversation"), "{message}");
+    assert!(message.contains("reserved"), "{message}");
+}
+
+#[tokio::test]
 async fn a_conversation_tool_colliding_with_a_builtin_is_refused_at_registration() {
     let server = MockServer::start(vec![]).await;
 

@@ -732,7 +732,7 @@ pub enum TurnLifecycle {
         tool_call_id: String,
         /// The tool being executed.
         tool_name: String,
-        /// The arguments **the model proposed**, verbatim.
+        /// The arguments **the model proposed**, redacted like the trail.
         ///
         /// Not the arguments that necessarily ran: an approval hook may
         /// rewrite them, and the gate may refuse the call outright. This is
@@ -740,6 +740,13 @@ pub enum TurnLifecycle {
         /// to the tool's name, and it is the only version that exists at the
         /// point the call is announced. What actually ran is in the audit
         /// trail.
+        ///
+        /// When an audit trail with a redaction list is configured, the
+        /// listed keys arrive as `[redacted]` here too. This broadcast lands
+        /// in every subscriber's mailbox — a lifecycle forwarder that
+        /// renders or persists arguments is exactly the place a redaction
+        /// config exists to keep a secret out of — so it crosses the same
+        /// boundary the trail's entries cross, redacted the same way.
         arguments: serde_json::Value,
     },
     /// A tool call finished, successfully or not — including a call the gate
