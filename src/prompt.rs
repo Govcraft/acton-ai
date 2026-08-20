@@ -88,6 +88,30 @@ const MAX_STREAM_RETRIES: u32 = 2;
 /// here is a dropped connection that a fresh request usually clears.
 const STREAM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// A corrective note for a round the provider killed because the model
+/// called a tool that does not exist.
+///
+/// Hosts that validate tool calls server-side (Groq, among others) reject
+/// such a round mid-stream, so the hallucinated call never reaches the tool
+/// loop — where an unknown tool would normally be answered with an error
+/// result the model can read and correct from. Re-dispatching the identical
+/// context just reproduces the hallucination; this note gives the retry the
+/// same feedback the tool result would have carried.
+fn hallucinated_tool_correction(reason: &str) -> Option<String> {
+    if !reason.contains("not in request.tools") {
+        return None;
+    }
+    // Groq's message quotes the offending name: "attempted to call tool
+    // 'repo_browser.print_tree' which was not in request.tools". Absent the
+    // quotes, the note still lands — the model knows what it just called.
+    let name = reason.split('\'').nth(1).unwrap_or("that tool");
+    Some(format!(
+        "Your previous response called a tool named '{name}', which does not \
+         exist. Call only the tools listed in this conversation's tool \
+         definitions, exactly as they are named there."
+    ))
+}
+
 /// Type alias for start callbacks.
 ///
 /// The [`StreamContext`] names the turn and the round that is starting, so a
@@ -2052,6 +2076,17 @@ impl PromptBuilder {
                             if let Some(reason) = round.transient_error.as_deref() {
                                 if stream_retries < MAX_STREAM_RETRIES {
                                     stream_retries += 1;
+                                    // A hallucinated tool call fails the same
+                                    // way on every identical dispatch, so the
+                                    // retry carries the feedback an unknown
+                                    // tool would normally get as its result.
+                                    if let Some(correction) = hallucinated_tool_correction(reason) {
+                                        if messages.last().map(|m| m.content.as_str())
+                                            != Some(correction.as_str())
+                                        {
+                                            messages.push(Message::user(correction));
+                                        }
+                                    }
                                     tracing::warn!(
                                         provider = %candidate,
                                         attempt = stream_retries,
@@ -3688,6 +3723,29 @@ mod tests {
             outcome_for(&ActonAIError::turns_not_admitted(
                 crate::introspection::AdmissionState::Paused
             ))
+        );
+    }
+
+    #[test]
+    fn a_validation_failure_names_the_hallucinated_tool_in_the_correction() {
+        let reason = "streaming error: provider reported an error mid-stream: \
+                      Tool call validation failed: tool call validation failed: \
+                      attempted to call tool 'repo_browser.print_tree' which was \
+                      not in request.tools";
+        let correction =
+            hallucinated_tool_correction(reason).expect("a validation failure must correct");
+        assert!(
+            correction.contains("'repo_browser.print_tree'"),
+            "{correction}"
+        );
+    }
+
+    #[test]
+    fn ordinary_transient_failures_get_no_correction() {
+        assert!(hallucinated_tool_correction("stream read error: connection reset").is_none());
+        assert!(
+            hallucinated_tool_correction("provider reported an error mid-stream: overloaded")
+                .is_none()
         );
     }
 

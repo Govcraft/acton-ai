@@ -68,3 +68,44 @@ async fn a_persistently_broken_stream_fails_after_bounded_retries() {
         "the loop should stop at the original dispatch plus two retries"
     );
 }
+
+#[tokio::test]
+async fn a_hallucinated_tool_rejection_feeds_the_correction_into_the_retry() {
+    let server = MockServer::start(vec![
+        Round::mid_stream_error(
+            "",
+            "Tool call validation failed: tool call validation failed: \
+             attempted to call tool 'repo_browser.print_tree' which was not in request.tools",
+        ),
+        Round::text("used a real tool this time"),
+    ])
+    .await;
+    let runtime = runtime_pointed_at(&server, "stream-retry-correction-test").await;
+
+    let response = runtime
+        .prompt("Explore the repository.")
+        .collect()
+        .await
+        .expect("the corrected retry must answer");
+    assert_eq!(response.text, "used a real tool this time");
+
+    // The retry is not a blind re-dispatch: its context must carry the
+    // feedback an unknown-tool result would have carried, naming the tool
+    // the model invented.
+    let requests = server.requests();
+    assert_eq!(requests.len(), 2);
+    let retry_messages = requests[1]["messages"]
+        .as_array()
+        .expect("the retry must carry messages");
+    let last = retry_messages
+        .last()
+        .expect("the retry must not have an empty context");
+    assert_eq!(last["role"], "user");
+    assert!(
+        last["content"]
+            .as_str()
+            .expect("the correction is text")
+            .contains("'repo_browser.print_tree'"),
+        "the correction must name the hallucinated tool: {last}"
+    );
+}
