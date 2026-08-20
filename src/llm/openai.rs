@@ -648,7 +648,9 @@ impl LLMClient for OpenAIClient {
             return Err(self.parse_error_response(response).await);
         }
 
-        let stream = response.bytes_stream();
+        // Chunk boundaries can split an SSE line (or a UTF-8 character)
+        // anywhere, so reassemble complete lines before parsing.
+        let stream = crate::llm::sse::lines(response.bytes_stream());
 
         // State carried through the unfold iteration.
         // This eliminates the need for Arc<Mutex<>> by owning state directly.
@@ -696,11 +698,10 @@ impl LLMClient for OpenAIClient {
                     };
 
                     match result {
-                        Ok(bytes) => {
-                            let text = String::from_utf8_lossy(&bytes);
+                        Ok(lines) => {
                             let mut first_id = None;
 
-                            for line in text.lines() {
+                            for line in &lines {
                                 if line.trim() == "data: [DONE]" {
                                     state.saw_done = true;
                                 }

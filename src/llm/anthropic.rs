@@ -424,14 +424,10 @@ impl AnthropicClient {
             return Err(error);
         }
 
-        let stream = response.bytes_stream().map(move |result| {
-            result
-                .map_err(|e| LLMError::stream_error(format!("stream read error: {}", e)))
-                .and_then(|bytes| {
-                    let text = String::from_utf8_lossy(&bytes);
-                    Self::parse_sse_events(&text)
-                })
-        });
+        // Chunk boundaries can split an SSE line (or a UTF-8 character)
+        // anywhere, so reassemble complete lines before parsing.
+        let stream = crate::llm::sse::lines(response.bytes_stream())
+            .map(|result| result.and_then(|lines| Self::parse_sse_events(&lines.join("\n"))));
 
         // Flatten the nested stream
         Ok(stream.flat_map(|result| {

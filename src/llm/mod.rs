@@ -12,6 +12,7 @@ pub(crate) mod failover;
 mod openai;
 mod provider;
 pub(crate) mod sanitize;
+pub(crate) mod sse;
 mod streaming;
 
 pub use anthropic::AnthropicClient;
