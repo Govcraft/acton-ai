@@ -2,7 +2,7 @@
 title: The Two API Levels
 ---
 
-acton-ai exposes two API levels that share the same actor-based runtime. The **high-level API** (`ActonAI`, `PromptBuilder`, `Conversation`) handles actor setup and message routing for you. The **low-level API** (`Kernel`, `Agent`, `ToolRegistry`, `MemoryStore`, `LLMProvider`) gives you direct control over every actor in the system.
+acton-ai exposes two API levels that share the same actor-based runtime. The **high-level API** (`ActonAI`, `PromptBuilder`, `Conversation`) handles actor setup and message routing for you. The **low-level API** (`Kernel`, `Agent`, `ToolActor`, `MemoryStore`, `LLMProvider`) gives you direct control over every actor in the system.
 
 ## High-level API
 
@@ -85,7 +85,7 @@ The low-level API gives you direct access to the actor primitives. Use it when y
 | `Kernel` | Central supervisor. Manages agent lifecycles, routes inter-agent messages, capability discovery. |
 | `Agent` | Individual AI agent actor. Owns conversation history, state machine, tool handles. |
 | `LLMProvider` | LLM API client actor. Handles rate limiting, retries, streaming. |
-| `ToolRegistry` | Central tool registration and execution dispatch actor. Supports sandboxed execution. |
+| `ToolActor` | Per-agent tool actor, supervised by its owning agent. |
 | `MemoryStore` | Persistent conversation storage and semantic memory retrieval actor. |
 | `LLMRequest` / `LLMStreamToken` / etc. | The raw messages that flow between actors. |
 
@@ -174,7 +174,7 @@ With the low-level API, you are responsible for creating actors, subscribing to 
 | Multiple providers, simple routing | High-level (`.provider("name")`) |
 | Custom stateful stream processing | Low-level (`StreamHandler` trait or custom actor) |
 | Multi-agent collaboration | Low-level (`Kernel` + multiple `Agent` actors) |
-| Custom tool execution dispatch | Low-level (`ToolRegistry` + `Agent`) |
+| Custom tool execution dispatch | Low-level (`ToolActor` + `Agent`) |
 | Persistent memory and embeddings | Low-level (`MemoryStore`) |
 | Integration with existing actor system | Low-level (share `ActorRuntime`) |
 

@@ -361,10 +361,7 @@ fn test_tool_definition() {
 // Phase 3: Tool System Integration Tests
 // ============================================================================
 
-use acton_ai::tools::{
-    RegisterTool, ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait, ToolRegistry,
-};
-use std::sync::Arc;
+use acton_ai::tools::{ToolConfig, ToolError, ToolExecutionFuture, ToolExecutorTrait};
 
 /// A simple echo tool for testing.
 #[derive(Debug)]
@@ -384,61 +381,6 @@ impl ToolExecutorTrait for FailingTool {
     fn execute(&self, _args: serde_json::Value) -> ToolExecutionFuture {
         Box::pin(async move { Err(ToolError::execution_failed("failing_tool", "always fails")) })
     }
-}
-
-/// Test spawning the Tool Registry actor.
-#[tokio::test]
-async fn test_spawn_tool_registry() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn the registry
-    let registry = ToolRegistry::spawn(&mut runtime).await;
-
-    // The registry should have a valid handle - check that root is "tool_registry"
-    let id_str = registry.id().root().to_string();
-    assert!(
-        id_str.contains("tool_registry"),
-        "Expected tool_registry in id: {}",
-        id_str
-    );
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
-}
-
-/// Test registering a tool with the registry.
-#[tokio::test]
-async fn test_register_tool() {
-    let mut runtime = ActonApp::launch_async().await;
-
-    // Spawn the registry
-    let registry = ToolRegistry::spawn(&mut runtime).await;
-
-    // Create a tool definition
-    let tool_def = ToolDefinition {
-        name: "echo".to_string(),
-        description: "Echoes input back".to_string(),
-        input_schema: serde_json::json!({
-            "type": "object",
-            "properties": {
-                "message": {"type": "string"}
-            }
-        }),
-    };
-
-    // Register the tool
-    registry
-        .send(RegisterTool {
-            config: ToolConfig::new(tool_def),
-            executor: Arc::new(Box::new(EchoTool) as Box<dyn ToolExecutorTrait>),
-        })
-        .await;
-
-    // Give time for message processing
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // Graceful shutdown
-    runtime.shutdown_all().await.expect("Shutdown failed");
 }
 
 /// Test tool error types.

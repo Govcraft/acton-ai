@@ -40,6 +40,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   default and not gated in CI: it builds AWS-LC from source and needs CMake
   and Go, and it must be a release build because the module's power-on
   integrity self-test does not survive a debug build's relocations.
+- **Runtime-wide custom tool registration.** `ActonAIBuilder::with_tool`
+  (definition + async closure), `with_tool_executor` (a `ToolExecutorTrait`
+  object; its `validate_args` runs before every execution), and `add_tool`
+  (a `Tool` value, the shape `#[tool]` generates) register a tool once and
+  inject it into every prompt and every conversation turn, alongside the
+  built-ins, skill tools, and MCP tools. Custom tools execute on the same
+  path as the built-ins — behind the tool-approval policy gate and onto the
+  audit trail when those are configured. Names are validated at `launch()`:
+  a custom tool that collides with an enabled built-in, a skill tool, an MCP
+  tool, or another custom tool fails the launch instead of silently
+  shadowing anything. Downstream embedders (an agent daemon installing an
+  `apply_patch` tool, say) previously had to re-register such tools on every
+  `PromptBuilder` — and could not reach `Conversation::send` at all.
+- **Per-conversation tools.** `ConversationBuilder::with_tool` /
+  `with_tool_executor` / `add_tool` register a tool for every turn one
+  conversation runs, closing the gap where `Conversation` rebuilt its prompt
+  internally and per-prompt registration could never reach it. Collisions —
+  with an injected runtime tool, another conversation tool, or the reserved
+  `exit_conversation` name — are refused at registration time with a
+  configuration error, never discovered mid-conversation.
 
 ### Changed
 
@@ -48,6 +68,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   build is unchanged. **A `--no-default-features` build that relied on TLS
   must now name `tls-ring` (or `fips`) explicitly**, where it previously got
   the *ring* stack implicitly.
+
+### Removed
+
+- **The orphaned `ToolRegistry` path.** `ToolRegistry`, `RegisterTool`,
+  `UnregisterTool`, `ListTools`, `ToolListResponse`, `RegisteredTool`,
+  `InitToolRegistry`, `RegistryMetrics`, `RegistryMetricsSnapshot`, the
+  one-shot `ToolExecutor` actor (`Execute`, `InitExecutor`), and the
+  `ExecuteTool` / `ToolResponse` messages are gone. Nothing in the facade,
+  the prompt loop, or the agents ever routed through them — the registry was
+  a dead end that *looked* like the way to register a global tool while the
+  real path did not exist. It is replaced, not merely deleted:
+  `ActonAIBuilder::with_tool` and `ConversationBuilder::with_tool` (above)
+  are the supported global and per-conversation registration paths, and both
+  actually reach every prompt. Per-agent tool actors (`ToolActor`,
+  `ExecuteToolDirect`, `ToolActorResponse`) are unchanged.
 
 ## 0.31.0 - 2026-08-16
 

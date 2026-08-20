@@ -178,8 +178,7 @@ pub mod prelude {
     pub use crate::messages::*;
     pub use crate::tools::builtins::BuiltinTools;
     pub use crate::tools::{
-        RegisterTool, Tool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind,
-        ToolExecutorTrait, ToolFuture, ToolRegistry,
+        Tool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind, ToolExecutorTrait, ToolFuture,
     };
 
     /// The [`#[tool]`](macro@crate::tool) attribute macro.

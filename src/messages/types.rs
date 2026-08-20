@@ -729,30 +729,6 @@ pub struct ToolCall {
     pub arguments: serde_json::Value,
 }
 
-/// Request to execute a tool.
-#[acton_message]
-#[derive(Serialize, Deserialize)]
-pub struct ExecuteTool {
-    /// Correlation ID for matching to response
-    pub correlation_id: CorrelationId,
-    /// The tool call to execute
-    pub tool_call: ToolCall,
-    /// The agent requesting the tool execution
-    pub requesting_agent: AgentId,
-}
-
-/// Response from tool execution.
-#[acton_message]
-#[derive(Serialize, Deserialize)]
-pub struct ToolResponse {
-    /// Correlation ID matching the request
-    pub correlation_id: CorrelationId,
-    /// The ID of the tool call this responds to
-    pub tool_call_id: String,
-    /// The result of the tool execution (success content or error message)
-    pub result: Result<String, String>,
-}
-
 // =============================================================================
 // System Events (Pub/Sub)
 // =============================================================================
