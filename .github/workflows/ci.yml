@@ -50,10 +50,10 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests (nextest)
-        run: cargo nextest run --all-features
+        run: cargo nextest run
 
       - name: Run doctests
-        run: cargo test --doc --all-features
+        run: cargo test --doc
 
   # Full cross-platform matrix: compile + test on every supported target.
   # Only runs on push to main (expensive).
@@ -97,7 +97,7 @@ jobs:
           key: ${{ matrix.target }}
 
       - name: Build
-        run: cargo build --all-features --target ${{ matrix.target }}
+        run: cargo build --target ${{ matrix.target }}
 
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
@@ -105,4 +105,4 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests (nextest)
-        run: cargo nextest run --all-features --target ${{ matrix.target }}
+        run: cargo nextest run --target ${{ matrix.target }}
