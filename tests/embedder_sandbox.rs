@@ -5,6 +5,8 @@
 //! handles, wrap them in its own tool types, and run real work through the
 //! re-exec'd `acton-ai` binary — no crate-private plumbing anywhere.
 
+#![cfg(unix)] // every case drives a POSIX bash through the sandbox child
+
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
