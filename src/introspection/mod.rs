@@ -132,7 +132,12 @@ impl IntrospectionConfig {
         socket_mode: Option<u32>,
     ) -> Result<Self, crate::error::ActonAIError> {
         if let Some(path) = socket_path.as_ref() {
-            if !path.is_absolute() {
+            // `has_root` alongside `is_absolute`: on Unix the two are the same
+            // test, but a Unix socket path like `/run/user/1000/agent.sock` is
+            // not "absolute" to Windows (no drive prefix), and a config shared
+            // across platforms must still parse on a Windows build, where the
+            // socket is never created anyway.
+            if !(path.is_absolute() || path.has_root()) {
                 return Err(crate::error::ActonAIError::configuration(
                     "introspection.socket_path",
                     format!(

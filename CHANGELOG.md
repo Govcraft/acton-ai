@@ -154,7 +154,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the upstream `ipc` feature is enabled through a `cfg(unix)` dependency
   entry, and every `ipc`-gated code site now gates on
   `all(feature = "ipc", unix)`. Same philosophy as `sandbox-hardening`,
-  which has always been a no-op off Linux.
+  which has always been a no-op off Linux. Relatedly, socket-path validation
+  now accepts Unix-style absolute paths on Windows (`Path::is_absolute`
+  demands a drive prefix there), so a config file shared across platforms
+  still parses on a Windows build.
 - **A refused resume can no longer reopen a finished turn.** Marking a failed
   turn's checkpoint now leaves terminal records — `Completed`, `Abandoned` —
   exactly as they are, so a pre-flight refusal (changed inputs, an abandoned
