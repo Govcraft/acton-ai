@@ -13,8 +13,8 @@ use std::future::Future;
 
 /// Message to execute a tool directly (sent to individual tool actors).
 ///
-/// Unlike `ExecuteTool` which is routed through the registry, this message
-/// is sent directly to a specific tool actor.
+/// Sent point-to-point to a specific tool actor rather than routed through
+/// any shared dispatcher, so each agent's tools stay isolated.
 #[acton_message]
 #[derive(Serialize, Deserialize)]
 pub struct ExecuteToolDirect {

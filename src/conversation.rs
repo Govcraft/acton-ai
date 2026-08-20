@@ -35,7 +35,7 @@
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::messages::{Message, ToolDefinition};
-use crate::prompt::{build_stream_collector, StreamCollectorSession};
+use crate::prompt::{build_stream_collector, SharedToolSpec, StreamCollectorSession};
 use crate::stream::CollectedResponse;
 use crate::types::ConversationId;
 use acton_reactive::prelude::*;
@@ -324,6 +324,10 @@ struct HandlerState {
     /// time and is reused by every turn so we don't stack dead broker
     /// subscribers (acton-reactive's `UnsubscribeBroker` is a no-op).
     stream_session: StreamCollectorSession,
+    /// Per-conversation tools, staged on the [`ConversationBuilder`] and
+    /// re-registered on the prompt of every turn. Callback-free and behind
+    /// shared executors, so cloning one per turn shares the executor.
+    tools: Vec<SharedToolSpec>,
 }
 
 /// Registers all message handlers on the `ConversationActor` builder.
@@ -340,6 +344,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         system_prompt_tx,
         context_window,
         stream_session,
+        tools,
     } = state;
     // ----- ConvSend: push user msg, run LLM call, await it -----
     {
@@ -353,6 +358,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
         let system_prompt_rx = system_prompt_rx.clone();
         let context_window = context_window.clone();
         let stream_session = stream_session.clone();
+        let tools = tools.clone();
 
         builder.mutate_on::<ConvSend>(move |actor, ctx| {
             let msg = ctx.message().clone();
@@ -376,6 +382,10 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
             let token_target = msg.token_target;
             let self_handle = self_handle.clone();
             let stream_session = stream_session.clone();
+            // Cloned in the shared (Sync) shape; converted to per-prompt
+            // specs only inside the spawned task, because `ToolSpec` is not
+            // `Sync` and the `Reply::pending` future must be.
+            let turn_tools: Vec<SharedToolSpec> = tools.clone();
 
             // The LLM call runs in a spawned task because PromptBuilder
             // contains non-Sync callbacks (FnMut). The spawned task only
@@ -391,6 +401,13 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, ConversationActor>, state
                     if let Some(ref system) = system_prompt {
                         builder = builder.system(system);
                     }
+
+                    // Per-conversation tools ride on every turn, in the same
+                    // spec list as the injected built-ins/MCP tools — which
+                    // is what keeps them behind the same policy gate and on
+                    // the same audit trail.
+                    builder = builder
+                        .with_tool_specs(turn_tools.iter().map(SharedToolSpec::to_tool_spec));
 
                     // Inject exit tool if enabled
                     if exit_tool_enabled_val {
@@ -1039,6 +1056,10 @@ pub struct ConversationBuilder {
     /// opt-out; `Some(Some(cw))` = explicit override; `None` = inherit
     /// from the runtime at [`build`](Self::build).
     context_window_override: Option<Option<crate::memory::ContextWindow>>,
+    /// Per-conversation tools staged by [`with_tool`](Self::with_tool),
+    /// [`with_tool_executor`](Self::with_tool_executor), and
+    /// [`add_tool`](Self::add_tool). Name-checked at registration time.
+    tools: Vec<SharedToolSpec>,
 }
 
 impl ConversationBuilder {
@@ -1050,6 +1071,7 @@ impl ConversationBuilder {
             history: Vec::new(),
             exit_tool_enabled: false,
             context_window_override: None,
+            tools: Vec::new(),
         }
     }
 
@@ -1180,6 +1202,139 @@ impl ConversationBuilder {
         self
     }
 
+    /// Registers a tool on this conversation, available on every turn
+    /// [`Conversation::send`] runs.
+    ///
+    /// This exists because [`Conversation`] rebuilds its prompt internally on
+    /// each turn, so a tool registered on a single
+    /// [`PromptBuilder`](crate::prompt::PromptBuilder) can never reach it —
+    /// embedders driving multi-turn sessions (an agent daemon, a chat
+    /// frontend) need this to offer session-scoped tools at all. The tool
+    /// runs through the same policy gate and audit trail as the built-ins.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error immediately — not at
+    /// [`build`](Self::build), and never as a silent shadow at send time —
+    /// when `definition.name` is already taken: by an auto-enabled built-in,
+    /// a skill tool, an MCP tool, a runtime-wide custom tool, the reserved
+    /// `exit_conversation` tool, or a tool already registered on this
+    /// builder. The runtime is fully resolved by the time a
+    /// `ConversationBuilder` exists, so the check needs no deferral.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let conv = runtime.conversation()
+    ///     .system("You can look up orders.")
+    ///     .with_tool(lookup_order_definition(), |args| async move {
+    ///         lookup_order(args).await
+    ///     })?
+    ///     .build()
+    ///     .await;
+    ///
+    /// let response = conv.send("where is order 42?").await?;
+    /// ```
+    pub fn with_tool<F, Fut>(
+        mut self,
+        definition: ToolDefinition,
+        executor: F,
+    ) -> Result<Self, ActonAIError>
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<serde_json::Value, crate::tools::ToolError>>
+            + Send
+            + 'static,
+    {
+        self.ensure_tool_name_free(&definition.name)?;
+        self.tools
+            .push(SharedToolSpec::from_closure(definition, executor));
+        Ok(self)
+    }
+
+    /// Registers a tool backed by a
+    /// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) executor on
+    /// this conversation.
+    ///
+    /// This is [`with_tool`](Self::with_tool) for callers whose tool is an
+    /// executor *object* rather than a closure. The executor's
+    /// [`validate_args`](crate::tools::ToolExecutorTrait::validate_args) runs
+    /// before every execution.
+    ///
+    /// # Errors
+    ///
+    /// The same name-collision rules as [`with_tool`](Self::with_tool).
+    pub fn with_tool_executor<E>(
+        mut self,
+        definition: ToolDefinition,
+        executor: E,
+    ) -> Result<Self, ActonAIError>
+    where
+        E: crate::tools::ToolExecutorTrait + 'static,
+    {
+        self.ensure_tool_name_free(&definition.name)?;
+        self.tools.push(SharedToolSpec::from_executor(
+            definition,
+            Arc::new(Box::new(executor) as crate::tools::BoxedToolExecutor),
+        ));
+        Ok(self)
+    }
+
+    /// Registers a value implementing the [`Tool`](crate::tools::Tool) trait
+    /// — typically generated by the `#[tool]` attribute macro — on this
+    /// conversation.
+    ///
+    /// The per-conversation counterpart of
+    /// [`PromptBuilder::add_tool`](crate::prompt::PromptBuilder::add_tool).
+    ///
+    /// # Errors
+    ///
+    /// The same name-collision rules as [`with_tool`](Self::with_tool).
+    pub fn add_tool<T>(mut self, tool: T) -> Result<Self, ActonAIError>
+    where
+        T: crate::tools::Tool,
+    {
+        self.ensure_tool_name_free(tool.name())?;
+        self.tools.push(SharedToolSpec::from_tool_impl(tool));
+        Ok(self)
+    }
+
+    /// Refuses a tool name that a turn of this conversation would already
+    /// carry.
+    ///
+    /// `exit_conversation` is reserved unconditionally — not only when
+    /// [`with_exit_tool`](Self::with_exit_tool) was already called — because
+    /// [`Conversation::run_chat`] enables the exit tool after building, and a
+    /// clash discovered there would be exactly the silent shadow this check
+    /// exists to prevent.
+    fn ensure_tool_name_free(&self, name: &str) -> Result<(), ActonAIError> {
+        let collides_with = if name == "exit_conversation" {
+            Some("the reserved exit_conversation tool")
+        } else if self.tools.iter().any(|tool| tool.name() == name) {
+            Some("a tool already registered on this conversation")
+        } else if self
+            .runtime
+            .injected_tool_names()
+            .iter()
+            .any(|taken| taken == name)
+        {
+            Some("a tool the runtime injects on every turn")
+        } else {
+            None
+        };
+
+        match collides_with {
+            Some(owner) => Err(ActonAIError::configuration(
+                "conversation.tools",
+                format!(
+                    "conversation tool '{name}' collides with {owner}; \
+                     rename it or drop the conflicting registration"
+                ),
+            )),
+            None => Ok(()),
+        }
+    }
+
     /// Builds the conversation by spawning a [`ConversationActor`].
     ///
     /// After calling this, you can use [`Conversation::send`] to interact
@@ -1236,6 +1391,7 @@ impl ConversationBuilder {
                 system_prompt_tx,
                 context_window,
                 stream_session: stream_session.clone(),
+                tools: self.tools,
             },
         );
 

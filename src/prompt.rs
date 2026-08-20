@@ -192,6 +192,121 @@ impl Clone for ToolSpec {
     }
 }
 
+/// A tool staged outside any single prompt: a definition plus a shared
+/// executor, with no per-prompt result callback.
+///
+/// [`ToolSpec`] carries an optional `FnMut` callback slot, which makes it
+/// `Send` but not `Sync` — fine inside one `PromptBuilder`, fatal inside
+/// `ActonAIInner`, which lives behind an `Arc` and must stay `Send + Sync`.
+/// Runtime-wide tools (staged with
+/// [`ActonAIBuilder::with_tool`](crate::facade::ActonAIBuilder::with_tool))
+/// and per-conversation tools (staged with
+/// [`ConversationBuilder::with_tool`](crate::conversation::ConversationBuilder::with_tool))
+/// are therefore held in this callback-free shape and converted with
+/// [`to_tool_spec`](Self::to_tool_spec) at injection time — which puts them
+/// in the same list the prompt loop executes, behind the same policy gate
+/// and audit trail as the built-ins.
+#[derive(Clone)]
+pub(crate) struct SharedToolSpec {
+    definition: ToolDefinition,
+    executor: Arc<dyn ToolExecutorFn>,
+}
+
+impl std::fmt::Debug for SharedToolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedToolSpec")
+            .field("definition", &self.definition)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedToolSpec {
+    /// Builds a spec from a definition and an async closure — the same
+    /// wrapping [`PromptBuilder::with_tool`] performs.
+    pub(crate) fn from_closure<F, Fut>(definition: ToolDefinition, executor: F) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
+    {
+        Self {
+            definition,
+            executor: Arc::new(ClosureToolExecutor { func: executor }),
+        }
+    }
+
+    /// Builds a spec from a definition and a boxed
+    /// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) executor.
+    ///
+    /// Arguments are run through the executor's
+    /// [`validate_args`](crate::tools::ToolExecutorTrait::validate_args)
+    /// before execution — the executor declared a validator, so skipping it
+    /// here would make registration through the facade quietly laxer than
+    /// registration anywhere else.
+    pub(crate) fn from_executor(
+        definition: ToolDefinition,
+        executor: Arc<crate::tools::BoxedToolExecutor>,
+    ) -> Self {
+        Self {
+            definition,
+            executor: Arc::new(ExecutorTraitAdapter { executor }),
+        }
+    }
+
+    /// Builds a spec from a value implementing the [`Tool`](crate::tools::Tool)
+    /// trait — the shape the `#[tool]` attribute macro generates.
+    pub(crate) fn from_tool_impl<T>(tool: T) -> Self
+    where
+        T: crate::tools::Tool,
+    {
+        let definition = ToolDefinition {
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        };
+        Self {
+            definition,
+            executor: Arc::new(TraitToolExecutor { tool }),
+        }
+    }
+
+    /// The name the model calls this tool by.
+    pub(crate) fn name(&self) -> &str {
+        &self.definition.name
+    }
+
+    /// Converts into the per-prompt shape the loop executes.
+    ///
+    /// Cheap: the definition is cloned, the executor `Arc` is shared.
+    pub(crate) fn to_tool_spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: self.definition.clone(),
+            executor: Arc::clone(&self.executor),
+            on_result: None,
+        }
+    }
+}
+
+/// Adapter that runs an `Arc<BoxedToolExecutor>` — the executor shape
+/// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) implementors
+/// produce — wherever the prompt loop expects a `ToolExecutorFn`.
+///
+/// Unlike [`BuiltinToolExecutorAdapter`] it honors the executor's own
+/// `validate_args` hook: built-ins validate inside `execute`, but an external
+/// executor was promised its validator runs first.
+struct ExecutorTraitAdapter {
+    executor: Arc<crate::tools::BoxedToolExecutor>,
+}
+
+impl ToolExecutorFn for ExecutorTraitAdapter {
+    fn call(&self, args: serde_json::Value) -> ToolFuture {
+        let executor = Arc::clone(&self.executor);
+        Box::pin(async move {
+            executor.validate_args(&args)?;
+            executor.execute(args).await
+        })
+    }
+}
+
 /// Type alias for wrapped start callback (shared across rounds).
 type WrappedStartCallback = Arc<std::sync::Mutex<StartCallback>>;
 
@@ -563,6 +678,20 @@ impl PromptBuilder {
         };
 
         self.tools.push(spec);
+        self
+    }
+
+    /// Appends pre-built tool specs to this prompt.
+    ///
+    /// This is how the facade injects runtime-wide custom tools (staged with
+    /// [`ActonAIBuilder::with_tool`](crate::facade::ActonAIBuilder::with_tool))
+    /// and how a [`Conversation`](crate::conversation::Conversation) carries
+    /// its per-conversation tools into every turn. Injected specs sit in the
+    /// same list as everything else, so the policy gate and the audit trail
+    /// see them exactly as they see built-ins.
+    #[must_use]
+    pub(crate) fn with_tool_specs(mut self, specs: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tools.extend(specs);
         self
     }
 

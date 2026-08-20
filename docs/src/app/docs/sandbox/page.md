@@ -14,7 +14,7 @@ Sandboxed tool calls flow through three steps:
 2. **Protocol.** The child sees the env-var at the top of `main()` and hands control to the sandbox runner. A length-prefixed JSON request is piped in on stdin: `{ tool_name, args, deadline_ms }`. The response is a length-prefixed JSON envelope on stdout: `{ Ok: value } | { Err: message }`.
 3. **Enforcement.** Before touching the request, the child applies `setrlimit` ceilings for address space, CPU time, and file size. On Linux, if the `sandbox-hardening` feature is built in, it also installs a `landlock` ruleset (filesystem access filter) and a `seccompiler` filter (syscall allowlist) before dispatching the tool. The parent enforces a wall-clock deadline via `tokio::time::timeout` and kills the child's entire process group on overrun, so shell grandchildren cannot survive the deadline.
 
-The abstraction -- `Sandbox` and `SandboxFactory` -- is unchanged from the previous implementation. The `ToolRegistry` calls `factory.create() -> sandbox.execute() -> sandbox.destroy()` as before; only the implementation swapped.
+The abstraction -- `Sandbox` and `SandboxFactory` -- is unchanged from the previous implementation. The prompt loop's sandboxed-builtin path calls `factory.create() -> sandbox.execute() -> sandbox.destroy()` as before; only the implementation swapped.
 
 ---
 

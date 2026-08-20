@@ -1,9 +1,9 @@
 //! Every request must get a definite answer.
 //!
-//! These tests pin the contract that used to be broken: the `MemoryStore` and
-//! `ToolRegistry` failure paths logged and returned without replying, so a
-//! caller waiting on an answer waited until the 30-second `ask` timeout and
-//! then learned only that it had timed out.
+//! These tests pin the contract that used to be broken: the `MemoryStore`
+//! failure paths logged and returned without replying, so a caller waiting on
+//! an answer waited until the 30-second `ask` timeout and then learned only
+//! that it had timed out.
 //!
 //! They also cover the concurrency the `act_on` conversion buys: read requests
 //! now overlap instead of serialising behind one another.
@@ -14,9 +14,6 @@ use acton_ai::memory::{
     StoreMemory,
 };
 use acton_ai::prelude::*;
-use acton_ai::tools::{
-    ListTools, RegisterTool, ToolConfig, ToolExecutionFuture, ToolExecutorTrait, ToolRegistry,
-};
 use std::time::Duration;
 
 /// `ask` fails after 30 seconds by default. A missing reply is a bug, not a
@@ -265,174 +262,4 @@ async fn concurrent_reads_all_get_answers() {
     }
 
     runtime.shutdown_all().await.expect("shutdown failed");
-}
-
-#[tokio::test]
-async fn registry_answers_list_requests() {
-    let mut runtime = ActonApp::launch_async().await;
-    let registry = ToolRegistry::spawn(&mut runtime).await;
-
-    let listed = registry
-        .ask_with_timeout(ListTools, REPLY_DEADLINE)
-        .await
-        .expect("registry must reply to a list request");
-
-    assert!(listed.tools.is_empty());
-
-    runtime.shutdown_all().await.expect("shutdown failed");
-}
-
-/// Number of executions the rendezvous tool waits for before any can finish.
-const RENDEZVOUS_PARTIES: usize = 4;
-
-/// A tool that cannot complete alone.
-///
-/// Every execution waits on a shared barrier, so all `RENDEZVOUS_PARTIES` calls
-/// finish together or none of them do. That makes it a decision procedure: if
-/// the registry runs executions one at a time, the first call blocks forever
-/// and the test times out.
-#[derive(Debug)]
-struct RendezvousTool {
-    barrier: std::sync::Arc<tokio::sync::Barrier>,
-}
-
-impl RendezvousTool {
-    fn definition() -> ToolDefinition {
-        ToolDefinition {
-            name: "rendezvous".to_string(),
-            description: "Completes only when every concurrent call has arrived".to_string(),
-            input_schema: serde_json::json!({ "type": "object", "properties": {} }),
-        }
-    }
-}
-
-impl ToolExecutorTrait for RendezvousTool {
-    fn execute(&self, _args: serde_json::Value) -> ToolExecutionFuture {
-        let barrier = self.barrier.clone();
-        Box::pin(async move {
-            barrier.wait().await;
-            Ok(serde_json::json!({ "arrived": true }))
-        })
-    }
-}
-
-#[tokio::test]
-async fn registry_runs_executions_concurrently() {
-    let mut runtime = ActonApp::launch_async().await;
-    let registry = ToolRegistry::spawn(&mut runtime).await;
-
-    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(RENDEZVOUS_PARTIES));
-    registry
-        .send(RegisterTool {
-            config: ToolConfig::new(RendezvousTool::definition()),
-            executor: std::sync::Arc::new(Box::new(RendezvousTool {
-                barrier: barrier.clone(),
-            }) as Box<dyn ToolExecutorTrait>),
-        })
-        .await;
-
-    // Collect the tool responses the registry broadcasts on completion.
-    let collector = ResponseCollector::subscribe(&mut runtime).await;
-
-    for index in 0..RENDEZVOUS_PARTIES {
-        registry
-            .send(ExecuteTool {
-                correlation_id: CorrelationId::new(),
-                requesting_agent: AgentId::new(),
-                tool_call: ToolCall {
-                    id: format!("call_{index}"),
-                    name: "rendezvous".to_string(),
-                    arguments: serde_json::json!({}),
-                },
-            })
-            .await;
-    }
-
-    // Under the old `try_mutate_on` handler each execution was awaited inline
-    // on the message loop, so call 0 would wait for a partner that could never
-    // be dispatched and this would time out instead of returning.
-    let completed = collector.wait_for(RENDEZVOUS_PARTIES, REPLY_DEADLINE).await;
-
-    assert_eq!(
-        completed, RENDEZVOUS_PARTIES,
-        "all executions must be in flight at once for the barrier to release"
-    );
-
-    runtime.shutdown_all().await.expect("shutdown failed");
-}
-
-/// Actor that counts the `ToolResponse` broadcasts the registry emits.
-#[acton_actor]
-struct ResponseCounter {
-    seen: usize,
-}
-
-/// Test-side view of a subscribed [`ResponseCounter`].
-struct ResponseCollector {
-    handle: ActorHandle,
-}
-
-/// Asks the counter how many responses it has observed.
-#[acton_message]
-struct CountResponses;
-
-/// The counter's answer.
-#[acton_message]
-struct ResponseCount {
-    seen: usize,
-}
-
-impl Request for CountResponses {
-    type Response = ResponseCount;
-}
-
-impl ResponseCollector {
-    async fn subscribe(runtime: &mut ActorRuntime) -> Self {
-        let mut builder = runtime.new_actor::<ResponseCounter>();
-
-        builder.mutate_on::<ToolResponse>(|actor, _envelope| {
-            actor.model.seen += 1;
-            Reply::ready()
-        });
-
-        builder.act_on::<CountResponses>(|actor, envelope| {
-            let reply = envelope.reply_envelope();
-            let seen = actor.model.seen;
-            Reply::pending(async move {
-                reply.send(ResponseCount { seen }).await;
-            })
-        });
-
-        // Subscriptions must be registered on the builder: acton-reactive
-        // ignores them once the actor has started.
-        builder.handle().subscribe::<ToolResponse>().await;
-
-        Self {
-            handle: builder.start().await,
-        }
-    }
-
-    /// Polls until `target` responses have been seen or the deadline passes.
-    ///
-    /// Polling is the honest option here: the count is what is under test, so
-    /// there is no earlier event to synchronise on. The deadline bounds a
-    /// failure rather than defining success.
-    async fn wait_for(&self, target: usize, deadline: Duration) -> usize {
-        let started = std::time::Instant::now();
-
-        loop {
-            let seen = self
-                .handle
-                .ask_with_timeout(CountResponses, deadline)
-                .await
-                .expect("collector must answer")
-                .seen;
-
-            if seen >= target || started.elapsed() >= deadline {
-                return seen;
-            }
-
-            tokio::task::yield_now().await;
-        }
-    }
 }
