@@ -49,7 +49,7 @@ use crate::facade::ActonAI;
 use crate::llm::{CheckHealth, FailoverEvent, ProviderHealth, SamplingParams};
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, Usage,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, TurnOutcome, Usage,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall};
 use crate::tools::ToolError;
@@ -178,8 +178,12 @@ pub struct ToolSpec {
     pub definition: ToolDefinition,
     /// The executor for this tool
     executor: Arc<dyn ToolExecutorFn>,
-    /// Optional callback invoked when the tool returns a result
-    on_result: Option<ToolResultCallback>,
+    /// Optional callback invoked when the tool returns a result.
+    ///
+    /// Behind a `Mutex` purely so the spec — and with it [`PromptBuilder`] —
+    /// is `Sync`; the loop is the only caller and uses `get_mut`, so the
+    /// lock is never contended.
+    on_result: Option<std::sync::Mutex<ToolResultCallback>>,
 }
 
 impl std::fmt::Debug for ToolSpec {
@@ -236,6 +240,36 @@ type WrappedEndCallback = Arc<std::sync::Mutex<EndCallback>>;
 ///     .collect()
 ///     .await?;
 /// ```
+///
+/// # Sending a turn through an actor handler
+///
+/// The builder — and the future [`collect`](Self::collect) /
+/// [`extract`](Self::extract) returns — is `Send + Sync`. This is a
+/// deliberate contract, not an accident of the fields: acton-reactive's
+/// `Reply::pending` stores handler futures as
+/// `Pin<Box<dyn Future + Send + Sync>>`, so an embedder driving turns from
+/// inside its own actors (an ACP agent daemon, a per-session actor) can
+/// await a turn directly in a handler instead of spawning a detached task
+/// and losing cancellation and supervision:
+///
+/// ```rust,ignore
+/// session.act_on::<UserTurn>(|actor, ctx| {
+///     let ai = actor.model.ai.clone();
+///     let reply = ctx.reply_envelope();
+///     let content = ctx.message().content.clone();
+///     Reply::pending(async move {
+///         let response = ai.prompt(content).collect().await;
+///         reply.send(TurnDone::from(response)).await;
+///     })
+/// });
+/// ```
+///
+/// What keeps it true: the `FnMut` callbacks are stored pre-wrapped in the
+/// `Arc<Mutex<_>>` the stream collector needs anyway, and the two `dyn
+/// Future + Send` trait objects the loop awaits (tool executions, the
+/// approval hook) are polled through `sync_wrapper::SyncFuture`. The
+/// `tests/prompt_builder_sync.rs` suite turns a regression here into a
+/// compile error.
 pub struct PromptBuilder {
     /// The ActonAI runtime (cheaply cloned via Arc)
     runtime: ActonAI,
@@ -245,12 +279,17 @@ pub struct PromptBuilder {
     system_prompt: Option<String>,
     /// Optional conversation history (replaces user_content when set)
     conversation_history: Option<Vec<Message>>,
-    /// Callback for stream start
-    on_start: Option<StartCallback>,
-    /// Callback for each token
-    on_token: Option<TokenCallback>,
-    /// Callback for stream end
-    on_end: Option<EndCallback>,
+    /// Callback for stream start.
+    ///
+    /// Stored pre-wrapped in the `Arc<Mutex<_>>` the stream collector needs
+    /// anyway, rather than as a bare `Box<dyn FnMut>`, because a boxed
+    /// `FnMut` is `!Sync` and would make the whole builder `!Sync` — see the
+    /// "Sending a turn through an actor handler" section on [`PromptBuilder`].
+    on_start: Option<WrappedStartCallback>,
+    /// Callback for each token. Wrapped for the same reason as `on_start`.
+    on_token: Option<WrappedTokenCallback>,
+    /// Callback for stream end. Wrapped for the same reason as `on_start`.
+    on_end: Option<WrappedEndCallback>,
     /// Registered tools with inline executors
     tools: Vec<ToolSpec>,
     /// Maximum tool execution rounds (default: 10)
@@ -380,7 +419,7 @@ impl PromptBuilder {
     where
         F: FnMut() + Send + 'static,
     {
-        self.on_start = Some(Box::new(f));
+        self.on_start = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
@@ -403,7 +442,7 @@ impl PromptBuilder {
     where
         F: FnMut(&str) + Send + 'static,
     {
-        self.on_token = Some(Box::new(f));
+        self.on_token = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
@@ -426,7 +465,7 @@ impl PromptBuilder {
     where
         F: FnMut(StopReason) + Send + 'static,
     {
-        self.on_end = Some(Box::new(f));
+        self.on_end = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
@@ -633,7 +672,7 @@ impl PromptBuilder {
         let spec = ToolSpec {
             definition,
             executor: Arc::new(ClosureToolExecutor { func: executor }),
-            on_result: Some(Box::new(on_result)),
+            on_result: Some(std::sync::Mutex::new(Box::new(on_result))),
         };
 
         self.tools.push(spec);
@@ -1045,13 +1084,17 @@ impl PromptBuilder {
 
         // From here the turn is admitted, and every exit path below must
         // publish `TurnFinished` — a turn counted as started and never
-        // finished holds a drain open forever.
+        // finished holds a drain open forever. "Every exit path" includes the
+        // one the compiler cannot see: the caller dropping this future
+        // mid-await. The guard owns that duty, so cancellation publishes an
+        // `Interrupted` finish instead of leaving the start unmatched.
         let turn_id = TurnId::new();
         broker
             .broadcast(TurnLifecycle::TurnStarted {
                 turn_id: turn_id.clone(),
             })
             .await;
+        let guard = TurnFinishedGuard::new(broker, turn_id.clone());
 
         let turn =
             crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
@@ -1059,8 +1102,11 @@ impl PromptBuilder {
         let mut stats = TurnStats::default();
         let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
 
-        broker
-            .broadcast(TurnLifecycle::TurnFinished { turn_id })
+        guard
+            .finish(match &result {
+                Ok(_) => TurnOutcome::Completed,
+                Err(_) => TurnOutcome::Failed,
+            })
             .await;
 
         let outcome = match &result {
@@ -1205,12 +1251,9 @@ impl PromptBuilder {
         // the loop itself publishes, and it can only happen with one.
         let broker = chained.then(|| runtime.runtime().broker());
 
-        // Wrap callbacks in Arc<Mutex> for sharing across multiple rounds
-        let on_start: Option<WrappedStartCallback> =
-            on_start.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_token: Option<WrappedTokenCallback> =
-            on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        // The callbacks arrive already wrapped in the Arc<Mutex> the stream
+        // collector shares across rounds; the builder stores them that way so
+        // that it stays `Sync` (a bare boxed FnMut is not).
 
         loop {
             iteration += 1;
@@ -1572,6 +1615,87 @@ impl PromptBuilder {
             .with_usage(stats.usage),
             captured,
         ))
+    }
+}
+
+/// Owns the duty to publish [`TurnLifecycle::TurnFinished`] exactly once.
+///
+/// The prompt loop broadcasts `TurnStarted` and *must* balance it with a
+/// `TurnFinished`, or the introspection actor counts the turn as in-flight
+/// forever and a drain waiting on it never completes. The `Ok`/`Err` paths
+/// through [`PromptBuilder::run_prompt_loop`] do that themselves via
+/// [`finish`](Self::finish) — but a caller can also *drop* the `collect()` /
+/// `extract()` future mid-await (a user pressed cancel, a `select!` took the
+/// other arm), and a dropped future never reaches any of its own code again.
+/// This guard's `Drop` is the only thing that still runs on that path, so
+/// the balancing broadcast lives here.
+///
+/// # Why `Drop` spawns instead of blocking
+///
+/// `Drop` is synchronous and usually runs inside an async context, so it can
+/// neither `.await` the broadcast nor block on it without risking a deadlock
+/// on the very runtime that is dropping the future. It therefore hands the
+/// send to a spawned task — the same fire-and-forget shape
+/// [`StreamCollectorSessionInner`]'s `Drop` already uses. Outside a Tokio
+/// runtime there is nothing to spawn on, and nothing to notify either: the
+/// process is past caring about its own drain.
+///
+/// # Why the normal path cannot double-fire
+///
+/// [`finish`](Self::finish) marks the guard fired *after* its broadcast
+/// completes, and `Drop` checks that mark. If the future is cancelled *inside*
+/// `finish`'s own broadcast — the one window where both could act — the
+/// duplicate `TurnFinished` is harmless by design: the introspection actor
+/// keeps in-flight turns in a `HashSet`, where a second remove is a no-op.
+/// The failure direction is chosen deliberately: an occasional duplicate
+/// finish is idempotent, while a missing one wedges a drain forever.
+struct TurnFinishedGuard {
+    broker: BrokerRef,
+    turn_id: TurnId,
+    fired: bool,
+}
+
+impl TurnFinishedGuard {
+    /// Arms the guard for `turn_id`. Call immediately after `TurnStarted`.
+    fn new(broker: BrokerRef, turn_id: TurnId) -> Self {
+        Self {
+            broker,
+            turn_id,
+            fired: false,
+        }
+    }
+
+    /// Publishes the balancing `TurnFinished` with how the turn ended.
+    ///
+    /// Consumes the guard: after this, its `Drop` is a no-op.
+    async fn finish(mut self, outcome: TurnOutcome) {
+        self.broker
+            .broadcast(TurnLifecycle::TurnFinished {
+                turn_id: self.turn_id.clone(),
+                outcome,
+            })
+            .await;
+        self.fired = true;
+    }
+}
+
+impl Drop for TurnFinishedGuard {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        let broker = self.broker.clone();
+        let turn_id = self.turn_id.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                broker
+                    .broadcast(TurnLifecycle::TurnFinished {
+                        turn_id,
+                        outcome: TurnOutcome::Interrupted,
+                    })
+                    .await;
+            });
+        }
     }
 }
 
@@ -2333,15 +2457,25 @@ async fn execute_tool_with_callback(
         return Err(ToolError::not_found(&tool_call.name));
     };
 
-    let result = spec.executor.call(arguments).await;
+    // `SyncFuture` because `ToolFuture` is a `dyn Future + Send` without
+    // `Sync`, and a `!Sync` future held across this await would make the
+    // whole turn future `!Sync` — which would force embedders back onto a
+    // spawned task instead of `Reply::pending`. The wrapper is sound because
+    // a future being polled is never shared, and it costs nothing at runtime.
+    let result = sync_wrapper::SyncFuture::new(spec.executor.call(arguments)).await;
 
-    // Invoke the result callback if present
-    if let Some(ref mut callback) = spec.on_result {
-        match &result {
-            Ok(value) => callback(Ok(value)),
-            Err(e) => {
-                let error_str = e.to_string();
-                callback(Err(&error_str));
+    // Invoke the result callback if present. `get_mut` rather than `lock`:
+    // we hold `&mut`, so the Mutex is only satisfying `Sync`, not guarding
+    // anything — and a poisoned lock (a callback that panicked earlier)
+    // simply skips the callback rather than failing the tool.
+    if let Some(callback) = spec.on_result.as_mut() {
+        if let Ok(callback) = callback.get_mut() {
+            match &result {
+                Ok(value) => callback(Ok(value)),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    callback(Err(&error_str));
+                }
             }
         }
     }
@@ -2482,7 +2616,7 @@ mod tests {
             executor: Arc::new(ClosureToolExecutor {
                 func: |_args: serde_json::Value| async { Ok(serde_json::json!({})) },
             }),
-            on_result: Some(Box::new(|_result| {})),
+            on_result: Some(std::sync::Mutex::new(Box::new(|_result| {}))),
         };
 
         let cloned = spec.clone();

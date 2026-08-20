@@ -146,8 +146,8 @@ pub mod prelude {
     pub use crate::introspection::{AdmissionGate, AdmissionState, IntrospectionConfig};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::policy::{
-        ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason, ToolInvocation,
-        ToolPolicy, TurnCounts,
+        ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason,
+        ToolClassification, ToolInvocation, ToolPolicy, TurnCounts,
     };
     pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
 

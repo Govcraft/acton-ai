@@ -41,6 +41,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and Go, and it must be a release build because the module's power-on
   integrity self-test does not survive a debug build's relocations.
 
+- **An interrupted turn now finishes its lifecycle.** Dropping the
+  `collect()` / `extract()` future mid-turn — a user pressing cancel, a
+  `select!` taking the other arm — used to leave its `TurnStarted` broadcast
+  unmatched forever, so the in-flight count never returned to zero and a
+  drain waiting on it never completed. A drop guard in the prompt loop now
+  publishes the balancing `TurnFinished` from cancellation, carrying the new
+  `TurnOutcome::Interrupted` so observers can tell a cancelled turn from a
+  completed or failed one. `TurnLifecycle::TurnFinished` now carries a
+  `TurnOutcome` (`completed` / `failed` / `interrupted`).
+- **`ToolPolicy::classify`.** A pure, public query answering what the gate
+  would do with a tool call — `AutoAllow`, `NeedsApproval`, or `Deny` with
+  the refusing rule and reason — so an embedder can render "this tool will
+  ask" UI without reimplementing the allowlist/denylist/cap rules. It is not
+  a parallel implementation: the gate's own `decide` is built on the same
+  classification, so the two cannot drift.
+- **`PromptBuilder` (and its turn future) is `Send + Sync`.** acton-reactive
+  handler futures must be `Send + Sync`, so an embedder driving turns from
+  inside its own actors previously had to spawn a detached task per turn.
+  Callback setters are unchanged (`FnMut + Send` still suffices); the
+  callbacks are stored pre-wrapped and the loop's `dyn Future + Send` awaits
+  go through `sync_wrapper::SyncFuture`. `tests/prompt_builder_sync.rs`
+  makes a regression a compile error.
+
 ### Changed
 
 - TLS backend selection moved behind features. The ordinary *ring* stack is
@@ -48,6 +71,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   build is unchanged. **A `--no-default-features` build that relied on TLS
   must now name `tls-ring` (or `fips`) explicitly**, where it previously got
   the *ring* stack implicitly.
+- `TurnLifecycle::TurnFinished` gained an `outcome` field. A subscriber
+  matching the variant by its full field list must add `outcome` (or `..`);
+  a subscriber only balancing starts against finishes can ignore it.
 
 ## 0.31.0 - 2026-08-16
 
