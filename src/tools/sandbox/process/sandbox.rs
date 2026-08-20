@@ -72,6 +72,15 @@ impl ProcessSandbox {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // If the execute future is dropped mid-flight — a caller-side
+            // `timeout`, an aborted turn — the child would otherwise outlive
+            // the call as an orphan until its own rlimits bite: `destroy()`
+            // never runs on a dropped future, and `process_group(0)` below
+            // deliberately detaches it from the parent's signals. Killing on
+            // drop bounds the child's life by the future's. Grandchildren in
+            // the group can still leak on this path, exactly as on the
+            // non-unix timeout path.
+            .kill_on_drop(true)
             .env_clear();
 
         for key in &self.config.env_allowlist {

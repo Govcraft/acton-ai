@@ -4,6 +4,10 @@
 //! and then read the file back with the same public API an auditor would use,
 //! so what they assert is what is actually on disk.
 //!
+//! The last section goes one step further and shells out to the real
+//! `acton-ai` binary, because the library and the CLI are two independent
+//! readers of the same chain and nothing else forces them to agree.
+//!
 //! # Determinism
 //!
 //! Nothing sleeps. `ActonAI::audit_head()` is an `ask` on the audit actor, and
@@ -14,8 +18,9 @@ mod mock_llm;
 
 use acton_ai::prelude::*;
 use mock_llm::{contains_ref, tool_named, MockServer, Round};
-use serde_json::json;
+use serde_json::{json, Value};
 use std::path::Path;
+use std::process::Command;
 
 /// A tool the scripted rounds can call.
 fn tool_definition(name: &str) -> ToolDefinition {
@@ -34,6 +39,117 @@ fn tool_definition(name: &str) -> ToolDefinition {
 fn read_trail(path: &Path) -> Vec<AuditEntry> {
     let contents = std::fs::read_to_string(path).expect("the trail must exist");
     acton_ai::audit::parse_entries(&contents).expect("the trail must parse")
+}
+
+/// Writes entries back as JSONL — the file a tamperer would leave behind.
+fn write_trail(path: &Path, entries: &[AuditEntry]) {
+    let mut contents = String::new();
+    for entry in entries {
+        contents.push_str(&entry.to_jsonl().expect("an entry must serialize"));
+        contents.push('\n');
+    }
+    std::fs::write(path, contents).expect("the trail must be writable");
+}
+
+/// Exit code the CLI uses for "the chain does not verify".
+///
+/// Duplicated from `acton_ai::cli::error::exit_code` on purpose: this number
+/// is the interface a cron job or compliance check keys on, so a test should
+/// fail when it changes rather than quietly follow it.
+const EXIT_AUDIT_CHAIN_BROKEN: i32 = 3;
+
+/// What the `acton-ai` binary said about a trail.
+struct CliVerdict {
+    exit_code: i32,
+    stdout: String,
+    stderr: String,
+}
+
+impl CliVerdict {
+    /// The JSON report the CLI prints when the chain holds.
+    fn report(&self) -> Value {
+        serde_json::from_str(&self.stdout).unwrap_or_else(|error| {
+            panic!(
+                "`audit verify --json` must print one JSON object, got {error}\n\
+                 stdout: {}\nstderr: {}",
+                self.stdout, self.stderr
+            )
+        })
+    }
+}
+
+/// Runs the real `acton-ai` binary the way an auditor would.
+///
+/// `--file` is always passed, so the command never consults a config file or
+/// the developer's own trail: the test is hermetic regardless of what is in
+/// `~/.config/acton-ai/`.
+fn run_audit_verify(path: &Path) -> CliVerdict {
+    let output = Command::new(env!("CARGO_BIN_EXE_acton-ai"))
+        .args(["--json", "audit", "verify", "--file"])
+        .arg(path)
+        .output()
+        .expect("the acton-ai binary must be runnable");
+
+    CliVerdict {
+        exit_code: output.status.code().expect("the CLI must exit, not signal"),
+        stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+    }
+}
+
+/// Launches a runtime auditing to `path`, drives `tool_calls` invocations
+/// through it, and shuts it down cleanly.
+///
+/// Returns the live [`ChainHead`] the runtime reported. Taking it before
+/// shutdown is the barrier: `audit_head()` is an `ask` on the audit actor and
+/// mailboxes are FIFO, so its reply cannot arrive until every entry recorded
+/// before it is sealed and on disk.
+async fn record_trail(app_name: &str, path: &Path, tool_calls: usize) -> ChainHead {
+    let mut rounds: Vec<Round> = (0..tool_calls)
+        .map(|i| {
+            Round::tool_call(
+                &format!("call_{i}"),
+                "echo",
+                json!({"value": i.to_string()}),
+            )
+        })
+        .collect();
+    rounds.push(Round::text("done"));
+
+    let server = MockServer::start(rounds).await;
+
+    let ai = ActonAI::builder()
+        .app_name(app_name)
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(path)
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+
+    if tool_calls > 0 {
+        ai.prompt("echo")
+            .with_tool(tool_definition("echo"), |args| async move { Ok(args) })
+            .collect()
+            .await
+            .expect("the turn must complete");
+        assert_eq!(
+            server.request_count(),
+            tool_calls + 1,
+            "each tool round plus the final answer"
+        );
+    }
+
+    let head = ai
+        .audit_head()
+        .await
+        .expect("an audited runtime must report a head");
+
+    ai.shutdown().await.expect("clean shutdown");
+
+    head
 }
 
 // =============================================================================
@@ -449,4 +565,157 @@ async fn a_toml_audit_section_arms_the_trail() {
     assert_eq!(read_trail(&path).len(), 1);
 
     ai.shutdown().await.expect("clean shutdown");
+}
+
+// =============================================================================
+// 8. The library and the CLI agree about the same trail
+// =============================================================================
+//
+// There are two readers of the hash chain and they share almost no code.
+// `ActonAI::audit_head()` asks the live audit actor what it has written and
+// gets an in-memory answer. `acton-ai audit verify` is a *separate process*
+// that opens the JSONL file, re-parses every entry, and re-walks the chain
+// from genesis. That split is the point — an auditor who does not trust the
+// running process can check its work — but it also means nothing forces the
+// two answers to match. A change to how an entry is sealed, serialized, or
+// counted could make the live head and the on-disk head diverge while every
+// test above still passed. These pin them together.
+
+#[tokio::test]
+async fn the_cli_reports_the_same_head_the_runtime_does() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+
+    let head = record_trail("audit-parity", &path, 3).await;
+    assert_eq!(head.entries, 3, "the test needs a chain to compare");
+
+    let verdict = run_audit_verify(&path);
+
+    assert_eq!(
+        verdict.exit_code, 0,
+        "an intact trail must exit 0\nstderr: {}",
+        verdict.stderr
+    );
+
+    let report = verdict.report();
+
+    assert_eq!(report["verified"], json!(true));
+    assert_eq!(
+        report["entries"],
+        json!(head.entries),
+        "the CLI counted a different number of entries than the runtime wrote"
+    );
+    assert_eq!(
+        report["head_sequence"],
+        json!(head.sequence),
+        "the CLI and the runtime disagree about the last sequence number"
+    );
+    // The load-bearing one: the head hash is derived from every entry's full
+    // contents, so agreement here means the bytes on disk hash to exactly what
+    // the actor believed it wrote.
+    assert_eq!(
+        report["head_hash"],
+        json!(head.hash),
+        "the CLI re-hashed the trail to something other than the runtime's head"
+    );
+
+    // The report names the file it actually checked, which is what makes it
+    // usable as evidence rather than just a green tick.
+    assert_eq!(report["path"], json!(path.to_string_lossy().into_owned()));
+}
+
+#[tokio::test]
+async fn a_tampered_trail_fails_the_cli_where_the_library_says_it_should() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+
+    let head = record_trail("audit-parity-tamper", &path, 3).await;
+    assert_eq!(head.entries, 3, "the test needs a middle entry to edit");
+
+    // The trail must start clean, or the tamper proves nothing.
+    let clean = run_audit_verify(&path);
+    assert_eq!(clean.exit_code, 0, "stderr: {}", clean.stderr);
+
+    // Rewrite the middle entry the way somebody covering their tracks would:
+    // change what the tool was, leave everything else alone.
+    let mut entries = read_trail(&path);
+    entries[1].tool_name = "something_harmless".to_string();
+    write_trail(&path, &entries);
+
+    // What the library says about it, in this process.
+    let expected = verify_chain(&entries).expect_err("an edited entry must be caught");
+    assert_eq!(expected.sequence, 2);
+    assert!(matches!(expected.kind, ChainBreakKind::HashMismatch { .. }));
+
+    // What the CLI says about it, in its own process, reading the file.
+    let verdict = run_audit_verify(&path);
+
+    assert_eq!(
+        verdict.exit_code, EXIT_AUDIT_CHAIN_BROKEN,
+        "a tampered trail must exit {EXIT_AUDIT_CHAIN_BROKEN} so a cron job notices\n\
+         stdout: {}\nstderr: {}",
+        verdict.stdout, verdict.stderr
+    );
+    assert!(
+        verdict.stderr.contains(&expected.to_string()),
+        "the CLI must name the same break the library found.\n\
+         library: {expected}\nCLI stderr: {}",
+        verdict.stderr
+    );
+    assert!(
+        verdict.stdout.trim().is_empty(),
+        "a broken chain must not also print a success report on stdout, got: {}",
+        verdict.stdout
+    );
+}
+
+#[tokio::test]
+async fn an_armed_but_unused_trail_verifies_as_the_genesis_head() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+
+    // Audit configured, no tool ever called. "Audited and nothing happened"
+    // and "not audited" are opposite findings — that is why `audit_head()`
+    // errors in the second case — so the CLI must not blur them either.
+    let head = record_trail("audit-parity-empty", &path, 0).await;
+    assert_eq!(head.entries, 0);
+    assert_eq!(head.sequence, 0);
+    assert_eq!(head.hash, GENESIS_HASH);
+
+    let verdict = run_audit_verify(&path);
+
+    assert_eq!(
+        verdict.exit_code, 0,
+        "an empty trail is intact, not broken\nstderr: {}",
+        verdict.stderr
+    );
+
+    let report = verdict.report();
+    assert_eq!(report["verified"], json!(true));
+    assert_eq!(report["entries"], json!(0));
+    assert_eq!(report["head_sequence"], json!(0));
+    assert_eq!(
+        report["head_hash"],
+        json!(GENESIS_HASH),
+        "an empty chain's head is the genesis hash, in both readers"
+    );
+}
+
+#[test]
+fn an_unreadable_file_is_not_reported_as_tampering() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    std::fs::write(&path, "this is not JSON\n").expect("writes");
+
+    let verdict = run_audit_verify(&path);
+
+    // "I cannot read this" and "this has been altered" are different findings
+    // and only one of them is an incident. Exit code 3 is reserved for the
+    // incident, so a garbled file must not raise one.
+    assert_ne!(
+        verdict.exit_code, EXIT_AUDIT_CHAIN_BROKEN,
+        "an unparseable file must not be reported as a broken chain\nstderr: {}",
+        verdict.stderr
+    );
+    assert_ne!(verdict.exit_code, 0, "it is still an error");
 }

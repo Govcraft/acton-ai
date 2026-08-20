@@ -176,7 +176,8 @@ pub mod prelude {
         StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
-    pub use crate::tools::builtins::BuiltinTools;
+    pub use crate::tools::builtins::{BuiltinExecutor, BuiltinTools};
+    pub use crate::tools::sandbox::SandboxedExecution;
     pub use crate::tools::{
         RegisterTool, Tool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind,
         ToolExecutorTrait, ToolFuture, ToolRegistry,
