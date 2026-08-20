@@ -73,9 +73,8 @@ jobs:
             runner: macos-15-intel
           - target: aarch64-apple-darwin
             runner: macos-14
-          # x86_64-pc-windows-msvc is disabled until acton-reactive ships a
-          # Windows-compatible config path (9.1.0 uses the Unix-only xdg
-          # crate unconditionally and does not compile on Windows).
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
     steps:
       - uses: actions/checkout@v4
         with:
