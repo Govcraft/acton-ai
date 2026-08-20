@@ -280,6 +280,96 @@ WARN acton_ai::conversation: truncated conversation history to fit context windo
 
 ---
 
+## Auto-compaction
+
+Truncation runs **between** turns. It does nothing **inside** one, and inside one is where a history most easily runs away: a turn that works through tools appends an assistant turn and every tool result on each round, with nothing bounding the result. A long tool loop eventually exceeds the provider's window and fails mid-turn, after the earlier rounds are already paid for.
+
+Auto-compaction bounds that. When the running history crosses a fraction of the available budget, the prompt loop — between rounds, never while a tool exchange is in flight — sends the older history back to the **same provider** with a fixed summarization prompt, and splices the model's own summary in where the elided messages were, keeping the last few exchanges verbatim:
+
+```text
+[system]   kept as-is, never elided
+[user]     "[conversation compacted] Earlier messages were summarized…"
+           followed by the provider-written summary of everything removed
+[ ... ]    the last N exchanges, verbatim
+```
+
+This is deliberately different from truncation. Dropping the oldest exchanges silently erases the user's original request and the model has no way to know: it answers a question it can no longer see. The summary tells the model what it forgot — and because the model that will continue the conversation is the one that wrote it, the summary keeps what *it* considers load-bearing.
+
+The summarization is a paid request like any other round: it goes to the same provider, under the same budget caps, and its usage folds into the turn's totals. If it fails — provider error, empty reply, budget refusal — the turn proceeds with its full history and takes its chances, which is strictly better than proceeding with a hole where its history used to be; a failed attempt also stops compaction for the rest of that turn rather than paying for a doomed retry every round.
+
+### Enabling it
+
+Off by default: an unconfigured runtime behaves exactly as before. The fallback `max_tokens` of 8192 is far below the native window of most providers, so compacting by default would summarize history that was never in danger — and every summary costs tokens. Set a realistic budget first — per-provider `context_window_tokens` is the best place — then switch it on.
+
+```toml
+[providers.claude]
+type = "anthropic"
+model = "claude-sonnet-4-20250514"
+context_window_tokens = 200000
+
+[context]
+auto_compact = true        # off unless this says otherwise
+compact_threshold = 0.8    # compact at 80% of the available budget
+keep_recent_turns = 3      # trailing exchanges kept verbatim
+```
+
+Or in code:
+
+```rust
+use acton_ai::memory::{CompactionConfig, KeepRecentTurns};
+
+let runtime = ActonAI::builder()
+    .app_name("my-app")
+    .ollama("qwen2.5:7b")
+    .compaction(
+        CompactionConfig::default()
+            .with_keep_recent_turns(KeepRecentTurns::new(5)?)
+    )
+    .launch()
+    .await?;
+
+// Or refuse it, including an `auto_compact = true` in TOML that would
+// otherwise switch it on.
+let runtime = ActonAI::builder()
+    .app_name("my-app")
+    .ollama("qwen2.5:7b")
+    .without_compaction()
+    .launch()
+    .await?;
+```
+
+Compaction needs a context window to measure against. With `without_context_window()` there is no budget, so a policy is inert rather than an error.
+
+### What it will not do
+
+- **Split an exchange.** `keep_recent_turns` counts whole exchanges: an assistant turn carrying tool calls travels with the tool results answering it. A `tool_use` block with no matching `tool_result` is rejected by every provider for the rest of the conversation, not just for the request that introduced it.
+- **Elide the system message.** It is held aside and re-emitted first.
+- **Compact when it would not help.** If the summary would be no smaller than the text it replaces — short histories summarize to more than themselves — the pass declines and nothing changes. This is also what stops an already-compacted history from being rewritten, and paid for, on every round.
+- **Compact a history that fits.** A policy in force is not a licence to rewrite a history that was never in danger, or to spend money summarizing it.
+- **Interrupt the caller's stream.** The summarization round fires none of the turn's streaming callbacks; it is framework traffic, not the model's answer.
+
+### Observing it
+
+Compaction rewrites what the model sees, so it is loud about every pass — a framework that silently deletes context is indistinguishable, from the outside, from a model that ignores it.
+
+Every pass logs at `info` and broadcasts `TurnLifecycle::ContextCompacted`:
+
+```text
+INFO acton_ai::prompt: compacted conversation history to stay within the context window
+    messages_before=23 messages_after=4 messages_elided=20
+    tokens_before=7904 tokens_after=1220 max_tokens=8192
+```
+
+The `CollectedResponse` a turn returns carries one `CompactionRecord` per pass, with the summary text and the measured effect; `record.as_message()` is the exact marked message the model saw, ready to store. The CLI's `chat` and `run-job` sessions persist those rows automatically, so a stored session records that — and what — the model was told it forgot.
+
+`acton-ai status` reports the running total once it is nonzero:
+
+```text
+Compaction: 7 histor(ies) compacted mid-turn
+```
+
+---
+
 ## System prompt management
 
 ### Setting the system prompt at build time

@@ -616,6 +616,9 @@ pub struct SkillsFileConfig {
 /// max_tokens = 8192
 /// reserved_for_response = 1024
 /// strategy = "keep-recent"   # "keep-recent" | "keep-system-and-recent" | "keep-ends"
+/// auto_compact = true        # summarize older history instead of truncating
+/// compact_threshold = 0.8    # trigger at 80% of the available budget
+/// keep_recent_turns = 3      # trailing exchanges kept verbatim
 /// ```
 ///
 /// Per-provider `context_window_tokens` on `[providers.<name>]` overrides
@@ -633,6 +636,52 @@ pub struct ContextFileConfig {
     /// Truncation strategy. See [`parse_truncation_strategy`].
     #[serde(default)]
     pub strategy: Option<String>,
+    /// Whether auto-compaction runs. Defaults to `false`: leaving it unset
+    /// (or writing `auto_compact = false`) changes nothing about how a
+    /// runtime behaves today.
+    #[serde(default)]
+    pub auto_compact: Option<bool>,
+    /// Fraction of the available budget at which compaction triggers.
+    /// Must be greater than 0.0 and at most 1.0. Defaults to 0.8.
+    #[serde(default)]
+    pub compact_threshold: Option<f64>,
+    /// Trailing turns kept verbatim through a compaction, counted in whole
+    /// exchanges (an assistant turn plus its tool results is one exchange).
+    /// Must be at least 1. Defaults to 3.
+    #[serde(default)]
+    pub keep_recent_turns: Option<usize>,
+}
+
+impl ContextFileConfig {
+    /// Resolves this section's compaction keys into a validated
+    /// [`CompactionConfig`](crate::memory::CompactionConfig).
+    ///
+    /// Returns `Ok(None)` unless `auto_compact = true`: compaction is opt-in,
+    /// and threshold or turn-count keys written without it are inert rather
+    /// than an implicit request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CompactionConfigError`](crate::memory::CompactionConfigError)
+    /// naming the first setting that is out of range.
+    pub fn resolve_compaction(
+        &self,
+    ) -> Result<Option<crate::memory::CompactionConfig>, crate::memory::CompactionConfigError> {
+        use crate::memory::{CompactionConfig, CompactionThreshold, KeepRecentTurns};
+
+        if !self.auto_compact.unwrap_or(false) {
+            return Ok(None);
+        }
+
+        let mut resolved = CompactionConfig::default();
+        if let Some(threshold) = self.compact_threshold {
+            resolved.threshold = CompactionThreshold::try_from(threshold)?;
+        }
+        if let Some(turns) = self.keep_recent_turns {
+            resolved.keep_recent_turns = KeepRecentTurns::new(turns)?;
+        }
+        Ok(Some(resolved))
+    }
 }
 
 /// Parses a strategy string into a [`crate::memory::TruncationStrategy`].
@@ -2594,6 +2643,123 @@ output_per_mtok = 10.0
         assert_eq!(ctx.max_tokens, Some(32_768));
         assert_eq!(ctx.reserved_for_response, Some(2048));
         assert_eq!(ctx.strategy.as_deref(), Some("keep-ends"));
+    }
+
+    #[test]
+    fn compaction_keys_parse_and_resolve() {
+        let toml_str = r#"
+            [context]
+            max_tokens = 32768
+            auto_compact = true
+            compact_threshold = 0.6
+            keep_recent_turns = 5
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let ctx = config.context.expect("[context] should parse");
+
+        let resolved = ctx
+            .resolve_compaction()
+            .expect("valid settings should resolve")
+            .expect("auto_compact = true should yield a policy");
+        assert_eq!(resolved.threshold.get(), 0.6);
+        assert_eq!(resolved.keep_recent_turns.get(), 5);
+    }
+
+    #[test]
+    fn auto_compact_alone_switches_compaction_on_with_defaults() {
+        let toml_str = r#"
+            [context]
+            auto_compact = true
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(
+            config.context.unwrap().resolve_compaction().unwrap(),
+            Some(crate::memory::CompactionConfig::default()),
+        );
+    }
+
+    #[test]
+    fn compaction_keys_without_auto_compact_are_inert() {
+        let toml_str = r#"
+            [context]
+            compact_threshold = 0.5
+            keep_recent_turns = 2
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.context.unwrap().resolve_compaction().unwrap(), None);
+    }
+
+    #[test]
+    fn auto_compact_false_resolves_to_nothing() {
+        let toml_str = r#"
+            [context]
+            auto_compact = false
+            compact_threshold = 0.5
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.context.unwrap().resolve_compaction().unwrap(), None);
+    }
+
+    #[test]
+    fn an_out_of_range_compact_threshold_is_rejected() {
+        let toml_str = r#"
+            [context]
+            auto_compact = true
+            compact_threshold = 80
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let error = config
+            .context
+            .unwrap()
+            .resolve_compaction()
+            .expect_err("80 is not a fraction");
+
+        assert!(
+            matches!(
+                error.kind(),
+                crate::memory::CompactionConfigErrorKind::ThresholdOutOfRange { .. }
+            ),
+            "{error}",
+        );
+    }
+
+    #[test]
+    fn a_zero_keep_recent_turns_is_rejected() {
+        let toml_str = r#"
+            [context]
+            auto_compact = true
+            keep_recent_turns = 0
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let error = config
+            .context
+            .unwrap()
+            .resolve_compaction()
+            .expect_err("keeping nothing is not a policy");
+
+        assert_eq!(
+            error.kind(),
+            &crate::memory::CompactionConfigErrorKind::KeepRecentTurnsZero,
+        );
+    }
+
+    #[test]
+    fn a_context_section_without_compaction_keys_leaves_it_off() {
+        let toml_str = r#"
+            [context]
+            max_tokens = 4096
+        "#;
+
+        let config: ActonAIConfig = toml::from_str(toml_str).unwrap();
+        let ctx = config.context.unwrap();
+        assert!(ctx.auto_compact.is_none());
+        assert_eq!(ctx.resolve_compaction().unwrap(), None);
     }
 
     #[test]

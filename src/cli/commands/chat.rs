@@ -169,10 +169,16 @@ pub async fn execute(
             // Single-shot mode: send one message and output response
             let response = conv.send(&msg).await?;
 
-            // Persist user message and assistant response
+            // Persist user message, any compaction summaries the turn
+            // produced, and the assistant response. Storing the summary rows
+            // keeps the session transparent: a stored conversation records
+            // that — and what — the model was told it forgot.
             let user_msg = Message::user(&msg);
             let assistant_msg = Message::assistant(&response.text);
             persistence::save_message(&conn, &conversation_id, &user_msg).await?;
+            for record in &response.compactions {
+                persistence::save_message(&conn, &conversation_id, &record.as_message()).await?;
+            }
             persistence::save_message(&conn, &conversation_id, &assistant_msg).await?;
             persistence::touch_session(&conn, &session_name).await?;
 

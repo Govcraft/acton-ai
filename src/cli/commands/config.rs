@@ -242,6 +242,21 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
         if let Some(s) = &ctx.strategy {
             output.write_line(&format!("  strategy:              {s}"))?;
         }
+        // Whether compaction is *on* is the first thing to report, because
+        // the threshold and turn-count keys can be present and still inert —
+        // a reader who sees only the numbers would assume otherwise.
+        if let Some(enabled) = ctx.auto_compact {
+            output.write_line(&format!(
+                "  auto_compact:          {}",
+                if enabled { "enabled" } else { "disabled" },
+            ))?;
+        }
+        if let Some(t) = ctx.compact_threshold {
+            output.write_line(&format!("  compact_threshold:     {t}"))?;
+        }
+        if let Some(k) = ctx.keep_recent_turns {
+            output.write_line(&format!("  keep_recent_turns:     {k}"))?;
+        }
     }
 
     if let Some(budget) = &report.config.budget {

@@ -317,6 +317,9 @@ pub async fn run(
             slash::SlashAction::NotSlash => {
                 last_user_message = Some(trimmed.to_string());
                 let outcome = send_turn(&turn_ctx, trimmed).await?;
+                if let TurnOutcome::Completed(ref records) = outcome {
+                    persist_compactions(records, &persist).await?;
+                }
                 flush_new_messages(conv, &persist, &mut persist_cursor).await?;
                 if matches!(outcome, TurnOutcome::Canceled) {
                     // Stream aborted by Ctrl+C — loop back to the prompt.
@@ -340,6 +343,9 @@ pub async fn run(
             slash::SlashAction::Retry => match last_user_message.clone() {
                 Some(prev) => {
                     let outcome = send_turn(&turn_ctx, &prev).await?;
+                    if let TurnOutcome::Completed(ref records) = outcome {
+                        persist_compactions(records, &persist).await?;
+                    }
                     flush_new_messages(conv, &persist, &mut persist_cursor).await?;
                     if matches!(outcome, TurnOutcome::Canceled) {
                         continue;
@@ -369,9 +375,13 @@ pub async fn run(
 
 /// Outcome of a single chat turn, distinguishing normal completion from a
 /// user-initiated cancel.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// A completed turn carries the compactions the prompt loop performed, so the
+/// REPL can persist each summary where it happened and the stored session
+/// records that — and what — the model was told it forgot.
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TurnOutcome {
-    Completed,
+    Completed(Vec<crate::memory::CompactionRecord>),
     Canceled,
 }
 
@@ -453,7 +463,7 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
             } else {
                 println!();
             }
-            Ok(TurnOutcome::Completed)
+            Ok(TurnOutcome::Completed(response.compactions))
         }
         TurnSelectResult::Canceled => {
             eprintln!(
@@ -475,6 +485,27 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
 enum TurnSelectResult {
     Done(Result<crate::stream::CollectedResponse, ActonAIError>),
     Canceled,
+}
+
+/// Persist the compaction summaries a turn produced, ahead of the turn's own
+/// rows: each summary stands in for history *older* than the turn, so that is
+/// where it reads correctly on reload. No-op when no persist context was
+/// supplied (e.g. tests driving the loop directly).
+async fn persist_compactions(
+    records: &[crate::memory::CompactionRecord],
+    persist: &Option<PersistCtx<'_>>,
+) -> Result<(), ActonAIError> {
+    let Some(ctx) = persist.as_ref() else {
+        return Ok(());
+    };
+    for record in records {
+        persistence::save_message(ctx.conn, ctx.conversation_id, &record.as_message())
+            .await
+            .map_err(|e| {
+                ActonAIError::prompt_failed(format!("failed to save compaction summary: {e}"))
+            })?;
+    }
+    Ok(())
 }
 
 /// Persist messages added since the last flush. No-op when no persist

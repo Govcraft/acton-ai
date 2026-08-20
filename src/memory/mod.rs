@@ -13,6 +13,7 @@
 //! - [`EmbeddingProvider`]: Trait for embedding generation services
 //! - [`Memory`]: A memory entry with optional embedding
 //! - [`ContextWindow`]: Context window management for LLM interactions
+//! - [`compaction`]: Pure auto-compaction policy applied inside the prompt loop
 //!
 //! ## Example
 //!
@@ -50,11 +51,20 @@
 //! }
 //! ```
 
+pub mod compaction;
 mod context;
 mod embeddings;
 mod error;
 pub mod persistence;
 mod store;
+
+// Re-export compaction types
+pub use compaction::{
+    apply_compaction, finish_compaction, plan_compaction, summarization_messages, summary_message,
+    transcript, CompactionConfig, CompactionConfigError, CompactionConfigErrorKind,
+    CompactionOutcome, CompactionPlan, CompactionRecord, CompactionThreshold, KeepRecentTurns,
+    COMPACTION_NOTICE, COMPACTION_PROMPT,
+};
 
 // Re-export context window types
 pub use context::{

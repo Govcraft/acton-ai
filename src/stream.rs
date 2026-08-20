@@ -264,6 +264,14 @@ pub struct CollectedResponse {
     /// Live observers get the same plans as they land, via the
     /// [`PlanUpdated`](crate::messages::PlanUpdated) broadcast.
     pub plan: Option<crate::tools::plan::Plan>,
+    /// Compactions the prompt loop performed during this turn, oldest first.
+    ///
+    /// Empty unless auto-compaction is configured *and* fired. Each record
+    /// carries the provider-written summary that replaced the elided span and
+    /// the measured effect; a caller that persists sessions can store
+    /// [`CompactionRecord::as_message`](crate::memory::CompactionRecord::as_message)
+    /// so the stored conversation records that compaction happened.
+    pub compactions: Vec<crate::memory::CompactionRecord>,
 }
 
 impl CollectedResponse {
@@ -277,6 +285,7 @@ impl CollectedResponse {
             usage: Usage::default(),
             tool_calls: Vec::new(),
             plan: None,
+            compactions: Vec::new(),
         }
     }
 
@@ -294,6 +303,19 @@ impl CollectedResponse {
         self
     }
 
+    /// Attaches the compactions the turn performed.
+    #[must_use]
+    pub fn with_compactions(mut self, compactions: Vec<crate::memory::CompactionRecord>) -> Self {
+        self.compactions = compactions;
+        self
+    }
+
+    /// Returns true if the prompt loop compacted the history during this turn.
+    #[must_use]
+    pub fn was_compacted(&self) -> bool {
+        !self.compactions.is_empty()
+    }
+
     /// Creates a new collected response with tool calls.
     #[must_use]
     pub fn with_tool_calls(
@@ -309,6 +331,7 @@ impl CollectedResponse {
             usage: Usage::default(),
             tool_calls,
             plan: None,
+            compactions: Vec::new(),
         }
     }
 
@@ -346,6 +369,7 @@ impl Default for CollectedResponse {
             usage: Usage::default(),
             tool_calls: Vec::new(),
             plan: None,
+            compactions: Vec::new(),
         }
     }
 }

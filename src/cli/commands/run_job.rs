@@ -182,6 +182,12 @@ pub async fn execute(
         let user_msg = crate::messages::Message::user(&message);
         let assistant_msg = crate::messages::Message::assistant(&response.text);
         crate::memory::persistence::save_message(&conn, &conversation_id, &user_msg).await?;
+        // Compaction summaries are stored where they happened, so the
+        // session records that — and what — the model was told it forgot.
+        for record in &response.compactions {
+            crate::memory::persistence::save_message(&conn, &conversation_id, &record.as_message())
+                .await?;
+        }
         crate::memory::persistence::save_message(&conn, &conversation_id, &assistant_msg).await?;
         crate::memory::persistence::touch_session(&conn, session_name).await?;
     }

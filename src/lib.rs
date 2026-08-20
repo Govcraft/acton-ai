@@ -168,12 +168,13 @@ pub mod prelude {
         LogLevel, LoggingConfig, LoggingError, LoggingErrorKind,
     };
     pub use crate::memory::{
-        AgentStateSnapshot, ContextStats, ContextWindow, ContextWindowConfig, ContextWindowData,
+        AgentStateSnapshot, CompactionConfig, CompactionOutcome, CompactionRecord,
+        CompactionThreshold, ContextStats, ContextWindow, ContextWindowConfig, ContextWindowData,
         ContextWindowResponse, Embedding, EmbeddingError, EmbeddingProvider, GetContextWindow,
-        InitMemoryStore, LoadMemories, MemoriesLoaded, Memory, MemorySearchResults, MemoryStore,
-        MemoryStoreMetrics, MemoryStoreMetricsSnapshot, MemoryStored, OperationCompleted,
-        PersistenceConfig, PersistenceError, ScoredMemory, SearchMemories, StoreMemory,
-        StubEmbeddingProvider, TruncationStrategy,
+        InitMemoryStore, KeepRecentTurns, LoadMemories, MemoriesLoaded, Memory,
+        MemorySearchResults, MemoryStore, MemoryStoreMetrics, MemoryStoreMetricsSnapshot,
+        MemoryStored, OperationCompleted, PersistenceConfig, PersistenceError, ScoredMemory,
+        SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
     pub use crate::tools::builtins::{BuiltinTools, UpdatePlanTool, UpdatePlanToolActor};

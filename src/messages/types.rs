@@ -701,6 +701,27 @@ pub enum TurnLifecycle {
         /// The call that finished.
         tool_call_id: String,
     },
+    /// A turn's history was compacted between rounds.
+    ///
+    /// Published only by a runtime with
+    /// [`CompactionConfig`](crate::memory::CompactionConfig) in force, and
+    /// only on a round where compaction actually changed the history: the
+    /// elided span was summarized by the turn's own provider and the summary
+    /// spliced in where the removed messages were. It is the one lifecycle
+    /// event that reports work done *to* a turn rather than *by* it, and it
+    /// exists because compaction rewrites what the model sees: an operator
+    /// debugging a model that "forgot" something needs to be able to see that
+    /// the framework took it away — and what it was told instead.
+    ContextCompacted {
+        /// The turn whose history was compacted.
+        turn_id: TurnId,
+        /// Estimated tokens before compaction.
+        tokens_before: u64,
+        /// Estimated tokens after compaction.
+        tokens_after: u64,
+        /// Messages the summary replaced.
+        messages_elided: u64,
+    },
 }
 
 /// A plan the model published, broadcast the moment it is recorded.
