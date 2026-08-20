@@ -543,3 +543,204 @@ async fn no_introspection_section_means_no_socket_at_all() {
 
     ai.shutdown().await.expect("shutdown");
 }
+
+// =============================================================================
+// 6. Interrupted turns
+// =============================================================================
+
+/// A test-owned subscriber recording every turn start and finish it sees.
+///
+/// Both the observation and the barrier: an `ask` answered by this actor
+/// proves every lifecycle broadcast ahead of it in the same FIFO inbox has
+/// been folded in.
+#[acton_actor]
+struct LifecycleSpy {
+    started: Vec<String>,
+    finished: Vec<(String, String)>,
+}
+
+#[acton_message]
+struct GetLifecycle;
+
+impl Request for GetLifecycle {
+    type Response = LifecycleSeen;
+}
+
+#[acton_message]
+struct LifecycleSeen {
+    started: Vec<String>,
+    finished: Vec<(String, String)>,
+}
+
+async fn spawn_lifecycle_spy(runtime: &mut ActorRuntime) -> ActorHandle {
+    let mut builder = runtime.new_actor_with_name::<LifecycleSpy>("lifecycle_spy".to_string());
+
+    builder.mutate_on::<TurnLifecycle>(|actor, envelope| {
+        match envelope.message() {
+            TurnLifecycle::TurnStarted { turn_id, .. } => {
+                actor.model.started.push(turn_id.to_string());
+            }
+            TurnLifecycle::TurnFinished {
+                turn_id, outcome, ..
+            } => {
+                actor
+                    .model
+                    .finished
+                    .push((turn_id.to_string(), outcome.to_string()));
+            }
+            _ => {}
+        }
+        Reply::ready()
+    });
+
+    builder.act_on::<GetLifecycle>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let started = actor.model.started.clone();
+        let finished = actor.model.finished.clone();
+        Reply::pending(async move {
+            reply.send(LifecycleSeen { started, finished }).await;
+        })
+    });
+
+    // On the builder, before start: a subscription registered afterwards is
+    // silently ignored.
+    builder.handle().subscribe::<TurnLifecycle>().await;
+
+    builder.start().await
+}
+
+/// Asks for status until the in-flight turn count reaches zero.
+///
+/// The interrupted `TurnFinished` is published from a task the drop guard
+/// spawned, so no future the test holds can be awaited for it; this is the
+/// same loop a real `acton-ai drain --wait` runs against the status surface.
+/// Bounded, and paced by asks and yields rather than by the clock.
+async fn status_once_idle(client: &IpcClient, ai: &ActonAI) -> StatusReport {
+    for _ in 0..10_000 {
+        flush_broadcasts(ai).await;
+        let report = ask_status(client).await;
+        if report.active_turns == 0 {
+            return report;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("the interrupted turn was never finished; a drain would hang forever");
+}
+
+#[tokio::test]
+async fn a_dropped_turn_future_still_finishes_its_lifecycle_and_a_drain_completes() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let socket = dir.path().join("dropped.sock");
+    let server = MockServer::start(vec![
+        Round::tool_call("call_1", "gate", json!({})),
+        Round::text("never reached"),
+    ])
+    .await;
+    let mut ai = runtime_listening_at(&server, "dropped-turn-agent", &socket).await;
+    let spy = spawn_lifecycle_spy(ai.runtime_mut()).await;
+
+    let gate = GatedTool::new();
+    let started = Arc::clone(&gate.started);
+
+    // Held locally, not spawned: the whole point is to drop it.
+    let mut turn = Box::pin(
+        ai.prompt("run the gated tool")
+            .tool(
+                "gate",
+                "Blocks until the test releases it",
+                json!({"type": "object", "properties": {}}),
+                move |_args| {
+                    let started = Arc::clone(&gate.started);
+                    let release = Arc::clone(&gate.release);
+                    async move {
+                        started.notify_one();
+                        release.notified().await;
+                        Ok(json!({"released": true}))
+                    }
+                },
+            )
+            .collect(),
+    );
+
+    // Drive the turn until the tool body is running, then drop it mid-tool —
+    // the exact shape of a user cancelling from a select! arm.
+    tokio::select! {
+        _ = &mut turn => panic!("the gated tool never returns, so the turn cannot complete"),
+        () = started.notified() => {}
+    }
+    drop(turn);
+
+    // The drop guard's TurnFinished settles the in-flight count to zero.
+    let client = connect(&socket).await;
+    let report = status_once_idle(&client, &ai).await;
+    assert_eq!(report.turns_started, 1);
+    assert_eq!(
+        report.in_flight_tool_calls, 0,
+        "the TurnFinished sweep must reap the tool the dropped turn was parked in"
+    );
+
+    // Which is precisely what lets a drain complete instead of hanging on a
+    // turn that no longer exists.
+    let ack: AdmissionAck = ask_admission!(client, Drain);
+    assert!(
+        ack.is_drained(),
+        "a dropped turn must not hold a drain open: {ack:?}"
+    );
+
+    // The pair is balanced and the finish is distinguishable from success.
+    flush_broadcasts(&ai).await;
+    let seen: LifecycleSeen = spy.ask(GetLifecycle).await.expect("the spy answers");
+    assert_eq!(seen.started.len(), 1);
+    assert_eq!(
+        seen.finished,
+        vec![(seen.started[0].clone(), "interrupted".to_string())],
+        "exactly one finish, for the started turn, marked interrupted"
+    );
+
+    ai.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_completed_turn_finishes_exactly_once_as_completed() {
+    let server = MockServer::start(vec![Round::text("done")]).await;
+    let mut ai = runtime_pointed_at(&server, "completed-turn-agent").await;
+    let spy = spawn_lifecycle_spy(ai.runtime_mut()).await;
+
+    ai.prompt("say done").collect().await.expect("the prompt");
+
+    // A guard that also fired from Drop on the normal path would show up
+    // here as a second finish for the same turn.
+    flush_broadcasts(&ai).await;
+    let seen: LifecycleSeen = spy.ask(GetLifecycle).await.expect("the spy answers");
+    assert_eq!(seen.started.len(), 1);
+    assert_eq!(
+        seen.finished,
+        vec![(seen.started[0].clone(), "completed".to_string())]
+    );
+
+    ai.shutdown().await.expect("shutdown");
+}
+
+#[tokio::test]
+async fn a_failed_turn_finishes_exactly_once_as_failed() {
+    // One scripted failure and no failover chain: the turn returns an error.
+    let server = MockServer::start(vec![Round::server_error()]).await;
+    let mut ai = runtime_pointed_at(&server, "failed-turn-agent").await;
+    let spy = spawn_lifecycle_spy(ai.runtime_mut()).await;
+
+    ai.prompt("try anyway")
+        .collect()
+        .await
+        .expect_err("the scripted round fails");
+
+    flush_broadcasts(&ai).await;
+    let seen: LifecycleSeen = spy.ask(GetLifecycle).await.expect("the spy answers");
+    assert_eq!(seen.started.len(), 1);
+    assert_eq!(
+        seen.finished,
+        vec![(seen.started[0].clone(), "failed".to_string())],
+        "an error is a finished turn, distinguishable from success and from interruption"
+    );
+
+    ai.shutdown().await.expect("shutdown");
+}

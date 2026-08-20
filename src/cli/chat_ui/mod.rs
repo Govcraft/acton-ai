@@ -428,7 +428,7 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
     // broadcast and render inline via the existing subscriber.
     let outcome = if ctx.render_markdown {
         tokio::select! {
-            res = ctx.conv.send(content) => TurnSelectResult::Done(res),
+            res = ctx.conv.send(content) => TurnSelectResult::Done(Box::new(res)),
             _ = tokio::signal::ctrl_c() => {
                 ctx.muted.store(true, Ordering::Relaxed);
                 TurnSelectResult::Canceled
@@ -436,7 +436,7 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
         }
     } else {
         tokio::select! {
-            res = ctx.conv.send_streaming(content, ctx.token_handle) => TurnSelectResult::Done(res),
+            res = ctx.conv.send_streaming(content, ctx.token_handle) => TurnSelectResult::Done(Box::new(res)),
             _ = tokio::signal::ctrl_c() => {
                 ctx.muted.store(true, Ordering::Relaxed);
                 TurnSelectResult::Canceled
@@ -452,6 +452,7 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
 
     match outcome {
         TurnSelectResult::Done(res) => {
+            let res = *res;
             let response = res?;
             if ctx.render_markdown {
                 // Render header + markdown as one block. Same bold-magenta
@@ -483,7 +484,7 @@ async fn send_turn(ctx: &TurnContext<'_>, content: &str) -> Result<TurnOutcome, 
 /// Intermediate enum used inside `send_turn` — kept private so the public
 /// surface only exposes the broader `TurnOutcome`.
 enum TurnSelectResult {
-    Done(Result<crate::stream::CollectedResponse, ActonAIError>),
+    Done(Box<Result<crate::stream::CollectedResponse, ActonAIError>>),
     Canceled,
 }
 

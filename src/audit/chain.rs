@@ -189,6 +189,7 @@ mod tests {
             correlation_id: CorrelationId::new(),
             conversation_id: None,
             turn_id: TurnId::new(),
+            tool_call_id: format!("toolu_{index}"),
             tool_name: format!("tool_{index}"),
             arguments: json!({"index": index}),
             outcome: AuditOutcome::Success {

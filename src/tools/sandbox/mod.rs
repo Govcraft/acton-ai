@@ -19,12 +19,26 @@
 //!
 //! ## Usage
 //!
+//! [`SandboxedExecution`] is the handle most callers want — it owns the
+//! one-shot `create` → `execute` → `destroy` lifecycle so nobody has to
+//! reimplement it:
+//!
 //! ```rust,ignore
-//! use acton_ai::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
+//! use acton_ai::tools::sandbox::{ProcessSandboxConfig, SandboxedExecution};
 //! use std::time::Duration;
 //!
-//! let cfg = ProcessSandboxConfig::new().with_timeout(Duration::from_secs(30));
-//! let factory = ProcessSandboxFactory::new(cfg)?;
+//! let sandbox = SandboxedExecution::process(
+//!     ProcessSandboxConfig::new().with_timeout(Duration::from_secs(30)),
+//! )?;
+//! let result = sandbox.execute("bash", serde_json::json!({"command": "echo hi"})).await?;
+//! ```
+//!
+//! The trait layer underneath stays available for custom implementations:
+//!
+//! ```rust,ignore
+//! use acton_ai::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
+//!
+//! let factory = ProcessSandboxFactory::new(ProcessSandboxConfig::new())?;
 //! let sandbox = factory.create().await?;
 //! let result = sandbox.execute("bash", serde_json::json!({"command": "echo hi"})).await?;
 //! ```
@@ -34,10 +48,14 @@
 mod stub;
 mod traits;
 
+pub mod execution;
 pub mod process;
 
 // Re-export traits
 pub use traits::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
+
+// Re-export the callable handle over a configured factory.
+pub use execution::SandboxedExecution;
 
 // Stub implementation is only available in tests
 #[cfg(test)]

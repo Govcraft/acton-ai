@@ -101,6 +101,13 @@ pub struct InvocationRecord {
     pub conversation_id: Option<ConversationId>,
     /// The turn the call belongs to.
     pub turn_id: TurnId,
+    /// The provider's ID for this particular call.
+    ///
+    /// Together with `turn_id` this is what joins the entry to the
+    /// `TurnLifecycle::ToolStarted` and `ToolFinished` a live observer saw,
+    /// so a recorded trail and a watched session can be reconciled after
+    /// the fact.
+    pub tool_call_id: String,
     /// The tool name as the model saw it.
     pub tool_name: String,
     /// The arguments, already redacted.
@@ -136,6 +143,8 @@ pub struct AuditEntry {
     pub conversation_id: Option<ConversationId>,
     /// The turn the call belongs to.
     pub turn_id: TurnId,
+    /// The provider's ID for this particular call.
+    pub tool_call_id: String,
     /// The tool name as the model saw it.
     pub tool_name: String,
     /// The arguments, already redacted.
@@ -171,6 +180,7 @@ struct HashPreimage<'a> {
     correlation_id: &'a CorrelationId,
     conversation_id: Option<&'a ConversationId>,
     turn_id: &'a TurnId,
+    tool_call_id: &'a str,
     tool_name: &'a str,
     arguments: &'a serde_json::Value,
     outcome: &'a AuditOutcome,
@@ -219,6 +229,7 @@ impl AuditEntry {
             correlation_id,
             conversation_id,
             turn_id,
+            tool_call_id,
             tool_name,
             arguments,
             outcome,
@@ -233,6 +244,7 @@ impl AuditEntry {
             correlation_id: &correlation_id,
             conversation_id: conversation_id.as_ref(),
             turn_id: &turn_id,
+            tool_call_id: &tool_call_id,
             tool_name: &tool_name,
             arguments: &arguments,
             outcome: &outcome,
@@ -248,6 +260,7 @@ impl AuditEntry {
             correlation_id,
             conversation_id,
             turn_id,
+            tool_call_id,
             tool_name,
             arguments,
             outcome,
@@ -271,6 +284,7 @@ impl AuditEntry {
             correlation_id: &self.correlation_id,
             conversation_id: self.conversation_id.as_ref(),
             turn_id: &self.turn_id,
+            tool_call_id: &self.tool_call_id,
             tool_name: &self.tool_name,
             arguments: &self.arguments,
             outcome: &self.outcome,
@@ -304,6 +318,7 @@ mod tests {
             correlation_id: CorrelationId::new(),
             conversation_id: None,
             turn_id: TurnId::new(),
+            tool_call_id: "toolu_01".to_string(),
             tool_name: tool_name.to_string(),
             arguments: json!({"value": 1}),
             outcome: AuditOutcome::Success {
@@ -352,6 +367,24 @@ mod tests {
         let mut reversed = entry.clone();
         reversed.decision = AuditDecision::refused(Decider::Denylist);
         assert_ne!(reversed.hash, reversed.recompute_hash());
+
+        // Repointing an entry at a different call would let one invocation's
+        // recorded outcome be passed off as another's.
+        let mut recalled = entry;
+        recalled.tool_call_id = "toolu_02".to_string();
+        assert_ne!(recalled.hash, recalled.recompute_hash());
+    }
+
+    #[test]
+    fn the_tool_call_id_survives_a_seal_and_verify_round_trip() {
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        assert_eq!(entry.tool_call_id, "toolu_01");
+
+        let line = entry.to_jsonl().expect("an entry must serialize");
+        let parsed: AuditEntry = serde_json::from_str(&line).expect("an entry must parse back");
+
+        assert_eq!(parsed.tool_call_id, "toolu_01");
+        assert_eq!(parsed.recompute_hash(), entry.hash);
     }
 
     #[test]

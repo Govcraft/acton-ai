@@ -152,10 +152,10 @@ pub mod prelude {
     pub use crate::introspection::{AdmissionGate, AdmissionState, IntrospectionConfig};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::policy::{
-        ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason, ToolInvocation,
-        ToolPolicy, TurnCounts,
+        ApprovalDecision, ApprovalFuture, ApprovalHookFn, Decider, DenialReason,
+        ToolClassification, ToolInvocation, ToolPolicy, TurnCounts,
     };
-    pub use crate::stream::{CollectedResponse, StreamAction, StreamHandler};
+    pub use crate::stream::{CollectedResponse, StreamAction, StreamContext, StreamHandler};
 
     // Low-level API (for advanced use cases)
     pub use crate::agent::{
@@ -184,11 +184,14 @@ pub mod prelude {
         SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
-    pub use crate::tools::builtins::{BuiltinTools, UpdatePlanTool, UpdatePlanToolActor};
+    pub use crate::tools::builtins::{
+        BuiltinExecutor, BuiltinTools, UpdatePlanTool, UpdatePlanToolActor,
+    };
+    pub use crate::tools::sandbox::SandboxedExecution;
     pub use crate::tools::{
         plan_from_tool_result, Plan, PlanError, PlanNote, PlanStep, PlanStepStatus, PlanStepTitle,
-        PlanTextError, RawPlanStep, RegisterTool, Tool, ToolConfig, ToolDefinition, ToolError,
-        ToolErrorKind, ToolExecutorTrait, ToolFuture, ToolRegistry, UPDATE_PLAN_TOOL,
+        PlanTextError, RawPlanStep, Tool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind,
+        ToolExecutorTrait, ToolFuture, UPDATE_PLAN_TOOL,
     };
 
     /// The [`#[tool]`](macro@crate::tool) attribute macro.

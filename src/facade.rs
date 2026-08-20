@@ -77,7 +77,7 @@ use crate::conversation::ConversationBuilder;
 use crate::error::{ActonAIError, ActonAIErrorKind};
 use crate::llm::{FailoverEvent, LLMProvider, ProviderConfig};
 use crate::logging::{init_and_store_logging, LoggingConfig};
-use crate::messages::Message;
+use crate::messages::{Message, ToolDefinition};
 use crate::prompt::PromptBuilder;
 use crate::tools::builtins::BuiltinTools;
 use crate::tools::sandbox::{ProcessSandboxConfig, ProcessSandboxFactory, SandboxFactory};
@@ -198,6 +198,15 @@ pub(crate) struct ActonAIInner {
     /// When present, these tools are injected into every prompt: configuring
     /// a server *is* the request to use it, so there is no separate opt-in.
     pub(crate) mcp: Option<crate::mcp::McpTools>,
+    /// Custom tools registered once on the builder and injected into every
+    /// prompt and conversation turn.
+    ///
+    /// Staged with [`ActonAIBuilder::with_tool`],
+    /// [`with_tool_executor`](ActonAIBuilder::with_tool_executor), or
+    /// [`add_tool`](ActonAIBuilder::add_tool); empty when none were. Names
+    /// were checked against the built-ins, skill tools, MCP tools, and each
+    /// other at launch, so injection can never silently shadow anything.
+    pub(crate) custom_tools: Vec<crate::prompt::SharedToolSpec>,
     /// Installed telemetry, when it was configured.
     ///
     /// `None` means no `[telemetry]` section and no builder call, which is
@@ -409,6 +418,7 @@ impl ActonAI {
             builder =
                 builder.checkpoint(checkpoint.store.clone(), crate::types::CheckpointId::new());
         }
+        builder = self.inject_custom_tools(builder);
         builder
     }
 
@@ -871,15 +881,63 @@ impl ActonAI {
         self.inner.compaction.as_ref()
     }
 
-    /// Returns the sandbox factory shared by sandboxed builtin tool calls.
+    /// Returns a handle that executes tools under this runtime's sandbox.
     ///
-    /// Populated when the builder was configured with
+    /// `Some` when the builder was configured with
     /// [`with_process_sandbox`](ActonAIBuilder::with_process_sandbox) or
     /// [`with_process_sandbox_config`](ActonAIBuilder::with_process_sandbox_config)
-    /// (or an equivalent TOML `[sandbox]` section). Returns `None` otherwise.
+    /// (or an equivalent TOML `[sandbox]` section); `None` otherwise. The
+    /// handle shares the runtime's factory, so what it executes is isolated
+    /// exactly as a sandboxed builtin would be.
+    ///
+    /// This exists for embedders that implement their own tool executors —
+    /// an ACP agent daemon wrapping builtin execution with its own approval
+    /// protocol, say — and need to run the underlying work on the same
+    /// sandbox path `.use_builtins()` uses, rather than losing isolation by
+    /// calling executors in-process. For wrapping one specific builtin,
+    /// [`builtin_executor`](Self::builtin_executor) already pairs the tool
+    /// with this decision.
+    ///
+    /// Note that a sandbox configured here re-execs the **current binary**;
+    /// an embedder's `main` must call
+    /// [`runner::run_if_sandbox_child`](crate::tools::sandbox::process::runner::run_if_sandbox_child)
+    /// first thing, as documented there.
     #[must_use]
-    pub(crate) fn sandbox_factory(&self) -> Option<&Arc<dyn SandboxFactory>> {
-        self.inner.sandbox_factory.as_ref()
+    pub fn sandboxed_execution(&self) -> Option<crate::tools::sandbox::SandboxedExecution> {
+        self.inner
+            .sandbox_factory
+            .as_ref()
+            .map(|factory| crate::tools::sandbox::SandboxedExecution::new(Arc::clone(factory)))
+    }
+
+    /// Returns the named builtin's execution path, sandbox routing included.
+    ///
+    /// `None` when builtins were not configured on this runtime or the name
+    /// is not among them. The returned executor makes the same decision
+    /// `.use_builtins()` makes for the prompt loop — and is in fact what the
+    /// prompt loop registers — so a tool configured `sandboxed` on a runtime
+    /// with a sandbox routes through it, and everything else runs in-process.
+    ///
+    /// This exists for embedders that wrap builtin execution (approval
+    /// flows, protocol adapters, extra logging) while keeping the sandboxing
+    /// the runtime would have applied. Note that the prompt loop's
+    /// tool-approval gate and audit trail wrap *registered* tools: a wrapper
+    /// registered on a prompt keeps both, a direct
+    /// [`call`](crate::tools::builtins::BuiltinExecutor::call) outside the
+    /// loop deliberately has neither.
+    #[must_use]
+    pub fn builtin_executor(&self, name: &str) -> Option<crate::tools::builtins::BuiltinExecutor> {
+        let builtins = self.inner.builtins.as_ref()?;
+        let config = builtins.get_config(name)?;
+        let executor = builtins.get_executor(name)?;
+        let sandbox = if config.sandboxed {
+            self.sandboxed_execution()
+        } else {
+            None
+        };
+        Some(crate::tools::builtins::BuiltinExecutor::new(
+            name, executor, sandbox,
+        ))
     }
 
     /// Returns the MCP tools discovered at launch, if any server is configured.
@@ -942,6 +1000,7 @@ impl ActonAI {
         }
         builder = self.inject_skill_tools(builder);
         builder = self.inject_mcp_tools(builder);
+        builder = self.inject_custom_tools(builder);
         builder
     }
 
@@ -995,6 +1054,65 @@ impl ActonAI {
                 });
         }
         builder
+    }
+
+    /// Registers every runtime-wide custom tool on `builder`. No-op when none
+    /// were staged.
+    ///
+    /// Called from both [`prompt`](Self::prompt) and
+    /// [`continue_with`](Self::continue_with) — the same pair of sites the
+    /// skill and MCP injections use — so every `PromptBuilder` the facade
+    /// hands out, including the ones a
+    /// [`Conversation`](crate::conversation::Conversation) rebuilds per turn,
+    /// carries the tools registered once at build time.
+    #[inline]
+    fn inject_custom_tools(&self, builder: PromptBuilder) -> PromptBuilder {
+        if self.inner.custom_tools.is_empty() {
+            return builder;
+        }
+        builder.with_tool_specs(
+            self.inner
+                .custom_tools
+                .iter()
+                .map(crate::prompt::SharedToolSpec::to_tool_spec),
+        )
+    }
+
+    /// Every tool name [`prompt`](Self::prompt) and
+    /// [`continue_with`](Self::continue_with) inject automatically.
+    ///
+    /// This is the collision set a per-conversation tool is checked against:
+    /// a name in this list is already taken on every turn the conversation
+    /// will run, so registering it again could only shadow or duplicate.
+    pub(crate) fn injected_tool_names(&self) -> Vec<String> {
+        let mut names = Vec::new();
+        if self.inner.auto_builtins {
+            if let Some(builtins) = &self.inner.builtins {
+                names.extend(
+                    builtins
+                        .configs()
+                        .map(|(_, config)| config.definition.name.clone()),
+                );
+            }
+        }
+        if self.inner.skills.is_some() {
+            use crate::tools::builtins::{ActivateSkillTool, ListSkillsTool};
+            names.push(ListSkillsTool::config().definition.name);
+            names.push(ActivateSkillTool::config().definition.name);
+        }
+        if let Some(mcp) = &self.inner.mcp {
+            names.extend(
+                mcp.configs()
+                    .map(|(_, config)| config.definition.name.clone()),
+            );
+        }
+        names.extend(
+            self.inner
+                .custom_tools
+                .iter()
+                .map(|spec| spec.name().to_string()),
+        );
+        names
     }
 
     /// Starts a managed conversation session.
@@ -1199,6 +1317,12 @@ pub struct ActonAIBuilder {
     builtins: BuiltinToolsConfig,
     auto_builtins: bool,
     sandbox_mode: SandboxMode,
+    /// Custom tools staged by [`with_tool`](Self::with_tool),
+    /// [`with_tool_executor`](Self::with_tool_executor), and
+    /// [`add_tool`](Self::add_tool). Name-checked against the built-ins, the
+    /// skill tools, the MCP tools, and each other in
+    /// [`launch`](Self::launch), then injected into every prompt.
+    custom_tools: Vec<crate::prompt::SharedToolSpec>,
     /// Skill paths staged by [`ActonAIBuilder::with_skill_paths`] /
     /// [`with_skill_path`]. Loaded once in [`launch`](Self::launch) into a
     /// shared [`SkillRegistry`](crate::skills::SkillRegistry).
@@ -2442,6 +2566,112 @@ impl ActonAIBuilder {
         self
     }
 
+    /// Registers a custom tool once, for every prompt and conversation this
+    /// runtime produces.
+    ///
+    /// This exists for embedders — an agent daemon installing something like
+    /// an `apply_patch` tool — that need a tool available everywhere without
+    /// re-registering it on each [`PromptBuilder`] via
+    /// [`with_tool`](crate::prompt::PromptBuilder::with_tool). The tool is
+    /// injected alongside the built-ins, skill tools, and MCP tools, and runs
+    /// through the same policy gate and audit trail they do.
+    ///
+    /// Names are validated at [`launch`](Self::launch): a custom tool that
+    /// collides with an enabled built-in, a skill tool, an MCP tool, a name
+    /// the prompt loop reserves for itself
+    /// ([`STRUCTURED_OUTPUT_TOOL`](crate::extract::STRUCTURED_OUTPUT_TOOL),
+    /// [`EXIT_CONVERSATION_TOOL`](crate::conversation::EXIT_CONVERSATION_TOOL)),
+    /// or another custom tool fails the launch rather than silently
+    /// shadowing anything.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let runtime = ActonAI::builder()
+    ///     .app_name("my-daemon")
+    ///     .anthropic_from_env()
+    ///     .with_tool(apply_patch_definition(), |args| async move {
+    ///         apply_patch(args).await
+    ///     })
+    ///     .launch()
+    ///     .await?;
+    ///
+    /// // Available on every prompt, no per-call wiring:
+    /// runtime.prompt("fix the failing test").collect().await?;
+    /// ```
+    #[must_use]
+    pub fn with_tool<F, Fut>(mut self, definition: ToolDefinition, executor: F) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: std::future::Future<Output = Result<serde_json::Value, crate::tools::ToolError>>
+            + Send
+            + 'static,
+    {
+        self.custom_tools
+            .push(crate::prompt::SharedToolSpec::from_closure(
+                definition, executor,
+            ));
+        self
+    }
+
+    /// Registers a custom tool backed by a
+    /// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) executor, for
+    /// every prompt and conversation this runtime produces.
+    ///
+    /// This is [`with_tool`](Self::with_tool) for callers whose tool is an
+    /// executor *object* rather than a closure — the shape a reusable tool
+    /// library exports. The executor's
+    /// [`validate_args`](crate::tools::ToolExecutorTrait::validate_args) runs
+    /// before every execution, and the same launch-time name validation and
+    /// policy/audit coverage as [`with_tool`](Self::with_tool) apply.
+    #[must_use]
+    pub fn with_tool_executor<E>(mut self, definition: ToolDefinition, executor: E) -> Self
+    where
+        E: crate::tools::ToolExecutorTrait + 'static,
+    {
+        self.custom_tools
+            .push(crate::prompt::SharedToolSpec::from_executor(
+                definition,
+                Arc::new(Box::new(executor) as crate::tools::BoxedToolExecutor),
+            ));
+        self
+    }
+
+    /// Registers a value implementing the [`Tool`](crate::tools::Tool) trait
+    /// — typically generated by the `#[tool]` attribute macro — for every
+    /// prompt and conversation this runtime produces.
+    ///
+    /// This is the runtime-wide counterpart of
+    /// [`PromptBuilder::add_tool`](crate::prompt::PromptBuilder::add_tool),
+    /// for embedders that define tools with `#[tool]` and want them installed
+    /// once at build time. The same launch-time name validation and
+    /// policy/audit coverage as [`with_tool`](Self::with_tool) apply.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// /// Adds two numbers.
+    /// #[tool]
+    /// async fn add(a: i64, b: i64) -> Result<serde_json::Value, ToolError> {
+    ///     Ok(serde_json::json!({ "sum": a + b }))
+    /// }
+    ///
+    /// let runtime = ActonAI::builder()
+    ///     .anthropic_from_env()
+    ///     .add_tool(Add)
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn add_tool<T>(mut self, tool: T) -> Self
+    where
+        T: crate::tools::Tool,
+    {
+        self.custom_tools
+            .push(crate::prompt::SharedToolSpec::from_tool_impl(tool));
+        self
+    }
+
     /// Stages skill paths to be loaded into a shared
     /// [`SkillRegistry`](crate::skills::SkillRegistry) at launch.
     ///
@@ -2751,6 +2981,18 @@ impl ActonAIBuilder {
             Some(tools)
         };
 
+        // Custom tool names are validated here, once everything they could
+        // collide with — built-ins, skill tools, MCP tools — is resolved. A
+        // collision is a launch failure: two tools with one name would either
+        // shadow silently or send the provider a duplicate definition, and
+        // neither is something to discover mid-conversation.
+        validate_custom_tool_names(
+            &self.custom_tools,
+            builtins.as_ref(),
+            skills.is_some(),
+            mcp.as_ref(),
+        )?;
+
         // Tracking is on unless something explicitly turned it off. The
         // accountant is a plain top-level actor: no IO, no connection, so
         // nothing for supervision to repair — and a restart would zero the
@@ -2874,6 +3116,7 @@ impl ActonAIBuilder {
                 accountant,
                 budget,
                 mcp,
+                custom_tools: self.custom_tools,
                 telemetry,
                 admission,
                 introspection,
@@ -3076,7 +3319,10 @@ impl ActonAIBuilder {
         };
 
         if let Some(ref config) = resolved {
-            config.ensure_parent_dir()?;
+            // Creates the trail as well as its directory: an armed trail that
+            // has recorded nothing must be an empty file, or `audit verify`
+            // reports a missing trail while `audit_head()` reports genesis.
+            config.ensure_trail_exists()?;
         }
 
         Ok(resolved)
@@ -3517,6 +3763,70 @@ async fn start_introspection(
         );
         Ok(IntrospectionRuntime { socket_path })
     }
+}
+
+/// Refuses a launch whose custom tool names collide with anything.
+///
+/// Pure: reads the resolved built-ins, the skill-tool names, and the MCP
+/// tools, and reports the first custom tool whose name is already taken —
+/// by one of those, or by an earlier custom tool. Built-ins count even under
+/// `manual_builtins()`, because `PromptBuilder::use_builtins()` can put them
+/// on any prompt later; a name that *might* be injected is not a name a
+/// custom tool can safely hold.
+///
+/// The prompt loop's own tool names are reserved on the same reasoning:
+/// `extract()` appends [`crate::extract::STRUCTURED_OUTPUT_TOOL`] to any
+/// prompt, and a conversation with the exit tool enabled appends
+/// [`crate::conversation::EXIT_CONVERSATION_TOOL`]. A custom tool holding
+/// either name would launch fine and then either fail every extraction at
+/// call time or silently swallow the model's exit call — exactly the
+/// mid-conversation discovery this check exists to prevent.
+fn validate_custom_tool_names(
+    custom_tools: &[crate::prompt::SharedToolSpec],
+    builtins: Option<&BuiltinTools>,
+    skills_configured: bool,
+    mcp: Option<&crate::mcp::McpTools>,
+) -> Result<(), ActonAIError> {
+    let mut taken: HashMap<String, &'static str> = HashMap::new();
+    taken.insert(
+        crate::extract::STRUCTURED_OUTPUT_TOOL.to_string(),
+        "the reserved structured-output extraction tool",
+    );
+    taken.insert(
+        crate::conversation::EXIT_CONVERSATION_TOOL.to_string(),
+        "the reserved conversation-exit tool",
+    );
+    if let Some(builtins) = builtins {
+        for (_, config) in builtins.configs() {
+            taken.insert(config.definition.name.clone(), "a built-in tool");
+        }
+    }
+    if skills_configured {
+        use crate::tools::builtins::{ActivateSkillTool, ListSkillsTool};
+        taken.insert(ListSkillsTool::config().definition.name, "a skill tool");
+        taken.insert(ActivateSkillTool::config().definition.name, "a skill tool");
+    }
+    if let Some(mcp) = mcp {
+        for (_, config) in mcp.configs() {
+            taken.insert(config.definition.name.clone(), "an MCP tool");
+        }
+    }
+
+    for spec in custom_tools {
+        let name = spec.name();
+        if let Some(owner) = taken.get(name) {
+            return Err(ActonAIError::configuration(
+                "tools",
+                format!(
+                    "custom tool '{name}' collides with {owner} of the same name; \
+                     rename the custom tool or drop the conflicting registration"
+                ),
+            ));
+        }
+        taken.insert(name.to_string(), "another custom tool");
+    }
+
+    Ok(())
 }
 
 /// Flips the gate to draining when `SIGTERM` arrives.

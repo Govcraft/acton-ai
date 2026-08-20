@@ -53,6 +53,58 @@ pub mod env_vars {
     pub const HARDENING: &str = "ACTON_AI_SANDBOX_HARDENING";
 }
 
+/// Detours into the sandbox runner when this process was re-exec'd as a
+/// sandbox child, and returns immediately otherwise.
+///
+/// The process sandbox re-execs the *current binary* and relies on that
+/// binary routing into [`main`] when `ACTON_AI_SANDBOX_RUNNER=1` is set —
+/// `acton-ai`'s own entry point does exactly this. A downstream embedder
+/// whose binary hosts the framework as a library must uphold the same
+/// contract, or the re-exec'd child will run their whole application against
+/// the sandbox protocol. This helper is that contract in one call: put it at
+/// the very top of `main()`, before any runtime, socket, or CLI setup.
+///
+/// ```rust,ignore
+/// fn main() {
+///     // Must run first: the sandbox child is a bounded one-shot executor
+///     // and must never boot the application around it.
+///     acton_ai::tools::sandbox::process::runner::run_if_sandbox_child();
+///
+///     my_daemon::main();
+/// }
+/// ```
+pub fn run_if_sandbox_child() {
+    let is_child = std::env::var(env_vars::RUNNER).ok().as_deref() == Some("1");
+    if is_child {
+        main();
+    }
+}
+
+/// Whether the sandbox runner can dispatch `tool_name`.
+///
+/// The child executes a fixed set of built-ins — the sandboxed ones — and
+/// nothing else: custom `#[tool]` functions and MCP tools cannot cross the
+/// process boundary. Embedders routing work through
+/// [`SandboxedExecution`](crate::tools::sandbox::SandboxedExecution) use this
+/// to decide, before spawning a child, whether a name will resolve inside it.
+#[must_use]
+pub fn supports(tool_name: &str) -> bool {
+    sandbox_tool(tool_name).is_some()
+}
+
+/// The single source of truth for what the child can run.
+///
+/// [`supports`] and [`dispatch_async`] both consult this, so the advertised
+/// set and the dispatched set cannot drift apart.
+fn sandbox_tool(tool_name: &str) -> Option<Box<dyn ToolExecutorTrait>> {
+    match tool_name {
+        "bash" => Some(Box::new(BashTool::new())),
+        "write_file" => Some(Box::new(WriteFileTool::new())),
+        "edit_file" => Some(Box::new(EditFileTool::new())),
+        _ => None,
+    }
+}
+
 /// Child entry point.
 ///
 /// Reads one [`Request`] from stdin, executes it against the in-process tool
@@ -116,11 +168,9 @@ pub async fn dispatch_async(req: Request) -> Response {
         tool_name, args, ..
     } = req;
 
-    let result: Result<Value, ToolError> = match tool_name.as_str() {
-        "bash" => BashTool::new().execute(args).await,
-        "write_file" => WriteFileTool::new().execute(args).await,
-        "edit_file" => EditFileTool::new().execute(args).await,
-        other => Err(ToolError::not_found(other)),
+    let result: Result<Value, ToolError> = match sandbox_tool(&tool_name) {
+        Some(tool) => tool.execute(args).await,
+        None => Err(ToolError::not_found(&tool_name)),
     };
 
     match result {

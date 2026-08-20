@@ -104,15 +104,13 @@ Key types:
 
 ### `tools` (`src/tools/`)
 
-The tool system. Provides infrastructure for tool registration, execution, and sandboxing. Tools can be registered globally (via `ToolRegistry`) or per-agent (via `ToolActor`). The per-agent approach is recommended because each tool actor is supervised as a child of its owning agent.
+The tool system. Provides infrastructure for tool registration, execution, and sandboxing. Tools can be registered runtime-wide (via `ActonAIBuilder::with_tool`), per conversation, per prompt, or per-agent (via `ToolActor`). The per-agent approach is recommended for multi-agent systems because each tool actor is supervised as a child of its owning agent.
 
 Key submodules:
 - `builtins/` -- pre-built tools (read_file, write_file, edit_file, list_directory, glob, grep, bash, calculate, web_fetch, update_plan)
 - `sandbox/` -- `Sandbox`/`SandboxFactory` traits plus the `process/` implementation (re-exec + rlimits + optional landlock/seccomp). See [Process Sandbox](/docs/sandbox).
 - `security/` -- path validation and sanitization (`PathValidator`)
 - `actor.rs` -- per-agent `ToolActor` implementation and the `ToolExecutor` trait
-- `registry.rs` -- global `ToolRegistry` actor (legacy approach)
-- `executor.rs` -- temporary executor actor for one-shot tool execution
 - `definition.rs` -- `ToolConfig`, `ToolExecutorTrait`, and boxed executor types
 
 Key types:

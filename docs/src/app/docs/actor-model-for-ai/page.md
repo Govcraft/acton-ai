@@ -62,9 +62,9 @@ When the provider receives an `LLMRequest`, it calls the API and broadcasts `LLM
 
 Each **Agent** actor maintains its own conversation history, state machine (`Idle`, `Thinking`, `Executing`, `Completed`), and tool definitions. It processes `UserPrompt` messages by sending `LLMRequest` to the provider and handling the streamed response. When the LLM requests tool calls, the agent transitions to the `Executing` state and dispatches tool executions.
 
-### ToolRegistry
+### Tool actors
 
-The **ToolRegistry** actor manages tool registration, validation, and execution dispatch. It supports sandboxed execution through configurable sandbox factories.
+Tools offered to the model are plain specs carried by the prompt loop — registered per prompt, per conversation, or runtime-wide on `ActonAIBuilder`. For agent isolation, each agent supervises **per-agent tool actors** (`ToolActor`), so one agent's tools are never visible to another.
 
 ### MemoryStore
 

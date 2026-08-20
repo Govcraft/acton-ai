@@ -629,6 +629,14 @@ pub struct UsageReport {
 pub struct LLMStreamToolResult {
     /// Correlation ID for the stream this result belongs to
     pub correlation_id: CorrelationId,
+    /// The turn the call belongs to.
+    ///
+    /// A turn spans every round of the tool loop, so the correlation ID above
+    /// names only the round that asked for this call. A consumer routing
+    /// events into one client session needs the coarser identity, and the
+    /// same one appears on the [`TurnLifecycle::ToolStarted`] and
+    /// [`TurnLifecycle::ToolFinished`] events for this call.
+    pub turn_id: TurnId,
     /// ID of the tool call that produced this result (matches
     /// [`ToolCall::id`]).
     pub tool_call_id: String,
@@ -663,21 +671,47 @@ pub struct LLMStreamToolResult {
 /// Published unconditionally, like [`UsageReport`]: these are tiny messages
 /// and a broadcast with no subscriber is a no-op, so a runtime that never
 /// arms introspection pays nothing but the send.
+///
+/// # The tool bracket is total
+///
+/// Every [`Self::ToolFinished`] — and every [`LLMStreamToolResult`] — is
+/// preceded by exactly one [`Self::ToolStarted`] carrying the same `turn_id`
+/// and `tool_call_id`. That holds for a call the policy gate **refused** as
+/// well as one that ran: the start event is published before the gate is
+/// consulted, and a refusal is reported as a finish with `success: false`.
+///
+/// A consumer that maps these onto a protocol where a result may only follow
+/// an announced call (ACP's `tool_call` / `tool_call_update`, say) therefore
+/// never has to synthesize a start event it did not see.
 #[acton_message]
 #[derive(Serialize, Deserialize)]
+#[non_exhaustive]
 pub enum TurnLifecycle {
     /// A turn was admitted and is now running.
+    #[non_exhaustive]
     TurnStarted {
         /// Identifies this turn across its whole lifecycle.
+        ///
+        /// Either minted by the prompt loop or supplied by the caller through
+        /// [`PromptBuilder::turn_id`](crate::prompt::PromptBuilder::turn_id);
+        /// either way it is the id
+        /// [`CollectedResponse::turn_id`](crate::stream::CollectedResponse::turn_id)
+        /// reports when the turn ends.
         turn_id: TurnId,
     },
-    /// A turn ended, successfully or with an error.
+    /// A turn ended, successfully or not.
     ///
     /// Always published for a turn that published [`Self::TurnStarted`],
-    /// whatever the outcome.
+    /// whatever the outcome — including a turn whose driving future was
+    /// dropped mid-flight, which a guard in the prompt loop finishes with
+    /// [`TurnOutcome::Interrupted`] so a drain can still complete.
+    #[non_exhaustive]
     TurnFinished {
         /// The turn that ended.
         turn_id: TurnId,
+        /// How it ended. An observer balancing starts against finishes can
+        /// ignore this; an observer reporting *what happened* cannot.
+        outcome: TurnOutcome,
     },
     /// A turn was never admitted, because admission was closed.
     ///
@@ -685,7 +719,12 @@ pub enum TurnLifecycle {
     /// pair, never alongside it: a refused turn never ran, so counting it as
     /// in-flight even momentarily would make a drain look unfinished.
     TurnRefused,
-    /// A tool call started executing inside a turn.
+    /// A tool call was dispatched inside a turn.
+    ///
+    /// Published *before* the approval gate runs, so a call the gate goes on
+    /// to refuse is announced like any other. See the type-level note on the
+    /// bracket for why.
+    #[non_exhaustive]
     ToolStarted {
         /// The turn running this tool.
         turn_id: TurnId,
@@ -693,13 +732,38 @@ pub enum TurnLifecycle {
         tool_call_id: String,
         /// The tool being executed.
         tool_name: String,
+        /// The arguments **the model proposed**, redacted like the trail.
+        ///
+        /// Not the arguments that necessarily ran: an approval hook may
+        /// rewrite them, and the gate may refuse the call outright. This is
+        /// what the model asked for, which is the thing a client renders next
+        /// to the tool's name, and it is the only version that exists at the
+        /// point the call is announced. What actually ran is in the audit
+        /// trail.
+        ///
+        /// When an audit trail with a redaction list is configured, the
+        /// listed keys arrive as `[redacted]` here too. This broadcast lands
+        /// in every subscriber's mailbox — a lifecycle forwarder that
+        /// renders or persists arguments is exactly the place a redaction
+        /// config exists to keep a secret out of — so it crosses the same
+        /// boundary the trail's entries cross, redacted the same way.
+        arguments: serde_json::Value,
     },
-    /// A tool call finished executing, successfully or not.
+    /// A tool call finished, successfully or not — including a call the gate
+    /// refused, which finishes without ever having run.
+    #[non_exhaustive]
     ToolFinished {
         /// The turn that ran this tool.
         turn_id: TurnId,
         /// The call that finished.
         tool_call_id: String,
+        /// True when the tool ran and returned a value; false when it failed
+        /// or when the gate refused it.
+        success: bool,
+        /// A bounded one-line preview of the result, the error, or the
+        /// denial reason — the same text [`LLMStreamToolResult::summary`]
+        /// carries for this call.
+        summary: String,
     },
     /// A turn's history was compacted between rounds.
     ///
@@ -757,6 +821,53 @@ pub struct PlanUpdated {
     pub plan: crate::tools::plan::Plan,
 }
 
+/// How a turn ended.
+///
+/// Carried by [`TurnLifecycle::TurnFinished`] so an observer — an embedder's
+/// session UI, an audit consumer — can tell a turn that answered from one
+/// that failed from one whose driving future was simply dropped. Downstream
+/// embedders that let a user cancel a turn (by dropping the `collect()`
+/// future) need [`Interrupted`](Self::Interrupted) to render "cancelled"
+/// rather than mislabelling the turn as completed or errored.
+///
+/// Marked `#[non_exhaustive]` so a future outcome can be added without
+/// breaking downstream `match`es.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TurnOutcome {
+    /// The turn ran to completion and its caller got a response.
+    Completed,
+    /// The turn ended with an error returned to its caller.
+    Failed,
+    /// The future driving the turn was dropped before the turn ended.
+    ///
+    /// Published by a drop guard in the prompt loop, not by the loop itself:
+    /// a dropped future never runs again, so nothing inside it can publish
+    /// anything. Without this outcome an interrupted turn would leave its
+    /// [`TurnLifecycle::TurnStarted`] unmatched forever, and a drain waiting
+    /// for in-flight turns to reach zero would never complete.
+    Interrupted,
+}
+
+impl TurnOutcome {
+    /// Short, stable label, for logs and JSON surfaces.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 // =============================================================================
 // Tool Messages
 // =============================================================================
@@ -804,30 +915,6 @@ pub struct ToolCall {
     pub name: String,
     /// The arguments to pass to the tool (as JSON)
     pub arguments: serde_json::Value,
-}
-
-/// Request to execute a tool.
-#[acton_message]
-#[derive(Serialize, Deserialize)]
-pub struct ExecuteTool {
-    /// Correlation ID for matching to response
-    pub correlation_id: CorrelationId,
-    /// The tool call to execute
-    pub tool_call: ToolCall,
-    /// The agent requesting the tool execution
-    pub requesting_agent: AgentId,
-}
-
-/// Response from tool execution.
-#[acton_message]
-#[derive(Serialize, Deserialize)]
-pub struct ToolResponse {
-    /// Correlation ID matching the request
-    pub correlation_id: CorrelationId,
-    /// The ID of the tool call this responds to
-    pub tool_call_id: String,
-    /// The result of the tool execution (success content or error message)
-    pub result: Result<String, String>,
 }
 
 // =============================================================================

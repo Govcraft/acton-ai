@@ -54,9 +54,9 @@ use crate::facade::ActonAI;
 use crate::llm::{CheckHealth, FailoverEvent, ProviderHealth, SamplingParams};
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, Usage,
+    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, TurnOutcome, Usage,
 };
-use crate::stream::{CollectedResponse, ExecutedToolCall};
+use crate::stream::{CollectedResponse, ExecutedToolCall, StreamContext};
 use crate::tools::ToolError;
 use crate::types::{AgentId, CorrelationId, TurnId};
 use acton_reactive::prelude::*;
@@ -79,13 +79,20 @@ pub const DEFAULT_MAX_TOOL_ROUNDS: usize = 10;
 const STRUCTURED_OUTPUT_NUDGE: &str = "Record your final answer now by calling structured_output.";
 
 /// Type alias for start callbacks.
-type StartCallback = Box<dyn FnMut() + Send + 'static>;
+///
+/// The [`StreamContext`] names the turn and the round that is starting, so a
+/// caller multiplexing several concurrent prompts can route the event without
+/// inventing a correlation scheme of its own.
+type StartCallback = Box<dyn FnMut(&StreamContext) + Send + 'static>;
 
 /// Type alias for token callbacks.
 type TokenCallback = Box<dyn FnMut(&str) + Send + 'static>;
 
 /// Type alias for end callbacks.
-type EndCallback = Box<dyn FnMut(StopReason) + Send + 'static>;
+///
+/// Receives the same [`StreamContext`] the round's start callback saw,
+/// alongside the reason the provider stopped.
+type EndCallback = Box<dyn FnMut(&StreamContext, StopReason) + Send + 'static>;
 
 /// Type alias for tool result callbacks.
 ///
@@ -143,37 +150,17 @@ where
     }
 }
 
-/// Adapter to wrap built-in tool executors as `ToolExecutorFn`.
+/// Lets the public builtin execution path stand in as a `ToolExecutorFn`.
 ///
-/// When `sandbox` is `Some`, tool invocations are dispatched through the
-/// sandbox factory's `Sandbox::execute` path. Otherwise the in-process
-/// executor runs the tool directly. This is how facade-configured
-/// `ProcessSandbox` actually reaches the bash/write_file/edit_file call
-/// sites — prior to this wiring the factory existed in memory but the
-/// prompt path skipped it entirely.
-struct BuiltinToolExecutorAdapter {
-    tool_name: String,
-    executor: Arc<crate::tools::BoxedToolExecutor>,
-    sandbox: Option<Arc<dyn crate::tools::sandbox::SandboxFactory>>,
-}
-
-impl ToolExecutorFn for BuiltinToolExecutorAdapter {
+/// [`BuiltinExecutor`](crate::tools::builtins::BuiltinExecutor) is what
+/// [`ActonAI::builtin_executor`](crate::facade::ActonAI::builtin_executor)
+/// hands to embedders, and it is also what `use_builtins()` registers — one
+/// construction site, one execution path, so what an embedder wraps is
+/// literally what the loop runs. The sandbox-or-in-process decision lives
+/// inside the executor; this impl only bridges the trait.
+impl ToolExecutorFn for crate::tools::builtins::BuiltinExecutor {
     fn call(&self, args: serde_json::Value) -> ToolFuture {
-        match self.sandbox.clone() {
-            Some(factory) => {
-                let name = self.tool_name.clone();
-                Box::pin(async move {
-                    let mut sandbox = factory.create().await?;
-                    let result = sandbox.execute(&name, args).await;
-                    sandbox.destroy();
-                    result
-                })
-            }
-            None => {
-                let executor = Arc::clone(&self.executor);
-                Box::pin(async move { executor.execute(args).await })
-            }
-        }
+        crate::tools::builtins::BuiltinExecutor::call(self, args)
     }
 }
 
@@ -183,8 +170,12 @@ pub struct ToolSpec {
     pub definition: ToolDefinition,
     /// The executor for this tool
     executor: Arc<dyn ToolExecutorFn>,
-    /// Optional callback invoked when the tool returns a result
-    on_result: Option<ToolResultCallback>,
+    /// Optional callback invoked when the tool returns a result.
+    ///
+    /// Behind a `Mutex` purely so the spec — and with it [`PromptBuilder`] —
+    /// is `Sync`; the loop is the only caller and uses `get_mut`, so the
+    /// lock is never contended.
+    on_result: Option<std::sync::Mutex<ToolResultCallback>>,
 }
 
 impl std::fmt::Debug for ToolSpec {
@@ -203,6 +194,125 @@ impl Clone for ToolSpec {
             // Callbacks cannot be cloned (FnMut is not Clone)
             on_result: None,
         }
+    }
+}
+
+/// A tool staged outside any single prompt: a definition plus a shared
+/// executor, with no per-prompt result callback.
+///
+/// [`ToolSpec`] carries an optional `FnMut` callback slot, which makes it
+/// `Send` but not `Sync` — fine inside one `PromptBuilder`, fatal inside
+/// `ActonAIInner`, which lives behind an `Arc` and must stay `Send + Sync`.
+/// Runtime-wide tools (staged with
+/// [`ActonAIBuilder::with_tool`](crate::facade::ActonAIBuilder::with_tool))
+/// and per-conversation tools (staged with
+/// [`ConversationBuilder::with_tool`](crate::conversation::ConversationBuilder::with_tool))
+/// are therefore held in this callback-free shape and converted with
+/// [`to_tool_spec`](Self::to_tool_spec) at injection time — which puts them
+/// in the same list the prompt loop executes, behind the same policy gate
+/// and audit trail as the built-ins.
+#[derive(Clone)]
+pub(crate) struct SharedToolSpec {
+    definition: ToolDefinition,
+    executor: Arc<dyn ToolExecutorFn>,
+}
+
+impl std::fmt::Debug for SharedToolSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SharedToolSpec")
+            .field("definition", &self.definition)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedToolSpec {
+    /// Builds a spec from a definition and an async closure — the same
+    /// wrapping [`PromptBuilder::with_tool`] performs.
+    pub(crate) fn from_closure<F, Fut>(definition: ToolDefinition, executor: F) -> Self
+    where
+        F: Fn(serde_json::Value) -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<serde_json::Value, ToolError>> + Send + 'static,
+    {
+        Self {
+            definition,
+            executor: Arc::new(ClosureToolExecutor { func: executor }),
+        }
+    }
+
+    /// Builds a spec from a definition and a boxed
+    /// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) executor.
+    ///
+    /// Arguments are run through the executor's
+    /// [`validate_args`](crate::tools::ToolExecutorTrait::validate_args)
+    /// before execution — the executor declared a validator, so skipping it
+    /// here would make registration through the facade quietly laxer than
+    /// registration anywhere else.
+    pub(crate) fn from_executor(
+        definition: ToolDefinition,
+        executor: Arc<crate::tools::BoxedToolExecutor>,
+    ) -> Self {
+        Self {
+            definition,
+            executor: Arc::new(ExecutorTraitAdapter { executor }),
+        }
+    }
+
+    /// Builds a spec from a value implementing the [`Tool`](crate::tools::Tool)
+    /// trait — the shape the `#[tool]` attribute macro generates.
+    pub(crate) fn from_tool_impl<T>(tool: T) -> Self
+    where
+        T: crate::tools::Tool,
+    {
+        let definition = ToolDefinition {
+            // The Tool trait predates the idempotency flag and offers no way
+            // to declare it, so trait-built tools take the conservative
+            // default: a crash-recovery resume never re-runs them blindly.
+            idempotent: false,
+            name: tool.name().to_string(),
+            description: tool.description().to_string(),
+            input_schema: tool.input_schema(),
+        };
+        Self {
+            definition,
+            executor: Arc::new(TraitToolExecutor { tool }),
+        }
+    }
+
+    /// The name the model calls this tool by.
+    pub(crate) fn name(&self) -> &str {
+        &self.definition.name
+    }
+
+    /// Converts into the per-prompt shape the loop executes.
+    ///
+    /// Cheap: the definition is cloned, the executor `Arc` is shared.
+    pub(crate) fn to_tool_spec(&self) -> ToolSpec {
+        ToolSpec {
+            definition: self.definition.clone(),
+            executor: Arc::clone(&self.executor),
+            on_result: None,
+        }
+    }
+}
+
+/// Adapter that runs an `Arc<BoxedToolExecutor>` — the executor shape
+/// [`ToolExecutorTrait`](crate::tools::ToolExecutorTrait) implementors
+/// produce — wherever the prompt loop expects a `ToolExecutorFn`.
+///
+/// Unlike [`BuiltinToolExecutorAdapter`] it honors the executor's own
+/// `validate_args` hook: built-ins validate inside `execute`, but an external
+/// executor was promised its validator runs first.
+struct ExecutorTraitAdapter {
+    executor: Arc<crate::tools::BoxedToolExecutor>,
+}
+
+impl ToolExecutorFn for ExecutorTraitAdapter {
+    fn call(&self, args: serde_json::Value) -> ToolFuture {
+        let executor = Arc::clone(&self.executor);
+        Box::pin(async move {
+            executor.validate_args(&args)?;
+            executor.execute(args).await
+        })
     }
 }
 
@@ -241,6 +351,36 @@ type WrappedEndCallback = Arc<std::sync::Mutex<EndCallback>>;
 ///     .collect()
 ///     .await?;
 /// ```
+///
+/// # Sending a turn through an actor handler
+///
+/// The builder — and the future [`collect`](Self::collect) /
+/// [`extract`](Self::extract) returns — is `Send + Sync`. This is a
+/// deliberate contract, not an accident of the fields: acton-reactive's
+/// `Reply::pending` stores handler futures as
+/// `Pin<Box<dyn Future + Send + Sync>>`, so an embedder driving turns from
+/// inside its own actors (an ACP agent daemon, a per-session actor) can
+/// await a turn directly in a handler instead of spawning a detached task
+/// and losing cancellation and supervision:
+///
+/// ```rust,ignore
+/// session.act_on::<UserTurn>(|actor, ctx| {
+///     let ai = actor.model.ai.clone();
+///     let reply = ctx.reply_envelope();
+///     let content = ctx.message().content.clone();
+///     Reply::pending(async move {
+///         let response = ai.prompt(content).collect().await;
+///         reply.send(TurnDone::from(response)).await;
+///     })
+/// });
+/// ```
+///
+/// What keeps it true: the `FnMut` callbacks are stored pre-wrapped in the
+/// `Arc<Mutex<_>>` the stream collector needs anyway, and the two `dyn
+/// Future + Send` trait objects the loop awaits (tool executions, the
+/// approval hook) are polled through `sync_wrapper::SyncFuture`. The
+/// `tests/prompt_builder_sync.rs` suite turns a regression here into a
+/// compile error.
 pub struct PromptBuilder {
     /// The ActonAI runtime (cheaply cloned via Arc)
     runtime: ActonAI,
@@ -250,12 +390,17 @@ pub struct PromptBuilder {
     system_prompt: Option<String>,
     /// Optional conversation history (replaces user_content when set)
     conversation_history: Option<Vec<Message>>,
-    /// Callback for stream start
-    on_start: Option<StartCallback>,
-    /// Callback for each token
-    on_token: Option<TokenCallback>,
-    /// Callback for stream end
-    on_end: Option<EndCallback>,
+    /// Callback for stream start.
+    ///
+    /// Stored pre-wrapped in the `Arc<Mutex<_>>` the stream collector needs
+    /// anyway, rather than as a bare `Box<dyn FnMut>`, because a boxed
+    /// `FnMut` is `!Sync` and would make the whole builder `!Sync` — see the
+    /// "Sending a turn through an actor handler" section on [`PromptBuilder`].
+    on_start: Option<WrappedStartCallback>,
+    /// Callback for each token. Wrapped for the same reason as `on_start`.
+    on_token: Option<WrappedTokenCallback>,
+    /// Callback for stream end. Wrapped for the same reason as `on_start`.
+    on_end: Option<WrappedEndCallback>,
     /// Registered tools with inline executors
     tools: Vec<ToolSpec>,
     /// Maximum tool execution rounds (default: 10)
@@ -289,6 +434,9 @@ pub struct PromptBuilder {
     /// never stored — so the facade, not the fingerprint, is the authority
     /// that it belongs to this turn. `None` on every other prompt.
     resume_seed: Option<Box<CheckpointRecord>>,
+    /// Caller-supplied turn identity, when the caller wants to know the id
+    /// before the loop runs. `None` mints a fresh one at admission.
+    turn_id: Option<TurnId>,
 }
 
 impl PromptBuilder {
@@ -315,6 +463,7 @@ impl PromptBuilder {
             conversation_id: None,
             checkpoint: CheckpointSink::disabled(),
             resume_seed: None,
+            turn_id: None,
         }
     }
 
@@ -384,23 +533,29 @@ impl PromptBuilder {
 
     /// Sets a callback to be called when the stream starts.
     ///
-    /// This is useful for displaying a "thinking" indicator or spinner.
+    /// This is useful for displaying a "thinking" indicator or spinner. The
+    /// callback receives the [`StreamContext`] naming the turn and the round
+    /// that is starting, so an embedder driving several prompts at once (an
+    /// ACP agent fanning turns out to client sessions, say) can route the
+    /// event without keeping a side table. The callback fires once per
+    /// provider round, so a turn that loops through tools fires it several
+    /// times under the same [`StreamContext::turn_id`].
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// runtime
     ///     .prompt("Hello")
-    ///     .on_start(|| println!("Thinking..."))
+    ///     .on_start(|ctx| println!("Thinking... (turn {})", ctx.turn_id))
     ///     .collect()
     ///     .await?;
     /// ```
     #[must_use]
     pub fn on_start<F>(mut self, f: F) -> Self
     where
-        F: FnMut() + Send + 'static,
+        F: FnMut(&StreamContext) + Send + 'static,
     {
-        self.on_start = Some(Box::new(f));
+        self.on_start = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
@@ -423,30 +578,31 @@ impl PromptBuilder {
     where
         F: FnMut(&str) + Send + 'static,
     {
-        self.on_token = Some(Box::new(f));
+        self.on_token = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
     /// Sets a callback to be called when the stream ends.
     ///
-    /// The callback receives the stop reason indicating why the LLM
-    /// stopped generating.
+    /// The callback receives the [`StreamContext`] the round's start callback
+    /// saw, plus the stop reason indicating why the LLM stopped generating.
+    /// Like [`on_start`](Self::on_start) it fires once per provider round.
     ///
     /// # Example
     ///
     /// ```rust,ignore
     /// runtime
     ///     .prompt("Hello")
-    ///     .on_end(|reason| println!("\n[Finished: {reason:?}]"))
+    ///     .on_end(|_ctx, reason| println!("\n[Finished: {reason:?}]"))
     ///     .collect()
     ///     .await?;
     /// ```
     #[must_use]
     pub fn on_end<F>(mut self, f: F) -> Self
     where
-        F: FnMut(StopReason) + Send + 'static,
+        F: FnMut(&StreamContext, StopReason) + Send + 'static,
     {
-        self.on_end = Some(Box::new(f));
+        self.on_end = Some(Arc::new(std::sync::Mutex::new(Box::new(f))));
         self
     }
 
@@ -547,6 +703,20 @@ impl PromptBuilder {
         };
 
         self.tools.push(spec);
+        self
+    }
+
+    /// Appends pre-built tool specs to this prompt.
+    ///
+    /// This is how the facade injects runtime-wide custom tools (staged with
+    /// [`ActonAIBuilder::with_tool`](crate::facade::ActonAIBuilder::with_tool))
+    /// and how a [`Conversation`](crate::conversation::Conversation) carries
+    /// its per-conversation tools into every turn. Injected specs sit in the
+    /// same list as everything else, so the policy gate and the audit trail
+    /// see them exactly as they see built-ins.
+    #[must_use]
+    pub(crate) fn with_tool_specs(mut self, specs: impl IntoIterator<Item = ToolSpec>) -> Self {
+        self.tools.extend(specs);
         self
     }
 
@@ -655,7 +825,7 @@ impl PromptBuilder {
         let spec = ToolSpec {
             definition,
             executor: Arc::new(ClosureToolExecutor { func: executor }),
-            on_result: Some(Box::new(on_result)),
+            on_result: Some(std::sync::Mutex::new(Box::new(on_result))),
         };
 
         self.tools.push(spec);
@@ -868,6 +1038,49 @@ impl PromptBuilder {
         self
     }
 
+    /// Supplies the turn's identity instead of letting the loop mint one.
+    ///
+    /// Exists for embedders that must announce a turn to their own client
+    /// before the loop starts — an ACP agent has to answer a `session/prompt`
+    /// with an id it can immediately bind lifecycle events to, and minting
+    /// the id itself is the only way to have it that early. Every
+    /// [`TurnLifecycle`] event, every
+    /// [`LLMStreamToolResult`](crate::messages::LLMStreamToolResult), the
+    /// audit trail, and [`CollectedResponse::turn_id`] then carry exactly
+    /// this id.
+    ///
+    /// Callers that only need the id *after* the turn can skip this and read
+    /// it from [`CollectedResponse::turn_id`] instead.
+    ///
+    /// # Uniqueness
+    ///
+    /// Nothing forces a supplied id to be unique, and the runtime's own
+    /// accounting does not need it to be: the introspection actor counts
+    /// starts and finishes per id, so a cancel-and-retry that reuses the id
+    /// it already announced stays correct even when the cancelled turn's
+    /// interrupted finish lands after the retry started. Avoid holding two
+    /// turns *live* under one id all the same — lifecycle events key on the
+    /// id, so your own subscribers cannot tell the two turns' events apart.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let turn_id = TurnId::new();
+    /// notify_client_of_new_turn(&turn_id);
+    ///
+    /// let response = runtime
+    ///     .prompt("Deploy the fix")
+    ///     .turn_id(turn_id.clone())
+    ///     .collect()
+    ///     .await?;
+    /// assert_eq!(response.turn_id, turn_id);
+    /// ```
+    #[must_use]
+    pub fn turn_id(mut self, id: TurnId) -> Self {
+        self.turn_id = Some(id);
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -895,25 +1108,16 @@ impl PromptBuilder {
     #[must_use]
     pub fn use_builtins(mut self) -> Self {
         if let Some(builtins) = self.runtime.builtins() {
-            let factory = self.runtime.sandbox_factory().cloned();
             for (name, config) in builtins.configs() {
-                if let Some(executor) = builtins.get_executor(name) {
-                    // Only sandboxed tools route through the factory. Non-
-                    // sandboxed tools (e.g. `calculate`, `read_file`) skip
-                    // the subprocess roundtrip even when a factory exists.
-                    let sandbox = if config.sandboxed {
-                        factory.clone()
-                    } else {
-                        None
-                    };
-                    let adapter = BuiltinToolExecutorAdapter {
-                        tool_name: name.clone(),
-                        executor,
-                        sandbox,
-                    };
+                // `builtin_executor` owns the sandbox-or-in-process decision:
+                // only tools configured `sandboxed` route through the
+                // subprocess, and only when a sandbox factory exists. Going
+                // through the facade keeps this the same executor an
+                // embedder gets from `ActonAI::builtin_executor`.
+                if let Some(executor) = self.runtime.builtin_executor(name) {
                     self.tools.push(ToolSpec {
                         definition: config.definition.clone(),
-                        executor: Arc::new(adapter),
+                        executor: Arc::new(executor),
                         on_result: None,
                     });
                 }
@@ -1124,13 +1328,21 @@ impl PromptBuilder {
 
         // From here the turn is admitted, and every exit path below must
         // publish `TurnFinished` — a turn counted as started and never
-        // finished holds a drain open forever.
-        let turn_id = TurnId::new();
+        // finished holds a drain open forever. "Every exit path" includes the
+        // one the compiler cannot see: the caller dropping this future
+        // mid-await. The guard owns that duty, so cancellation publishes an
+        // `Interrupted` finish instead of leaving the start unmatched.
+        //
+        // The caller's id when one was supplied, so an embedder that
+        // announced the turn to its own client before calling `collect` sees
+        // that exact id on every event; minted here otherwise.
+        let turn_id = self.turn_id.clone().unwrap_or_default();
         broker
             .broadcast(TurnLifecycle::TurnStarted {
                 turn_id: turn_id.clone(),
             })
             .await;
+        let guard = TurnFinishedGuard::new(broker, turn_id.clone());
 
         let turn =
             crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
@@ -1172,8 +1384,11 @@ impl PromptBuilder {
             Err(error) => Err(error),
         };
 
-        broker
-            .broadcast(TurnLifecycle::TurnFinished { turn_id })
+        guard
+            .finish(match &result {
+                Ok(_) => TurnOutcome::Completed,
+                Err(_) => TurnOutcome::Failed,
+            })
             .await;
 
         let outcome = match &result {
@@ -1216,6 +1431,9 @@ impl PromptBuilder {
             conversation_id,
             checkpoint,
             resume_seed,
+            // Already resolved into the `turn_id` parameter by
+            // `run_prompt_loop`, which needed it before the span opened.
+            turn_id: _,
         } = self;
 
         // Resolve the provider handle
@@ -1570,12 +1788,9 @@ impl PromptBuilder {
         // the loop itself publishes, and it can only happen with one.
         let broker = chained.then(|| runtime.runtime().broker());
 
-        // Wrap callbacks in Arc<Mutex> for sharing across multiple rounds
-        let on_start: Option<WrappedStartCallback> =
-            on_start.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_token: Option<WrappedTokenCallback> =
-            on_token.map(|f| Arc::new(std::sync::Mutex::new(f)));
-        let on_end: Option<WrappedEndCallback> = on_end.map(|f| Arc::new(std::sync::Mutex::new(f)));
+        // The callbacks arrive already wrapped in the Arc<Mutex> the stream
+        // collector shares across rounds; the builder stores them that way so
+        // that it stays `Sync` (a bare boxed FnMut is not).
 
         loop {
             iteration += 1;
@@ -1687,6 +1902,10 @@ impl PromptBuilder {
                     // broadcasts with the round's correlation ID further down.
                     let round_correlation_id = correlation_id.clone();
                     let round_callbacks = StreamRoundCallbacks {
+                        context: Some(StreamContext::new(
+                            turn_id.clone(),
+                            round_correlation_id.clone(),
+                        )),
                         on_start: on_start.clone(),
                         on_token: on_token.clone(),
                         on_end: on_end.clone(),
@@ -2132,7 +2351,11 @@ impl PromptBuilder {
             )
             .with_usage(stats.usage)
             .with_plan(turn_plan)
-            .with_compactions(compaction_records),
+            .with_compactions(compaction_records)
+            // The id every lifecycle event of this turn carried — supplied by
+            // the caller or minted at admission — so the response can be
+            // matched against events observed while the turn ran.
+            .with_turn_id(turn_id.clone()),
             captured,
         ))
     }
@@ -2150,6 +2373,105 @@ impl std::fmt::Display for DisplayId<'_> {
         match self.0 {
             Some(id) => write!(f, "{id}"),
             None => f.write_str("-"),
+        }
+    }
+}
+
+/// Owns the duty to publish [`TurnLifecycle::TurnFinished`] exactly once.
+///
+/// The prompt loop broadcasts `TurnStarted` and *must* balance it with a
+/// `TurnFinished`, or the introspection actor counts the turn as in-flight
+/// forever and a drain waiting on it never completes. The `Ok`/`Err` paths
+/// through [`PromptBuilder::run_prompt_loop`] do that themselves via
+/// [`finish`](Self::finish) — but a caller can also *drop* the `collect()` /
+/// `extract()` future mid-await (a user pressed cancel, a `select!` took the
+/// other arm), and a dropped future never reaches any of its own code again.
+/// This guard's `Drop` is the only thing that still runs on that path, so
+/// the balancing broadcast lives here.
+///
+/// # Why `Drop` spawns instead of blocking
+///
+/// `Drop` is synchronous and usually runs inside an async context, so it can
+/// neither `.await` the broadcast nor block on it without risking a deadlock
+/// on the very runtime that is dropping the future. It therefore hands the
+/// send to a spawned task — the same fire-and-forget shape
+/// [`StreamCollectorSessionInner`]'s `Drop` already uses — on the runtime
+/// handle captured when the guard was built. Captured, not looked up at
+/// drop time: `Drop` can run on a thread with no Tokio context at all — an
+/// embedder stores the `Send + Sync` `collect()` future in its own session
+/// table and a UI thread, a C-FFI callback, or a watchdog `std::thread`
+/// drops the entry — and on that thread `Handle::try_current()` offers
+/// nothing while the runtime that started the turn is still healthy and
+/// still counting the turn in-flight. The ambient handle remains the
+/// fallback for the degenerate case of a guard built with no handle
+/// current.
+///
+/// # Why the normal path cannot double-fire
+///
+/// [`finish`](Self::finish) marks the guard fired *after* its broadcast
+/// completes, and `Drop` checks that mark. If the future is cancelled *inside*
+/// `finish`'s own broadcast — the one window where both could act — the
+/// duplicate `TurnFinished` is harmless by design: the introspection actor
+/// keeps in-flight turns in a `HashSet`, where a second remove is a no-op.
+/// The failure direction is chosen deliberately: an occasional duplicate
+/// finish is idempotent, while a missing one wedges a drain forever.
+struct TurnFinishedGuard {
+    broker: BrokerRef,
+    turn_id: TurnId,
+    /// Where `Drop` spawns the balancing broadcast. See the type-level note
+    /// on why this is captured at construction instead of looked up at drop.
+    handle: Option<tokio::runtime::Handle>,
+    fired: bool,
+}
+
+impl TurnFinishedGuard {
+    /// Arms the guard for `turn_id`. Call immediately after `TurnStarted`.
+    fn new(broker: BrokerRef, turn_id: TurnId) -> Self {
+        Self {
+            broker,
+            turn_id,
+            // Effectively always `Some`: `new` runs inside the prompt loop's
+            // async context. `try_current` rather than `current` so a guard
+            // built anywhere stranger degrades instead of panicking.
+            handle: tokio::runtime::Handle::try_current().ok(),
+            fired: false,
+        }
+    }
+
+    /// Publishes the balancing `TurnFinished` with how the turn ended.
+    ///
+    /// Consumes the guard: after this, its `Drop` is a no-op.
+    async fn finish(mut self, outcome: TurnOutcome) {
+        self.broker
+            .broadcast(TurnLifecycle::TurnFinished {
+                turn_id: self.turn_id.clone(),
+                outcome,
+            })
+            .await;
+        self.fired = true;
+    }
+}
+
+impl Drop for TurnFinishedGuard {
+    fn drop(&mut self) {
+        if self.fired {
+            return;
+        }
+        let broker = self.broker.clone();
+        let turn_id = self.turn_id.clone();
+        let handle = self
+            .handle
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
+        if let Some(handle) = handle {
+            handle.spawn(async move {
+                broker
+                    .broadcast(TurnLifecycle::TurnFinished {
+                        turn_id,
+                        outcome: TurnOutcome::Interrupted,
+                    })
+                    .await;
+            });
         }
     }
 }
@@ -2393,6 +2715,12 @@ fn outcome_for(error: &ActonAIError) -> &'static str {
 /// this type.
 #[derive(Clone, Default)]
 pub(crate) struct StreamRoundCallbacks {
+    /// The turn+round identity handed to the start and end callbacks.
+    ///
+    /// `Some` whenever the round loop installed this set; `None` only in the
+    /// idle state between rounds, where no callback can fire because the
+    /// correlation filter is also clear.
+    pub(crate) context: Option<StreamContext>,
     pub(crate) on_start: Option<WrappedStartCallback>,
     pub(crate) on_token: Option<WrappedTokenCallback>,
     pub(crate) on_end: Option<WrappedEndCallback>,
@@ -2402,6 +2730,7 @@ pub(crate) struct StreamRoundCallbacks {
 impl std::fmt::Debug for StreamRoundCallbacks {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("StreamRoundCallbacks")
+            .field("context", &self.context)
             .field("on_start", &self.on_start.is_some())
             .field("on_token", &self.on_token.is_some())
             .field("on_end", &self.on_end.is_some())
@@ -2493,9 +2822,11 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
         {
             return Reply::ready();
         }
-        if let Some(ref callback) = actor.model.round.on_start {
+        if let (Some(callback), Some(context)) =
+            (&actor.model.round.on_start, &actor.model.round.context)
+        {
             if let Ok(mut f) = callback.lock() {
-                f();
+                f(context);
             }
         }
         Reply::ready()
@@ -2548,9 +2879,11 @@ pub(crate) async fn build_stream_collector(runtime: &ActonAI) -> StreamCollector
         }
         actor.model.stop_reason = Some(envelope.message().stop_reason);
         actor.model.usage = envelope.message().usage;
-        if let Some(ref callback) = actor.model.round.on_end {
+        if let (Some(callback), Some(context)) =
+            (&actor.model.round.on_end, &actor.model.round.context)
+        {
             if let Ok(mut f) = callback.lock() {
-                f(envelope.message().stop_reason);
+                f(context, envelope.message().stop_reason);
             }
         }
 
@@ -2828,10 +3161,16 @@ impl ToolStep<'_> {
     ) -> (ToolOutcome, ExecutedToolCall) {
         let started = std::time::Instant::now();
 
-        // The gate comes first, ahead of the span and the lifecycle
-        // broadcast: a refused call never ran, and announcing it as started
-        // would put a tool in the observer's status line that no process ever
-        // executed.
+        // The bracket opens before the gate is consulted, so a call the gate
+        // goes on to refuse is announced exactly like one that runs. This is
+        // the doctrine `TurnLifecycle` documents: a consumer mapping these
+        // onto a protocol where a result may only follow an announced call
+        // must never have to synthesize a start it never saw. The cost is
+        // that a refused tool appears in an observer's status line for as
+        // long as the gate deliberates, which is the honest picture — the
+        // call was proposed, and something had to decide about it.
+        self.start_tool(tool_call).await;
+
         let gate = self.decide(tool_call, counts).await;
 
         let (arguments, decided_by) = match gate {
@@ -2852,6 +3191,64 @@ impl ToolStep<'_> {
             .await
     }
 
+    /// Opens the observation bracket for one call.
+    ///
+    /// Carries the arguments the *model* proposed, not the ones that will
+    /// run: at this point the gate has not been consulted, so a hook has had
+    /// no chance to rewrite them and the proposed set is the only one that
+    /// exists. What actually ran is the audit trail's business.
+    ///
+    /// When a trail is configured, the arguments pass through its redactor
+    /// first, exactly as the trail's own entries do: this broadcast fans out
+    /// to every [`TurnLifecycle`] subscriber's mailbox — the introspection
+    /// actor, an embedder's lifecycle forwarder — and those mailboxes are
+    /// precisely the places the redaction config promises a secret never
+    /// reaches. Publishing raw here would keep the secret out of the audit
+    /// file while delivering it to every UI and log downstream of the
+    /// broker.
+    async fn start_tool(&self, tool_call: &ToolCall) {
+        let arguments = match self.audit {
+            Some((_, config)) => config.redactor().redact(&tool_call.arguments),
+            None => tool_call.arguments.clone(),
+        };
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolStarted {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                arguments,
+            })
+            .await;
+    }
+
+    /// Closes the bracket [`Self::start_tool`] opened, however the call ended.
+    ///
+    /// Both events carry the same verdict and the same text, so an observer
+    /// watching only one of them reaches the same conclusion. Callers settle
+    /// `success` and `summary` before calling this, which is what makes that
+    /// possible.
+    async fn finish_tool(&self, tool_call: &ToolCall, success: bool, summary: String) {
+        self.provider_handle
+            .broadcast(TurnLifecycle::ToolFinished {
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                success,
+                summary: summary.clone(),
+            })
+            .await;
+
+        self.provider_handle
+            .broadcast(crate::messages::LLMStreamToolResult {
+                correlation_id: self.correlation_id.clone(),
+                turn_id: self.turn_id.clone(),
+                tool_call_id: tool_call.id.clone(),
+                tool_name: tool_call.name.clone(),
+                success,
+                summary,
+            })
+            .await;
+    }
+
     /// Applies the policy, or admits everything when there is none.
     async fn decide(
         &self,
@@ -2870,6 +3267,7 @@ impl ToolStep<'_> {
                 crate::policy::ToolInvocation {
                     tool_name: tool_call.name.clone(),
                     arguments: tool_call.arguments.clone(),
+                    tool_call_id: tool_call.id.clone(),
                     correlation_id: self.correlation_id.clone(),
                     turn_id: self.turn_id.clone(),
                 },
@@ -2893,19 +3291,12 @@ impl ToolStep<'_> {
             "tool call refused by policy",
         );
 
-        // Observers still hear about it. A refusal is something an operator
-        // watching a chat session needs to see, and `success: false` is
-        // exactly what the REPL already renders as a failed call.
+        // Closes the bracket `run` opened before the gate was consulted. A
+        // refusal is something an operator watching a chat session needs to
+        // see, and `success: false` is exactly what the REPL already renders
+        // as a failed call.
         let summary = summarize_error(&reason.to_string(), 200);
-        self.provider_handle
-            .broadcast(crate::messages::LLMStreamToolResult {
-                correlation_id: self.correlation_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                success: false,
-                summary,
-            })
-            .await;
+        self.finish_tool(tool_call, false, summary).await;
 
         self.record(
             tool_call,
@@ -2950,17 +3341,6 @@ impl ToolStep<'_> {
         // when it ran.
         let tool_span = self.turn.tool(&tool_call.name);
 
-        // Bracketed for the same reason the turn is: a tool is where a turn
-        // spends most of its wall-clock, so "what is this process doing right
-        // now" is usually answered by the name of a running tool.
-        self.provider_handle
-            .broadcast(TurnLifecycle::ToolStarted {
-                turn_id: self.turn_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-            })
-            .await;
-
         // Kept only when there is a trail to write it to: the entry must
         // describe the call that actually ran, and a hook may have rewritten
         // it into something the model never proposed.
@@ -2968,12 +3348,15 @@ impl ToolStep<'_> {
 
         let result = execute_tool_with_callback(tools, tool_call, arguments).await;
 
-        self.provider_handle
-            .broadcast(TurnLifecycle::ToolFinished {
-                turn_id: self.turn_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-            })
-            .await;
+        // Settled before the bracket closes, because `finish_tool` puts the
+        // same verdict and the same text on both events it publishes: an
+        // observer watching only one of them has to reach the same conclusion
+        // as one watching the other.
+        let (success, summary) = match &result {
+            Ok(value) => (true, summarize_tool_value(value, 200)),
+            Err(e) => (false, summarize_error(&e.to_string(), 200)),
+        };
+        self.finish_tool(tool_call, success, summary.clone()).await;
 
         let tool_outcome = if result.is_ok() {
             crate::telemetry::metrics::OUTCOME_OK
@@ -2989,23 +3372,6 @@ impl ToolStep<'_> {
         // of unbounded size and are never recorded — see
         // `crate::telemetry::spans`.
         tool_span.finish(tool_outcome);
-
-        // Broadcast a compact result event so observers (the CLI chat REPL)
-        // can render success/failure inline alongside the preceding tool-call
-        // line.
-        let (success, summary) = match &result {
-            Ok(value) => (true, summarize_tool_value(value, 200)),
-            Err(e) => (false, summarize_error(&e.to_string(), 200)),
-        };
-        self.provider_handle
-            .broadcast(crate::messages::LLMStreamToolResult {
-                correlation_id: self.correlation_id.clone(),
-                tool_call_id: tool_call.id.clone(),
-                tool_name: tool_call.name.clone(),
-                success,
-                summary: summary.clone(),
-            })
-            .await;
 
         let audit_outcome = match (&result, self.audit) {
             // Summarized from a redacted copy of the result, not the raw one.
@@ -3092,6 +3458,7 @@ impl ToolStep<'_> {
             correlation_id: self.correlation_id.clone(),
             conversation_id: self.conversation_id.cloned(),
             turn_id: self.turn_id.clone(),
+            tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
             // Redacted here, at the boundary, so a secret never reaches the
             // actor's mailbox — let alone its file.
@@ -3126,15 +3493,25 @@ async fn execute_tool_with_callback(
         return Err(ToolError::not_found(&tool_call.name));
     };
 
-    let result = spec.executor.call(arguments).await;
+    // `SyncFuture` because `ToolFuture` is a `dyn Future + Send` without
+    // `Sync`, and a `!Sync` future held across this await would make the
+    // whole turn future `!Sync` — which would force embedders back onto a
+    // spawned task instead of `Reply::pending`. The wrapper is sound because
+    // a future being polled is never shared, and it costs nothing at runtime.
+    let result = sync_wrapper::SyncFuture::new(spec.executor.call(arguments)).await;
 
-    // Invoke the result callback if present
-    if let Some(ref mut callback) = spec.on_result {
-        match &result {
-            Ok(value) => callback(Ok(value)),
-            Err(e) => {
-                let error_str = e.to_string();
-                callback(Err(&error_str));
+    // Invoke the result callback if present. `get_mut` rather than `lock`:
+    // we hold `&mut`, so the Mutex is only satisfying `Sync`, not guarding
+    // anything — and a poisoned lock (a callback that panicked earlier)
+    // simply skips the callback rather than failing the tool.
+    if let Some(callback) = spec.on_result.as_mut() {
+        if let Ok(callback) = callback.get_mut() {
+            match &result {
+                Ok(value) => callback(Ok(value)),
+                Err(e) => {
+                    let error_str = e.to_string();
+                    callback(Err(&error_str));
+                }
             }
         }
     }
@@ -3277,7 +3654,7 @@ mod tests {
             executor: Arc::new(ClosureToolExecutor {
                 func: |_args: serde_json::Value| async { Ok(serde_json::json!({})) },
             }),
-            on_result: Some(Box::new(|_result| {})),
+            on_result: Some(std::sync::Mutex::new(Box::new(|_result| {}))),
         };
 
         let cloned = spec.clone();

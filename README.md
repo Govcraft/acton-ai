@@ -887,8 +887,6 @@ ActonAI (Facade)
     │       │
     │       ├── Agent(s) ───────── Individual AI agents with reasoning
     │       │
-    │       ├── ToolRegistry ───── Tool registration and execution
-    │       │
     │       ├── MemoryStore ───── Persistent sessions, memories, embeddings
     │       │
     │       ├── CostAccountant ── Tallies broadcast usage reports, prices snapshots

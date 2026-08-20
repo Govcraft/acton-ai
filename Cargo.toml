@@ -141,6 +141,7 @@ opentelemetry-otlp = { version = "0.32", default-features = false, features = ["
 blake3 = "1.8.6"
 rustls = { version = "0.23.43", default-features = false, features = ["fips"], optional = true }
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "blocking"] }
+sync_wrapper = "1.0.2"
 
 [dev-dependencies]
 anyhow = "1.0.100"

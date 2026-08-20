@@ -82,12 +82,20 @@ pub(crate) struct StatusSources {
 /// Observes turn lifecycle broadcasts and answers introspection requests.
 #[acton_actor]
 pub struct IntrospectionActor {
-    /// Turns currently running.
+    /// Turns currently running: a count of live starts per turn id.
     ///
-    /// A set rather than a counter so a duplicate or out-of-order broadcast
-    /// corrects itself instead of permanently skewing the count. An operator
-    /// who cannot trust the in-flight number cannot trust a drain.
-    active_turns: std::collections::HashSet<TurnId>,
+    /// A map of counts rather than a set because turn ids can be supplied by
+    /// the caller
+    /// ([`PromptBuilder::turn_id`](crate::prompt::PromptBuilder::turn_id))
+    /// and nothing forces those unique: two concurrent turns sharing one id,
+    /// or a cancel-and-retry whose interrupted finish (published from a
+    /// spawned task) lands *after* the retry's start, must not let one
+    /// finish erase the other's live turn — a drain trusting the erased
+    /// entry would report drained while a turn is still mid-tool. Starts
+    /// increment, finishes decrement and drop the entry at zero, and an
+    /// unmatched finish is a no-op instead of a skew. An operator who cannot
+    /// trust the in-flight number cannot trust a drain.
+    active_turns: std::collections::HashMap<TurnId, u64>,
     /// Tool calls currently executing, keyed by provider-assigned call ID.
     in_flight_tools: std::collections::HashSet<String>,
     /// Turns started since launch.
@@ -110,6 +118,42 @@ pub struct IntrospectionActor {
 }
 
 impl IntrospectionActor {
+    /// Folds one `TurnStarted` into the in-flight picture.
+    ///
+    /// Every start counts, including one whose id is already live: the
+    /// prompt loop publishes exactly one start per turn, so a repeated id
+    /// here is a second *turn* sharing the id, not a duplicate broadcast.
+    fn note_turn_started(&mut self, turn_id: &TurnId) {
+        *self.active_turns.entry(turn_id.clone()).or_insert(0) += 1;
+        self.turns_started = self.turns_started.saturating_add(1);
+    }
+
+    /// Folds one `TurnFinished` into the in-flight picture.
+    ///
+    /// The belt-and-braces sweep of the turn's recorded tools — a turn that
+    /// ended while a tool was still recorded would otherwise leak that tool
+    /// forever — runs only when the id goes fully dead: while another live
+    /// turn still shares the id, sweeping would clear *its* in-flight tools
+    /// and let a drain complete under a turn still mid-tool. An unmatched
+    /// finish (the drop guard's one documented double-fire window) is a
+    /// no-op rather than a negative count.
+    fn note_turn_finished(&mut self, turn_id: &TurnId) {
+        match self.active_turns.get_mut(turn_id) {
+            Some(count) if *count > 1 => *count -= 1,
+            Some(_) => {
+                self.active_turns.remove(turn_id);
+                self.in_flight_tools
+                    .retain(|id| !id.starts_with(&tool_scope(turn_id)));
+            }
+            None => {}
+        }
+    }
+
+    /// Turns in flight right now: the sum of live starts, not distinct ids.
+    fn live_turns(&self) -> u64 {
+        self.active_turns.values().sum()
+    }
+
     /// Spawns the actor, subscribed **on the builder** to [`TurnLifecycle`].
     ///
     /// Subscribing after `start()` is silently ignored by acton-reactive,
@@ -131,21 +175,14 @@ impl IntrospectionActor {
         builder.mutate_on::<TurnLifecycle>(|actor, envelope| {
             match envelope.message() {
                 TurnLifecycle::TurnStarted { turn_id } => {
-                    if actor.model.active_turns.insert(turn_id.clone()) {
-                        actor.model.turns_started = actor.model.turns_started.saturating_add(1);
-                    }
+                    actor.model.note_turn_started(turn_id);
                 }
-                TurnLifecycle::TurnFinished { turn_id } => {
-                    actor.model.active_turns.remove(turn_id);
-                    // Belt and braces: a turn that ended while a tool was
-                    // still recorded would otherwise leak that tool forever.
-                    // Unreachable through the prompt loop, which brackets
-                    // every tool it starts, but the cost of being wrong here
-                    // is a drain that never completes.
-                    actor
-                        .model
-                        .in_flight_tools
-                        .retain(|id| !id.starts_with(&tool_scope(turn_id)));
+                // The outcome is deliberately ignored: for the in-flight
+                // picture, a completed, failed, and interrupted turn are the
+                // same fact — the turn is over. Counting only "successful"
+                // finishes would leave every failure holding a drain open.
+                TurnLifecycle::TurnFinished { turn_id, .. } => {
+                    actor.model.note_turn_finished(turn_id);
                 }
                 TurnLifecycle::ToolStarted {
                     turn_id,
@@ -160,6 +197,7 @@ impl IntrospectionActor {
                 TurnLifecycle::ToolFinished {
                     turn_id,
                     tool_call_id,
+                    ..
                 } => {
                     actor
                         .model
@@ -193,7 +231,7 @@ impl IntrospectionActor {
         builder.act_on::<Pause>(|actor, envelope| {
             let reply = envelope.reply_envelope();
             let state = actor.model.gate.pause();
-            let in_flight = actor.model.active_turns.len() as u64;
+            let in_flight = actor.model.live_turns();
             tracing::info!(in_flight, "turn admission paused over introspection");
             Reply::pending(async move {
                 reply
@@ -205,7 +243,7 @@ impl IntrospectionActor {
         builder.act_on::<Resume>(|actor, envelope| {
             let reply = envelope.reply_envelope();
             let state = actor.model.gate.resume();
-            let in_flight = actor.model.active_turns.len() as u64;
+            let in_flight = actor.model.live_turns();
             tracing::info!(in_flight, "turn admission resumed over introspection");
             Reply::pending(async move {
                 reply
@@ -217,7 +255,7 @@ impl IntrospectionActor {
         builder.act_on::<Drain>(|actor, envelope| {
             let reply = envelope.reply_envelope();
             let state = actor.model.gate.drain();
-            let in_flight = actor.model.active_turns.len() as u64;
+            let in_flight = actor.model.live_turns();
             tracing::info!(in_flight, "drain started over introspection");
             Reply::pending(async move {
                 reply
@@ -259,7 +297,7 @@ struct ModelSnapshot {
 impl ModelSnapshot {
     fn of(model: &IntrospectionActor) -> Self {
         Self {
-            active_turns: model.active_turns.len() as u64,
+            active_turns: model.live_turns(),
             in_flight_tool_calls: model.in_flight_tools.len() as u64,
             turns_started: model.turns_started,
             turns_refused: model.turns_refused,
@@ -409,5 +447,84 @@ mod tests {
         let one = TurnId::new();
         let two = TurnId::new();
         assert!(!scoped_tool_id(&two, "call_1").starts_with(&tool_scope(&one)));
+    }
+
+    #[test]
+    fn a_shared_turn_id_stays_live_until_every_start_has_finished() {
+        // Caller-supplied ids (`PromptBuilder::turn_id`) are not forced
+        // unique, so two concurrent turns can legitimately share one. The
+        // first finish must neither free the id nor sweep the other turn's
+        // tools, or a drain completes while that turn is still mid-tool.
+        let mut model = IntrospectionActor::default();
+        let id = TurnId::new();
+
+        model.note_turn_started(&id);
+        model.note_turn_started(&id);
+        model.in_flight_tools.insert(scoped_tool_id(&id, "call_1"));
+
+        model.note_turn_finished(&id);
+        assert_eq!(model.live_turns(), 1);
+        assert!(
+            model
+                .in_flight_tools
+                .contains(&scoped_tool_id(&id, "call_1")),
+            "one turn's finish must not sweep a still-live turn's tools"
+        );
+
+        model.note_turn_finished(&id);
+        assert_eq!(model.live_turns(), 0);
+        assert!(model.in_flight_tools.is_empty());
+    }
+
+    #[test]
+    fn a_stale_finish_never_erases_a_later_start() {
+        // The drop guard publishes its interrupted finish from a spawned
+        // task, so a cancel-and-retry reusing the announced id can see that
+        // finish land *after* the retry's start. Arrival order must not
+        // matter: two starts and one finish leave the retry live.
+        let mut model = IntrospectionActor::default();
+        let id = TurnId::new();
+
+        model.note_turn_started(&id); // the original turn
+        model.note_turn_started(&id); // the retry
+        model.note_turn_finished(&id); // the original's late interrupted finish
+        assert_eq!(model.live_turns(), 1, "the retry must still be counted");
+    }
+
+    #[test]
+    fn an_unmatched_finish_is_a_no_op() {
+        let mut model = IntrospectionActor::default();
+        let live = TurnId::new();
+        model.note_turn_started(&live);
+
+        model.note_turn_finished(&TurnId::new());
+        assert_eq!(model.live_turns(), 1);
+
+        model.note_turn_finished(&live);
+        model.note_turn_finished(&live); // the guard's double-fire window
+        assert_eq!(
+            model.live_turns(),
+            0,
+            "a duplicate finish must saturate at zero, not go negative"
+        );
+
+        model.note_turn_started(&live);
+        assert_eq!(
+            model.live_turns(),
+            1,
+            "a stale duplicate finish must not eat a later start"
+        );
+    }
+
+    #[test]
+    fn every_start_counts_toward_turns_started() {
+        let mut model = IntrospectionActor::default();
+        let id = TurnId::new();
+        model.note_turn_started(&id);
+        model.note_turn_started(&id);
+        assert_eq!(
+            model.turns_started, 2,
+            "a reused id is a second turn, not a duplicate broadcast"
+        );
     }
 }

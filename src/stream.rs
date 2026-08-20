@@ -28,7 +28,42 @@
 //! ```
 
 use crate::messages::{StopReason, Usage};
-use crate::types::CorrelationId;
+use crate::types::{CorrelationId, TurnId};
+
+/// Who a stream event belongs to: the turn, and the round inside it.
+///
+/// Handed to [`PromptBuilder::on_start`](crate::prompt::PromptBuilder::on_start)
+/// and [`on_end`](crate::prompt::PromptBuilder::on_end) so a caller driving a
+/// UI can bind what it renders to the operation that produced it, without
+/// having to invent a correlation scheme of its own.
+///
+/// The two IDs answer different questions and neither replaces the other:
+/// [`turn_id`](Self::turn_id) names the whole `collect()` call, and
+/// [`correlation_id`](Self::correlation_id) names the one provider round that
+/// is starting or ending — a turn that drives four rounds fires the callbacks
+/// four times under one turn id.
+///
+/// `#[non_exhaustive]`: a later addition here should cost a downstream
+/// callback nothing, since callbacks read fields rather than destructure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct StreamContext {
+    /// The turn this round belongs to.
+    pub turn_id: TurnId,
+    /// The round that is starting or ending.
+    pub correlation_id: CorrelationId,
+}
+
+impl StreamContext {
+    /// Pairs a turn with one of its rounds.
+    #[must_use]
+    pub fn new(turn_id: TurnId, correlation_id: CorrelationId) -> Self {
+        Self {
+            turn_id,
+            correlation_id,
+        }
+    }
+}
 
 /// Action to take after processing a stream event.
 ///
@@ -277,6 +312,17 @@ pub struct CollectedResponse {
     /// [`CompactionRecord::as_message`](crate::memory::CompactionRecord::as_message)
     /// so the stored conversation records that compaction happened.
     pub compactions: Vec<crate::memory::CompactionRecord>,
+    /// The turn that produced this response.
+    ///
+    /// The same id every [`TurnLifecycle`](crate::messages::TurnLifecycle)
+    /// event of the turn carried, so a caller holding the response can match
+    /// it against events it already saw — or against events that are still
+    /// arriving — without keeping a side table keyed on anything else.
+    ///
+    /// A response built by hand rather than by a turn (the constructors
+    /// below, and [`Default`]) gets a fresh id, so the field is never absent
+    /// and two unrelated responses never collide.
+    pub turn_id: TurnId,
 }
 
 impl CollectedResponse {
@@ -291,6 +337,7 @@ impl CollectedResponse {
             tool_calls: Vec::new(),
             plan: None,
             compactions: Vec::new(),
+            turn_id: TurnId::new(),
         }
     }
 
@@ -321,6 +368,16 @@ impl CollectedResponse {
         !self.compactions.is_empty()
     }
 
+    /// Attaches the turn that produced this response.
+    ///
+    /// Used by the prompt loop, which knows the real id; a response built any
+    /// other way keeps the fresh one its constructor minted.
+    #[must_use]
+    pub fn with_turn_id(mut self, turn_id: TurnId) -> Self {
+        self.turn_id = turn_id;
+        self
+    }
+
     /// Creates a new collected response with tool calls.
     #[must_use]
     pub fn with_tool_calls(
@@ -337,6 +394,7 @@ impl CollectedResponse {
             tool_calls,
             plan: None,
             compactions: Vec::new(),
+            turn_id: TurnId::new(),
         }
     }
 
@@ -375,6 +433,7 @@ impl Default for CollectedResponse {
             tool_calls: Vec::new(),
             plan: None,
             compactions: Vec::new(),
+            turn_id: TurnId::new(),
         }
     }
 }
@@ -496,6 +555,35 @@ mod tests {
             CollectedResponse::new("hi".to_string(), StopReason::EndTurn, 1).with_usage(usage);
 
         assert_eq!(response.usage, usage);
+    }
+
+    #[test]
+    fn collected_response_carries_the_turn_it_was_given() {
+        let turn_id = TurnId::new();
+
+        let response = CollectedResponse::new("hi".to_string(), StopReason::EndTurn, 1)
+            .with_turn_id(turn_id.clone());
+
+        assert_eq!(response.turn_id, turn_id);
+    }
+
+    #[test]
+    fn two_hand_built_responses_do_not_share_a_turn() {
+        let first = CollectedResponse::new("a".to_string(), StopReason::EndTurn, 1);
+        let second = CollectedResponse::new("b".to_string(), StopReason::EndTurn, 1);
+
+        assert_ne!(first.turn_id, second.turn_id);
+    }
+
+    #[test]
+    fn stream_context_pairs_a_turn_with_a_round() {
+        let turn_id = TurnId::new();
+        let correlation_id = CorrelationId::new();
+
+        let context = StreamContext::new(turn_id.clone(), correlation_id.clone());
+
+        assert_eq!(context.turn_id, turn_id);
+        assert_eq!(context.correlation_id, correlation_id);
     }
 
     #[test]

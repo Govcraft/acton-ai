@@ -870,7 +870,27 @@ mod tests {
 
         let first = plan_resume(Some(&record), &inputs(&tools)).unwrap();
         let second = plan_resume(Some(&record), &inputs(&tools)).unwrap();
-        assert_eq!(first, second);
+
+        // Everything the record holds replays identically. The one exception
+        // is `turn_id`: the record does not store one — the original turn's
+        // lifecycle concluded when it completed — so each replayed response
+        // mints a fresh id, which by design matches no lifecycle events.
+        let (
+            ResumePlan::Replay {
+                response: mut a,
+                structured_output: sa,
+            },
+            ResumePlan::Replay {
+                response: b,
+                structured_output: sb,
+            },
+        ) = (first, second)
+        else {
+            panic!("a completed record must plan a replay");
+        };
+        a.turn_id = b.turn_id.clone();
+        assert_eq!(a, b);
+        assert_eq!(sa, sb);
     }
 
     #[test]

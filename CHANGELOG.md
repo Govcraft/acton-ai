@@ -2,6 +2,201 @@
 
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## Unreleased
+
+### Added
+
+- **Tool-approval policy gate.** One choke point between "the model asked for
+  a tool" and "the tool ran", covering built-ins, `#[tool]` functions and MCP
+  tools uniformly. Rules — allowlist, denylist, per-turn invocation caps —
+  come from `ToolPolicy` or a `[tool_policy]` section; an async
+  `.on_tool_approval(..)` hook can approve, refuse with a reason, or rewrite
+  the arguments, which makes a human in the loop possible. Patterns are exact
+  names or a single trailing `*`, enough to name a whole MCP server. A refusal
+  is an outcome, not an error: the tool does not run, the reason goes back to
+  the model as that call's tool result, and the turn continues. Nothing is
+  configured by default and an unconfigured runtime behaves exactly as before.
+- **Tamper-evident audit trail.** Every tool invocation — allowed, refused, or
+  failed — is appended to a JSONL file as one BLAKE3 hash-chained entry
+  carrying the timestamp, correlation / conversation / turn IDs, tool name,
+  redacted arguments, a bounded result summary, the approval decision and who
+  made it, and the duration. One actor owns the chain and is the only writer.
+  Secrets are redacted by key before an entry ever leaves the prompt loop, and
+  the result summary is redacted too, so a tool that echoes its input cannot
+  launder a secret past the argument redaction. A restarted process resumes
+  the chain it already has, and refuses to start on a file that does not
+  verify. An armed trail exists on disk from launch — empty, verifying as
+  the genesis head — so a missing file always means somebody removed it.
+  Configured with `[audit]` or `.audit_to(..)`; off by default.
+- **`acton-ai audit verify`.** Walks the chain and reports the first broken
+  link, with `--file` and the global `--json`. Exit code 3 when the chain does
+  not hold, distinct from the generic runtime error, so a monitoring check can
+  tell "the evidence has been altered" from "the check could not run".
+- **`ConversationId` on the wire.** `Conversation::id()` names a conversation
+  and every audit entry its turns produce carries it, so the tool calls of one
+  exchange can be grouped out of a shared trail.
+- **Embedder access to the sandbox execution path.** A downstream crate
+  wrapping builtin execution — an approval flow, a protocol adapter — could
+  not keep the sandbox while doing it: the factory getter and the executor
+  adapter were crate-private. `SandboxedExecution` is now the public handle
+  over the configured factory, returned by `ActonAI::sandboxed_execution()`,
+  and it owns the one-shot create → execute → destroy lifecycle so nobody
+  re-derives it. `ActonAI::builtin_executor(name)` returns the named
+  builtin's `BuiltinExecutor` with the sandbox-or-in-process decision
+  already made; it is the very value `.use_builtins()` registers, so what an
+  embedder wraps is literally what the prompt loop runs. Because the process
+  sandbox re-execs the current binary, an embedder's `main` installs
+  `runner::run_if_sandbox_child()` first thing — the same guard `acton-ai`'s
+  own entry point now uses — and `runner::supports(name)` says which tools
+  can cross the process boundary at all.
+- **Caller-supplied turn identity.** `PromptBuilder::turn_id(..)` lets an
+  embedder that already answered a session (an ACP daemon, say) name the turn
+  before the loop starts, and `CollectedResponse::turn_id` reports the turn's
+  ID back either way — supplied or minted — so no claim/bind side table is
+  needed to attribute a response.
+- **`StreamContext` on the stream callbacks.** `.on_start(..)` and
+  `.on_end(..)` now receive a `&StreamContext` carrying the turn ID and the
+  round's correlation ID, so a streaming consumer can attribute every round
+  to its turn without out-of-band bookkeeping. Exported from the prelude.
+- **Enriched tool lifecycle events.** `TurnLifecycle::ToolStarted` carries the
+  arguments the model proposed, verbatim; `ToolFinished` carries `success` and
+  a bounded `summary`; `LLMStreamToolResult` carries the `turn_id`. The enum
+  and its variants are now `#[non_exhaustive]`.
+- **The tool bracket is total.** `ToolStarted` is broadcast *before* the
+  policy gate deliberates, so every `ToolFinished` and `LLMStreamToolResult`
+  — including a call the policy refused — is preceded by exactly one
+  `ToolStarted` with the same `tool_call_id`, and a human approval hook
+  deliberates on a call the client has already been shown.
+- **`tool_call_id` end to end.** `policy::ToolInvocation` and every audit
+  entry now carry the provider's own ID for the call — the same ID the
+  lifecycle events broadcast — so an approval prompt and a trail read after
+  the fact both join cleanly against a session watched live.
+- **`fips` cargo feature.** Routes every TLS connection the framework opens
+  through the FIPS 140-3 validated AWS-LC module instead of *ring*, installed
+  as the process-wide rustls default before anything can connect. Off by
+  default and not gated in CI: it builds AWS-LC from source and needs CMake
+  and Go, and it must be a release build because the module's power-on
+  integrity self-test does not survive a debug build's relocations.
+- **Runtime-wide custom tool registration.** `ActonAIBuilder::with_tool`
+  (definition + async closure), `with_tool_executor` (a `ToolExecutorTrait`
+  object; its `validate_args` runs before every execution), and `add_tool`
+  (a `Tool` value, the shape `#[tool]` generates) register a tool once and
+  inject it into every prompt and every conversation turn, alongside the
+  built-ins, skill tools, and MCP tools. Custom tools execute on the same
+  path as the built-ins — behind the tool-approval policy gate and onto the
+  audit trail when those are configured. Names are validated at `launch()`:
+  a custom tool that collides with an enabled built-in, a skill tool, an MCP
+  tool, or another custom tool fails the launch instead of silently
+  shadowing anything. Downstream embedders (an agent daemon installing an
+  `apply_patch` tool, say) previously had to re-register such tools on every
+  `PromptBuilder` — and could not reach `Conversation::send` at all.
+- **Per-conversation tools.** `ConversationBuilder::with_tool` /
+  `with_tool_executor` / `add_tool` register a tool for every turn one
+  conversation runs, closing the gap where `Conversation` rebuilt its prompt
+  internally and per-prompt registration could never reach it. Collisions —
+  with an injected runtime tool, another conversation tool, or the reserved
+  `exit_conversation` name — are refused at registration time with a
+  configuration error, never discovered mid-conversation.
+
+- **An interrupted turn now finishes its lifecycle.** Dropping the
+  `collect()` / `extract()` future mid-turn — a user pressing cancel, a
+  `select!` taking the other arm — used to leave its `TurnStarted` broadcast
+  unmatched forever, so the in-flight count never returned to zero and a
+  drain waiting on it never completed. A drop guard in the prompt loop now
+  publishes the balancing `TurnFinished` from cancellation, carrying the new
+  `TurnOutcome::Interrupted` so observers can tell a cancelled turn from a
+  completed or failed one. `TurnLifecycle::TurnFinished` now carries a
+  `TurnOutcome` (`completed` / `failed` / `interrupted`).
+- **`ToolPolicy::classify`.** A pure, public query answering what the gate
+  would do with a tool call — `AutoAllow`, `NeedsApproval`, or `Deny` with
+  the refusing rule and reason — so an embedder can render "this tool will
+  ask" UI without reimplementing the allowlist/denylist/cap rules. It is not
+  a parallel implementation: the gate's own `decide` is built on the same
+  classification, so the two cannot drift.
+- **`PromptBuilder` (and its turn future) is `Send + Sync`.** acton-reactive
+  handler futures must be `Send + Sync`, so an embedder driving turns from
+  inside its own actors previously had to spawn a detached task per turn.
+  Callback setters are unchanged (`FnMut + Send` still suffices); the
+  callbacks are stored pre-wrapped and the loop's `dyn Future + Send` awaits
+  go through `sync_wrapper::SyncFuture`. `tests/prompt_builder_sync.rs`
+  makes a regression a compile error.
+
+### Fixed
+
+- Launch-time custom tool validation now reserves the prompt loop's own tool
+  names. A runtime-wide custom tool named `structured_output` or
+  `exit_conversation` used to launch fine and misbehave later — every
+  `.extract::<T>()` failed at call time, and a conversation's exit tool was
+  silently shadowed so a chat could never end through it. Both names now fail
+  `launch()` like any other collision, and they are published as
+  `extract::STRUCTURED_OUTPUT_TOOL` and `conversation::EXIT_CONVERSATION_TOOL`
+  so an embedder can avoid them without hardcoding strings.
+- `TurnLifecycle::ToolStarted` no longer broadcasts secret-bearing arguments
+  past the audit redactor. Trail entries were redacted at the boundary, but
+  the lifecycle broadcast carried the model's arguments raw into every
+  subscriber's mailbox — an embedder forwarding lifecycle events to a UI or a
+  log received exactly what the redaction config promised to withhold. With a
+  trail configured, `ToolStarted` arguments now pass through the same
+  redactor; without one they are unchanged.
+- A turn future dropped from a thread outside any Tokio context now still
+  publishes its balancing `TurnFinished`. The drop guard used to look up the
+  ambient runtime at drop time and silently give up without one, so an
+  embedder storing the `Send + Sync` `collect()` future in a session table
+  and dropping it from a UI thread, C-FFI callback, or watchdog thread left
+  the turn counted in-flight forever and wedged `acton-ai drain --wait`. The
+  guard now captures the runtime handle at construction and spawns the
+  broadcast on it, falling back to the ambient handle as before.
+- Reused caller-supplied turn ids no longer corrupt the in-flight accounting.
+  The introspection actor kept live turns in a set, so two concurrent turns
+  sharing a `PromptBuilder::turn_id` — or a cancel-and-retry whose
+  interrupted finish landed after the retry started — let one finish erase
+  the other's live turn and sweep its in-flight tools, and a drain could
+  report drained mid-turn. Starts and finishes are now counted per id, an
+  unmatched finish is a no-op, and the tool sweep runs only when an id goes
+  fully dead.
+- A dropped sandbox execution no longer leaks the child process. Cancelling
+  the execute future mid-flight — a caller-side timeout, an aborted turn —
+  left the re-exec'd child running detached until its own resource limits
+  bit: the destroy step lives after the await, and a dropped future never
+  reaches it. The child is now killed when the future is dropped.
+  Grandchildren in the child's process group can still outlive it on this
+  path, exactly as on the non-unix timeout path.
+
+### Changed
+
+- **The stream callbacks take an identity.** `.on_start(..)` now receives
+  `&StreamContext` where it previously took no arguments, and `.on_end(..)`
+  receives `(&StreamContext, StopReason)` where it previously took only the
+  stop reason. **Existing callers must add the parameter**, typically
+  `.on_start(|_ctx| ..)` and `.on_end(|_ctx, reason| ..)`. `.on_token(..)` is
+  deliberately unchanged and still takes `&str`: it fires per token, where an
+  identity that is constant for the whole round would be repeated noise.
+- `TurnLifecycle` and its struct variants are now `#[non_exhaustive]`, so a
+  downstream `match` needs a wildcard arm. These are observation events and
+  later additions should not be breaking changes.
+- TLS backend selection moved behind features. The ordinary *ring* stack is
+  now the `tls-ring` feature and is part of the default set, so a default
+  build is unchanged. **A `--no-default-features` build that relied on TLS
+  must now name `tls-ring` (or `fips`) explicitly**, where it previously got
+  the *ring* stack implicitly.
+- `TurnLifecycle::TurnFinished` gained an `outcome` field. A subscriber
+  matching the variant by its full field list must add `outcome` (or `..`);
+  a subscriber only balancing starts against finishes can ignore it.
+
+### Removed
+
+- **The orphaned `ToolRegistry` path.** `ToolRegistry`, `RegisterTool`,
+  `UnregisterTool`, `ListTools`, `ToolListResponse`, `RegisteredTool`,
+  `InitToolRegistry`, `RegistryMetrics`, `RegistryMetricsSnapshot`, the
+  one-shot `ToolExecutor` actor (`Execute`, `InitExecutor`), and the
+  `ExecuteTool` / `ToolResponse` messages are gone. Nothing in the facade,
+  the prompt loop, or the agents ever routed through them — the registry was
+  a dead end that *looked* like the way to register a global tool while the
+  real path did not exist. It is replaced, not merely deleted:
+  `ActonAIBuilder::with_tool` and `ConversationBuilder::with_tool` (above)
+  are the supported global and per-conversation registration paths, and both
+  actually reach every prompt. Per-agent tool actors (`ToolActor`,
+  `ExecuteToolDirect`, `ToolActorResponse`) are unchanged.
 
 ## 0.32.0 - 2026-08-19
 

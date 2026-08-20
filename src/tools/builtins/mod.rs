@@ -82,6 +82,11 @@ mod write_file;
 mod skill_activate;
 mod skill_list;
 
+pub mod execution;
+
+// Re-export the execution handle that pairs a builtin with its sandbox route.
+pub use execution::BuiltinExecutor;
+
 // Re-export tool implementations
 pub use bash::{BashTool, BashToolActor};
 pub use calculate::{CalculateTool, CalculateToolActor};
