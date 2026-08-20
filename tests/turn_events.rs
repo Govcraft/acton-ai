@@ -252,15 +252,21 @@ fn bracket_counts(events: &[Seen]) -> Vec<(String, usize, usize, usize)> {
         .map(|id| {
             let starts = events
                 .iter()
-                .filter(|e| matches!(e, Seen::ToolStarted { tool_call_id, .. } if *tool_call_id == id))
+                .filter(
+                    |e| matches!(e, Seen::ToolStarted { tool_call_id, .. } if *tool_call_id == id),
+                )
                 .count();
             let finishes = events
                 .iter()
-                .filter(|e| matches!(e, Seen::ToolFinished { tool_call_id, .. } if *tool_call_id == id))
+                .filter(
+                    |e| matches!(e, Seen::ToolFinished { tool_call_id, .. } if *tool_call_id == id),
+                )
                 .count();
             let results = events
                 .iter()
-                .filter(|e| matches!(e, Seen::ToolResult { tool_call_id, .. } if *tool_call_id == id))
+                .filter(
+                    |e| matches!(e, Seen::ToolResult { tool_call_id, .. } if *tool_call_id == id),
+                )
                 .count();
             (id, starts, finishes, results)
         })
@@ -422,8 +428,11 @@ async fn every_tool_result_was_preceded_by_exactly_one_start() {
     // allowed and refused paths are exercised inside a single turn and any
     // divergence between them shows up as an asymmetry here.
     let server = MockServer::start(vec![
-        Round::tool_call("call_ok", "echo", json!({"value": "fine"}))
-            .with_tool_call("call_no", "bash", json!({"command": "rm -rf /"})),
+        Round::tool_call("call_ok", "echo", json!({"value": "fine"})).with_tool_call(
+            "call_no",
+            "bash",
+            json!({"command": "rm -rf /"}),
+        ),
         Round::text("done"),
     ])
     .await;
@@ -453,17 +462,20 @@ async fn every_tool_result_was_preceded_by_exactly_one_start() {
     // Ordering, not just counts: a start that arrives after its own result is
     // useless to a consumer that must announce before it reports.
     for (id, ..) in &counts {
-        let start = position_of(&events, |e| {
-            matches!(e, Seen::ToolStarted { tool_call_id, .. } if tool_call_id == id)
-        })
+        let start = position_of(
+            &events,
+            |e| matches!(e, Seen::ToolStarted { tool_call_id, .. } if tool_call_id == id),
+        )
         .expect("every call is started");
-        let finish = position_of(&events, |e| {
-            matches!(e, Seen::ToolFinished { tool_call_id, .. } if tool_call_id == id)
-        })
+        let finish = position_of(
+            &events,
+            |e| matches!(e, Seen::ToolFinished { tool_call_id, .. } if tool_call_id == id),
+        )
         .expect("every call is finished");
-        let result = position_of(&events, |e| {
-            matches!(e, Seen::ToolResult { tool_call_id, .. } if tool_call_id == id)
-        })
+        let result = position_of(
+            &events,
+            |e| matches!(e, Seen::ToolResult { tool_call_id, .. } if tool_call_id == id),
+        )
         .expect("every call reports a result");
 
         assert!(start < finish, "{id}: start must precede finish");
@@ -559,7 +571,10 @@ async fn a_finished_tool_reports_its_outcome() {
         })
         .expect("a tool call must be closed");
 
-    assert!(success, "a tool that returned Ok must be reported as success");
+    assert!(
+        success,
+        "a tool that returned Ok must be reported as success"
+    );
     assert!(
         !summary.is_empty(),
         "a successful call must still preview its result"
@@ -731,4 +746,95 @@ async fn the_start_is_published_before_the_gate_deliberates() {
         vec![("call_1".to_string(), 1, 1, 1)],
         "announcing before the gate must not duplicate the announcement"
     );
+}
+
+// =============================================================================
+// 9. The audit trail names the same call the events did
+// =============================================================================
+
+#[tokio::test]
+async fn the_audit_entry_carries_the_call_id_the_events_carried() {
+    // The bracket tests prove a live watcher sees a coherent story; the audit
+    // tests elsewhere prove the trail records *a* call id. What neither pins
+    // is the join: an investigator reading the trail after the fact must be
+    // able to line its entries up with what a session watcher saw live, and
+    // that join is `tool_call_id` plus `turn_id`. So this test runs both
+    // observers at once — the recorder on the broker and the sealed trail on
+    // disk — and asserts they name the same calls in the same turn, on an
+    // executed call and a refused one alike.
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+
+    let server = MockServer::start(vec![
+        Round::tool_call("call_deny", "bash", json!({"value": "rm -rf /"})).with_tool_call(
+            "call_ok",
+            "echo",
+            json!({"value": "hi"}),
+        ),
+        Round::text("understood"),
+    ])
+    .await;
+    let mut ai = ActonAI::builder()
+        .app_name("turn-events-audit")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .tool_policy(ToolPolicy::new().deny(["bash"]))
+        .audit_to(&path)
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+    let recorder = spawn_recorder(ai.runtime_mut()).await;
+
+    let turn_id = TurnId::new();
+    ai.prompt("clean up")
+        .turn_id(turn_id.clone())
+        .with_tool(tool_definition("bash"), |args| async move { Ok(args) })
+        .with_tool(tool_definition("echo"), |args| async move { Ok(args) })
+        .collect()
+        .await
+        .expect("a denial must not fail the turn");
+
+    // The audit-side barrier: the head cannot answer before both entries are
+    // sealed and written.
+    let head = ai.audit_head().await.expect("the trail must report a head");
+    assert_eq!(head.entries, 2, "one denied and one executed call");
+
+    let events = recorded(&ai, &recorder).await;
+    let contents = std::fs::read_to_string(&path).expect("the trail must exist");
+    let entries = acton_ai::audit::parse_entries(&contents).expect("the trail must parse");
+
+    // Each entry names the call the live events named for that tool, in the
+    // turn the caller supplied.
+    for entry in &entries {
+        let event_call_id = events
+            .iter()
+            .find_map(|event| match event {
+                Seen::ToolStarted {
+                    tool_call_id,
+                    tool_name,
+                    ..
+                } if *tool_name == entry.tool_name => Some(tool_call_id.clone()),
+                _ => None,
+            })
+            .expect("every audited tool was announced");
+        assert_eq!(
+            entry.tool_call_id, event_call_id,
+            "the trail and the events must name the same call"
+        );
+        assert_eq!(
+            entry.turn_id, turn_id,
+            "the trail records the caller's turn id"
+        );
+    }
+
+    let denied = entries
+        .iter()
+        .find(|entry| entry.tool_name == "bash")
+        .expect("the denied call is recorded");
+    assert_eq!(denied.tool_call_id, "call_deny");
+    assert!(matches!(denied.outcome, AuditOutcome::Denied { .. }));
+
+    ai.shutdown().await.expect("shutdown");
 }

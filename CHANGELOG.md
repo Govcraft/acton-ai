@@ -34,6 +34,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ConversationId` on the wire.** `Conversation::id()` names a conversation
   and every audit entry its turns produce carries it, so the tool calls of one
   exchange can be grouped out of a shared trail.
+- **Caller-supplied turn identity.** `PromptBuilder::turn_id(..)` lets an
+  embedder that already answered a session (an ACP daemon, say) name the turn
+  before the loop starts, and `CollectedResponse::turn_id` reports the turn's
+  ID back either way — supplied or minted — so no claim/bind side table is
+  needed to attribute a response.
+- **`StreamContext` on the stream callbacks.** `.on_start(..)` and
+  `.on_end(..)` now receive a `&StreamContext` carrying the turn ID and the
+  round's correlation ID, so a streaming consumer can attribute every round
+  to its turn without out-of-band bookkeeping. Exported from the prelude.
+- **Enriched tool lifecycle events.** `TurnLifecycle::ToolStarted` carries the
+  arguments the model proposed, verbatim; `ToolFinished` carries `success` and
+  a bounded `summary`; `LLMStreamToolResult` carries the `turn_id`. The enum
+  and its variants are now `#[non_exhaustive]`.
+- **The tool bracket is total.** `ToolStarted` is broadcast *before* the
+  policy gate deliberates, so every `ToolFinished` and `LLMStreamToolResult`
+  — including a call the policy refused — is preceded by exactly one
+  `ToolStarted` with the same `tool_call_id`, and a human approval hook
+  deliberates on a call the client has already been shown.
+- **`tool_call_id` end to end.** `policy::ToolInvocation` and every audit
+  entry now carry the provider's own ID for the call — the same ID the
+  lifecycle events broadcast — so an approval prompt and a trail read after
+  the fact both join cleanly against a session watched live.
 - **`fips` cargo feature.** Routes every TLS connection the framework opens
   through the FIPS 140-3 validated AWS-LC module instead of *ring*, installed
   as the process-wide rustls default before anything can connect. Off by
