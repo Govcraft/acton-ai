@@ -145,6 +145,19 @@ async fn the_facade_reports_the_builtin_sandbox_routing() {
         "an unconfigured name yields no executor"
     );
 
+    // A governed deployment has to report what isolation is in force, so the
+    // runtime states its own terms rather than leaving an operator to infer
+    // them from the config file they hope was loaded.
+    let enforced = ai
+        .sandbox_config()
+        .expect("a configured sandbox says what it is enforcing");
+    assert_eq!(
+        enforced.hardening,
+        HardeningMode::Off,
+        "the hardening reported is the one configured"
+    );
+    assert_eq!(enforced.timeout, Duration::from_secs(15));
+
     ai.shutdown().await.expect("clean shutdown");
 }
 
@@ -161,6 +174,10 @@ async fn without_a_sandbox_the_handle_is_absent_and_builtins_run_in_process() {
     assert!(
         ai.sandboxed_execution().is_none(),
         "no sandbox was configured, so no handle exists"
+    );
+    assert!(
+        ai.sandbox_config().is_none(),
+        "and nothing is claimed about isolation that is not there"
     );
 
     let bash = ai
@@ -249,4 +266,57 @@ async fn a_tool_the_runner_does_not_support_fails_inside_the_child() {
         error.to_string().contains("read_file"),
         "the error should name the unknown tool, got: {error}"
     );
+}
+
+// =============================================================================
+// 4. What a deployment actually writes: a TOML `[sandbox]` section
+// =============================================================================
+
+#[tokio::test]
+async fn a_toml_sandbox_section_reaches_the_running_runtime() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("acton-ai.toml");
+    std::fs::write(
+        &path,
+        r#"
+[providers.unused]
+type = "ollama"
+model = "unused-model"
+base_url = "http://127.0.0.1:9"
+
+[sandbox]
+hardening = "enforce"
+
+[sandbox.limits]
+max_execution_ms = 9000
+max_memory_mb = 64
+"#,
+    )
+    .expect("writing the config must succeed");
+
+    let ai = ActonAI::builder()
+        .app_name("embedder-sandbox-toml")
+        .from_config_file(&path)
+        .expect("the config must load")
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+
+    assert!(
+        ai.sandboxed_execution().is_some(),
+        "a `[sandbox]` section is how a deployment turns isolation on"
+    );
+
+    let enforced = ai
+        .sandbox_config()
+        .expect("the section resolves to a configuration in force");
+    assert_eq!(
+        enforced.hardening,
+        HardeningMode::Enforce,
+        "an operator asking for enforce gets enforce, not the default"
+    );
+    assert_eq!(enforced.timeout, Duration::from_millis(9000));
+    assert_eq!(enforced.memory_limit, Some(64 * 1024 * 1024));
+
+    ai.shutdown().await.expect("clean shutdown");
 }

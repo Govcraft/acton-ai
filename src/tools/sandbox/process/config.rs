@@ -45,7 +45,12 @@ pub enum HardeningMode {
     Off,
     /// Apply hardening, but tolerate failures (e.g. kernels without
     /// landlock support) by logging a warning and continuing.
+    ///
+    /// `rename_all` spells this `besteffort`, which nobody writes by hand;
+    /// the aliases accept the two spellings an operator actually reaches for
+    /// rather than failing a deployment over a hyphen.
     #[default]
+    #[serde(alias = "best-effort", alias = "best_effort")]
     BestEffort,
     /// Apply hardening, and abort child startup if any step fails.
     Enforce,

@@ -160,6 +160,13 @@ pub(crate) struct ActonAIInner {
     /// still execute in-process (matching pre-ProcessSandbox behavior) but
     /// with no OS-level isolation.
     pub(crate) sandbox_factory: Option<Arc<dyn SandboxFactory>>,
+    /// The configuration behind [`ActonAIInner::sandbox_factory`].
+    ///
+    /// Kept beside the factory so a running system can *say* what isolation
+    /// it is enforcing. An operator who cannot tell whether hardening is on
+    /// has to take it on faith, and a sandbox taken on faith is not a
+    /// control.
+    pub(crate) sandbox_config: Option<ProcessSandboxConfig>,
     /// Default `max_tool_rounds` seeded into every new `PromptBuilder`.
     ///
     /// Resolved at launch from the cascade:
@@ -908,6 +915,23 @@ impl ActonAI {
             .sandbox_factory
             .as_ref()
             .map(|factory| crate::tools::sandbox::SandboxedExecution::new(Arc::clone(factory)))
+    }
+
+    /// Returns the sandbox configuration this runtime is enforcing.
+    ///
+    /// `Some` exactly when [`sandboxed_execution`](Self::sandboxed_execution)
+    /// is `Some`, carrying the limits and the
+    /// [`HardeningMode`](crate::tools::sandbox::HardeningMode) actually in
+    /// force after the builder, the TOML `[sandbox]` section, and the
+    /// defaults have all been resolved.
+    ///
+    /// This is for saying so out loud: a governed deployment is usually
+    /// required to report whether isolation and OS hardening are active, and
+    /// an operator who has to infer that from a config file is reading an
+    /// intention rather than a fact.
+    #[must_use]
+    pub fn sandbox_config(&self) -> Option<&ProcessSandboxConfig> {
+        self.inner.sandbox_config.as_ref()
     }
 
     /// Returns the named builtin's execution path, sandbox routing included.
@@ -2910,6 +2934,10 @@ impl ActonAIBuilder {
         // sandboxed tool executors at prompt construction time. Prior to
         // this refactor the factory was constructed and dropped, which
         // silently bypassed sandboxing for all facade callers.
+        let sandbox_config = match self.sandbox_mode {
+            SandboxMode::None => None,
+            SandboxMode::Process(ref cfg) => Some(cfg.clone()),
+        };
         let sandbox_factory: Option<Arc<dyn SandboxFactory>> = match self.sandbox_mode {
             SandboxMode::None => None,
             SandboxMode::Process(cfg) => {
@@ -3115,6 +3143,7 @@ impl ActonAIBuilder {
                 auto_builtins: self.auto_builtins,
                 skills,
                 sandbox_factory,
+                sandbox_config,
                 default_max_tool_rounds,
                 context_window,
                 compaction,

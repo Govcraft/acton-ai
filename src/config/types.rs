@@ -1567,8 +1567,9 @@ impl ActonAIDefaults {
 /// default, so existing TOMLs load cleanly.
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct SandboxFileConfig {
-    /// OS-hardening policy. Accepts `"off"`, `"besteffort"`, or `"enforce"`.
-    /// Defaults to [`HardeningMode::BestEffort`].
+    /// OS-hardening policy. Accepts `"off"`, `"besteffort"` (or the friendlier
+    /// `"best-effort"` / `"best_effort"`), or `"enforce"`. Defaults to
+    /// [`HardeningMode::BestEffort`].
     #[serde(default)]
     pub hardening: Option<HardeningMode>,
 
