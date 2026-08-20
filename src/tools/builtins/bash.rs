@@ -327,6 +327,9 @@ mod tests {
     use super::*;
     use tempfile::TempDir;
 
+    // The spawning tests need a real POSIX bash on PATH, which Windows
+    // does not guarantee (System32 carries a WSL stub named bash.exe).
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_simple_command() {
         let tool = BashTool::new();
@@ -342,6 +345,7 @@ mod tests {
         assert!(result["stdout"].as_str().unwrap().contains("hello world"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_with_stderr() {
         let tool = BashTool::new();
@@ -356,6 +360,7 @@ mod tests {
         assert!(result["stderr"].as_str().unwrap().contains("error"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_exit_code() {
         let tool = BashTool::new();
@@ -370,6 +375,7 @@ mod tests {
         assert_eq!(result["exit_code"], 42);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_with_cwd() {
         let dir = TempDir::new().unwrap();
@@ -389,6 +395,7 @@ mod tests {
         assert!(stdout.contains(dir.path().file_name().unwrap().to_str().unwrap()));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_timeout() {
         let tool = BashTool::with_timeouts(1, 5); // 1 second timeout
@@ -403,6 +410,7 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("timed out"));
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_invalid_cwd() {
         let tool = BashTool::new();

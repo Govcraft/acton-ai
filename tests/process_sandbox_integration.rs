@@ -9,6 +9,8 @@
 //!   `ACTON_AI_SANDBOX_RUNNER=1` and routes into the runner instead of the
 //!   regular CLI).
 
+#![cfg(unix)] // every case drives a POSIX bash through the sandbox child
+
 use std::path::PathBuf;
 use std::time::Duration;
 

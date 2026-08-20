@@ -105,4 +105,6 @@ jobs:
           tool: cargo-nextest
 
       - name: Run tests (nextest)
-        run: cargo nextest run --target ${{ matrix.target }}
+        # --no-fail-fast: a red lane should report every failure it has in
+        # one run, not one per push.
+        run: cargo nextest run --no-fail-fast --target ${{ matrix.target }}
