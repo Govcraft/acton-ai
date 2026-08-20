@@ -90,6 +90,7 @@ fn interrupted_record(
         stop_reason: None,
         structured_output: None,
         pending_round: Some(pending),
+        resume_attempts: 0,
     }
 }
 
@@ -330,6 +331,65 @@ async fn the_abandon_policy_records_the_outcome_without_running_anything() {
         .await
         .expect_err("an abandoned turn must not resume");
     assert!(error.to_string().contains("abandoned"), "{error}");
+
+    // The refusal changed nothing: the record is still Abandoned, not
+    // downgraded to Failed by the failing loop's mark on its way out. A
+    // downgrade would put the turn back in interrupted_turns(), reopening a
+    // record the operator's policy had closed.
+    let still_abandoned = list_by_status(&store, CheckpointStatus::Abandoned).await;
+    assert_eq!(still_abandoned.len(), 1);
+    assert_eq!(still_abandoned[0].id, interrupted_id);
+    let waiting = ai.interrupted_turns().await.expect("the store must answer");
+    assert!(
+        waiting.is_empty(),
+        "a refused resume must not reopen an abandoned record"
+    );
+}
+
+#[tokio::test]
+async fn the_sweep_abandons_a_turn_that_is_out_of_attempts() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let db_path = dir.path().join("checkpoints.db");
+    let db_path = db_path.to_str().expect("a utf-8 path");
+
+    let server = MockServer::start(vec![]).await;
+    let ai = launch_with_checkpoints(
+        &server,
+        "sweep-ceiling",
+        db_path,
+        ResumePolicy::ResumeOnRequest,
+    )
+    .await;
+    let store = ai.checkpoint_store().expect("checkpointing is configured");
+
+    // A turn that has already failed as many times as the default ceiling
+    // grants.
+    let mut record = interrupted_record(
+        PendingRound {
+            assistant_text: "noting".to_string(),
+            calls: vec![pending_call("call_1", "first", PendingCallState::Pending)],
+        },
+        vec![],
+    );
+    record.status = CheckpointStatus::Failed;
+    record.resume_attempts = CheckpointConfig::DEFAULT_MAX_RESUME_ATTEMPTS;
+    let id = record.id.clone();
+    save_record(&store, record).await;
+
+    let resumed = ai.resume_interrupted().await.expect("the sweep must run");
+
+    // Nothing resumed, nothing dispatched, nothing paid for.
+    assert!(resumed.is_empty(), "an exhausted turn must not resume");
+    assert_eq!(server.request_count(), 0);
+
+    // The turn has a recorded outcome instead of another attempt.
+    let abandoned = list_by_status(&store, CheckpointStatus::Abandoned).await;
+    assert_eq!(abandoned.len(), 1);
+    assert_eq!(abandoned[0].id, id);
+
+    // And it will never be offered up again.
+    let waiting = ai.interrupted_turns().await.expect("the store must answer");
+    assert!(waiting.is_empty(), "an abandoned turn is settled");
 }
 
 /// Writes one in-progress checkpoint into `db_path` and shuts down, the way a

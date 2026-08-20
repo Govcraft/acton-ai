@@ -240,6 +240,9 @@ pub(crate) struct CheckpointRuntime {
     /// What launch did — and [`ActonAI::resume_interrupted`] does — about
     /// interrupted turns.
     pub(crate) policy: crate::checkpoint::ResumePolicy,
+    /// Failed attempts an unattended sweep grants a turn before abandoning
+    /// it instead of resuming it again.
+    pub(crate) max_resume_attempts: u32,
 }
 
 /// The introspection socket a launched runtime owns.
@@ -630,7 +633,10 @@ impl ActonAI {
     /// Lists the turns a previous process left unfinished.
     ///
     /// In-progress and failed records, newest first. Abandoned and completed
-    /// turns are not here: neither has work left to do.
+    /// turns are not here: neither has work left to do. Neither are turns
+    /// running in **this** process right now — a record whose ID a live
+    /// prompt loop has claimed is in progress, not interrupted, and resuming
+    /// it would give one checkpoint two concurrent owners.
     ///
     /// # Errors
     ///
@@ -652,6 +658,23 @@ impl ActonAI {
             )
             .await?,
         );
+
+        // Turns live in this process are filtered out, not offered up for a
+        // second owner. The claim registry is the same actor the listing just
+        // came from, and even a listing that races a claim is safe: the
+        // resumed builder claims before it plans, so the loser of the race is
+        // refused rather than double-executed.
+        let claims: crate::memory::CheckpointClaims = checkpoint
+            .store
+            .ask(crate::memory::ListCheckpointClaims)
+            .await
+            .map_err(|e| {
+                ActonAIError::checkpoint_without_id(format!(
+                    "the store did not answer the claim listing: {e}"
+                ))
+            })?;
+        let claimed: std::collections::HashSet<_> = claims.ids.into_iter().collect();
+        records.retain(|record| !claimed.contains(&record.id));
         Ok(records)
     }
 
@@ -692,6 +715,13 @@ impl ActonAI {
     /// A turn that fails to resume is logged and marked failed rather than
     /// aborting the rest.
     ///
+    /// The sweep is bounded: a `Failed` record whose counted attempts have
+    /// reached [`CheckpointConfig::max_resume_attempts`](crate::checkpoint::CheckpointConfig::max_resume_attempts)
+    /// is marked `Abandoned` instead of resumed, so a turn that fails the
+    /// same way on every process start is not re-dispatched — and re-paid
+    /// for — on every restart forever. A deliberate per-turn
+    /// [`resume_turn`](ActonAI::resume_turn) is never subject to the ceiling.
+    ///
     /// # Errors
     ///
     /// Returns a configuration error when checkpointing is not configured,
@@ -699,9 +729,24 @@ impl ActonAI {
     pub async fn resume_interrupted(
         &self,
     ) -> Result<Vec<crate::types::CheckpointId>, ActonAIError> {
+        let max_attempts = self.checkpoint_runtime()?.max_resume_attempts;
         let mut resumed = Vec::new();
         for record in self.interrupted_turns().await? {
             let id = record.id.clone();
+            if record.status == crate::checkpoint::CheckpointStatus::Failed
+                && record.resume_attempts >= max_attempts
+            {
+                // Out of attempts: the sweep closes the record rather than
+                // paying for the same failure again. The outcome is recorded,
+                // so an operator can still list what was given up on.
+                self.abandon_checkpoint(record).await?;
+                tracing::warn!(
+                    checkpoint = %id,
+                    attempts = max_attempts,
+                    "abandoned a turn that failed on every granted attempt"
+                );
+                continue;
+            }
             match self.resume_turn(record)?.collect().await {
                 Ok(_) => resumed.push(id),
                 Err(error) => {
@@ -712,6 +757,29 @@ impl ActonAI {
             }
         }
         Ok(resumed)
+    }
+
+    /// Writes a record back as abandoned, closing it to further resumes.
+    async fn abandon_checkpoint(
+        &self,
+        record: crate::checkpoint::CheckpointRecord,
+    ) -> Result<(), ActonAIError> {
+        let store = &self.checkpoint_runtime()?.store;
+        let id = record.id.clone();
+        let saved: crate::memory::CheckpointSaved = store
+            .ask(crate::memory::SaveCheckpoint {
+                record: crate::checkpoint::abandon(record),
+            })
+            .await
+            .map_err(|e| {
+                ActonAIError::checkpoint(
+                    id.clone(),
+                    format!("the store did not answer the abandon write: {e}"),
+                )
+            })?;
+        saved.result.map_err(|e| {
+            ActonAIError::checkpoint(id, format!("could not record the abandoned outcome: {e}"))
+        })
     }
 
     /// The checkpoint runtime, or the error telling the caller how to get one.
@@ -3180,6 +3248,7 @@ async fn launch_checkpoints(
     Ok(CheckpointRuntime {
         store,
         policy: config.policy,
+        max_resume_attempts: config.max_resume_attempts,
     })
 }
 

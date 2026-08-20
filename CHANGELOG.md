@@ -146,6 +146,52 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   must now name `tls-ring` (or `fips`) explicitly**, where it previously got
   the *ring* stack implicitly.
 
+### Fixed
+
+- **A refused resume can no longer reopen a finished turn.** Marking a failed
+  turn's checkpoint now leaves terminal records — `Completed`, `Abandoned` —
+  exactly as they are, so a pre-flight refusal (changed inputs, an abandoned
+  record) no longer downgrades them to `Failed`, which would have made a
+  finished answer re-executable and an operator's abandonment resumable.
+- **A seeded resume keeps the record's original fingerprint.** Progress
+  written by `resume_turn(..)` / `resume_auto` no longer stamps a fingerprint
+  computed from the resumed builder's synthetic inputs, so the documented
+  retry — re-issuing `.prompt(P).checkpoint(store, id)` after a crash-resume —
+  still matches and replays instead of being refused as changed inputs.
+- **One live owner per checkpoint.** The prompt loop claims its checkpoint ID
+  (an in-process registry owned by the `MemoryStore` actor) before reading
+  the record and releases it when the turn ends; a concurrent resume of the
+  same ID — an operator's `resume_turn` against a live turn, a retry racing
+  the `resume_auto` background task — is refused with `AlreadyRunning`
+  instead of double-executing pending tool calls, and `interrupted_turns()`
+  filters out records claimed by turns still running in this process.
+- **The unattended resume sweep is bounded.** Each failed attempt increments
+  the record's `resume_attempts`; once a `Failed` record reaches
+  `max_resume_attempts` (default 3, settable on `CheckpointConfig` or as
+  `max_resume_attempts` under `[checkpoint]`), `resume_interrupted()` — and
+  therefore `resume_auto` — marks it `Abandoned` instead of re-dispatching,
+  and re-paying for, the same failure on every process start. A deliberate
+  per-turn `resume_turn(..)` is never subject to the ceiling.
+- **Uncertain calls reach the audit trail.** A started, non-idempotent call
+  the resume settlement declines to re-run is now recorded as an
+  `AuditOutcome::Uncertain` entry (decider `settlement`), so the trail
+  accounts for the one call whose first attempt died before it could write —
+  previously the response's `tool_calls` showed a call the chain had no
+  entry for.
+- **Settlement re-execution matches the main loop.** A `Pending`
+  `get_context_remaining` settled on resume now gets the loop-injected
+  context state instead of erroring with "live conversation state is
+  unavailable", and a settled `update_plan` updates the turn's plan and
+  broadcasts `PlanUpdated`, exactly as the main round loop does.
+- Removed the two `#[allow(clippy::cast_possible_truncation)]` suppressions
+  in `memory::compaction`: `CompactionThreshold` now stores `f64` (so the
+  TOML fraction is never narrowed at all — `get()` returns `f64`), and
+  `trigger_tokens` clamps to the budget before a cast that is exact by
+  construction.
+- `PlanError` and `PlanTextError` are now `#[non_exhaustive]`, like every
+  other error enum in the crate, so adding a validation rule stays a
+  semver-compatible change.
+
 ## 0.31.0 - 2026-08-16
 
 ### Fixed

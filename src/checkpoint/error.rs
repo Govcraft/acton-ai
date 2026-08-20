@@ -67,6 +67,14 @@ pub enum CheckpointErrorKind {
     /// An operator policy already declined to resume this turn. The record is
     /// kept as evidence of that outcome and is never picked up again.
     Abandoned,
+    /// A turn holding this checkpoint is already running in this process.
+    ///
+    /// A checkpoint ID has exactly one live owner: the prompt loop claims it
+    /// before planning and releases it when the turn ends, so a concurrent
+    /// resume — an operator's `resume_turn` against a turn still in flight,
+    /// or a retry racing the `resume_auto` background task — is refused
+    /// instead of double-executing the turn's pending tool calls.
+    AlreadyRunning,
 }
 
 impl CheckpointError {
@@ -151,6 +159,12 @@ impl CheckpointError {
     pub fn abandoned() -> Self {
         Self::new(CheckpointErrorKind::Abandoned)
     }
+
+    /// Creates a [`CheckpointErrorKind::AlreadyRunning`] error.
+    #[must_use]
+    pub fn already_running() -> Self {
+        Self::new(CheckpointErrorKind::AlreadyRunning)
+    }
 }
 
 impl fmt::Display for CheckpointError {
@@ -196,6 +210,12 @@ impl fmt::Display for CheckpointErrorKind {
                 f,
                 "the turn this checkpoint belongs to was abandoned by operator policy; \
                  the record is kept as evidence, so start a new checkpoint"
+            ),
+            Self::AlreadyRunning => write!(
+                f,
+                "a turn holding this checkpoint is already running in this process; \
+                 a checkpoint has exactly one live owner, so wait for that turn to \
+                 finish or fail before resuming it"
             ),
         }
     }

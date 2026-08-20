@@ -181,6 +181,7 @@ pub struct ActonAIConfig {
 /// [checkpoint]
 /// db_path = "checkpoints.db"     # where interrupted turns are recorded
 /// policy = "abandon"             # abandon | resume_on_request | resume_auto
+/// max_resume_attempts = 3        # failed attempts before a sweep abandons a turn
 /// ```
 ///
 /// Writing the section is what turns checkpointing on: every prompt records
@@ -202,6 +203,14 @@ pub struct CheckpointFileConfig {
     /// One of `abandon` (the default), `resume_on_request`, or `resume_auto`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub policy: Option<crate::checkpoint::ResumePolicy>,
+
+    /// How many failed attempts an unattended resume sweep grants a turn
+    /// before abandoning it instead of resuming it again.
+    ///
+    /// Defaults to
+    /// [`CheckpointConfig::DEFAULT_MAX_RESUME_ATTEMPTS`](crate::checkpoint::CheckpointConfig::DEFAULT_MAX_RESUME_ATTEMPTS).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_resume_attempts: Option<u32>,
 }
 
 impl CheckpointFileConfig {
@@ -217,6 +226,9 @@ impl CheckpointFileConfig {
                 .clone()
                 .unwrap_or_else(|| Self::DEFAULT_DB_PATH.to_string()),
             policy: self.policy.unwrap_or_default(),
+            max_resume_attempts: self
+                .max_resume_attempts
+                .unwrap_or(crate::checkpoint::CheckpointConfig::DEFAULT_MAX_RESUME_ATTEMPTS),
         }
     }
 }

@@ -87,6 +87,7 @@ fn mid_turn(id: CheckpointId, tools: &[String]) -> CheckpointRecord {
                 serde_json::json!("contents of a.txt"),
             )],
             token_count: 37,
+            resume_attempts: 0,
             usage: Usage {
                 input_tokens: 400,
                 output_tokens: 60,
@@ -297,6 +298,7 @@ async fn a_persisted_checkpoint_plans_a_resume_from_where_it_stopped() {
         token_count,
         usage,
         pending_round,
+        ..
     } = plan
     else {
         panic!("expected a resume, got {plan:?}");

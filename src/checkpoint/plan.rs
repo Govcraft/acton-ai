@@ -38,6 +38,9 @@ pub enum ResumePlan {
         /// unstarted calls, surfacing uncertainty for the rest — before it
         /// dispatches anything to the model.
         pending_round: Option<PendingRound>,
+        /// Attempts at this turn that already ended in an error, carried so
+        /// the resumed loop's own progress writes preserve the count.
+        resume_attempts: u32,
     },
     /// The turn already finished. Hand back what it produced without
     /// dispatching anything.
@@ -70,6 +73,10 @@ pub struct RoundProgress {
     /// The mid-round state, when the write happens between a round's tool
     /// calls rather than at its boundary. `None` at every boundary.
     pub pending_round: Option<PendingRound>,
+    /// Attempts at this turn that already ended in an error. Zero on a fresh
+    /// turn; a resume carries the stored count forward so its own writes do
+    /// not reset it.
+    pub resume_attempts: u32,
 }
 
 /// Decides what a run may do with the checkpoint it found.
@@ -174,6 +181,7 @@ pub fn plan_from_record(
         token_count: record.token_count,
         usage: record.usage,
         pending_round: record.pending_round.clone(),
+        resume_attempts: record.resume_attempts,
     })
 }
 
@@ -227,6 +235,7 @@ pub fn advance(
         stop_reason: None,
         structured_output: None,
         pending_round: progress.pending_round,
+        resume_attempts: progress.resume_attempts,
     }
 }
 
@@ -265,10 +274,24 @@ pub struct FinalAnswer {
 /// resumable, and where it got to is the point of the record. What changes is
 /// only what an operator sees — [`ListCheckpoints`](crate::memory::ListCheckpoints)
 /// can pick failed turns out, which an in-progress marking would hide among
-/// the turns still running.
+/// the turns still running. The failure also counts: `resume_attempts` goes
+/// up by one, which is what lets an unattended resume loop stop re-paying for
+/// a turn that fails the same way on every restart.
+///
+/// A terminal record — `Completed` or `Abandoned` — comes back unchanged.
+/// Those statuses are outcomes, not progress: a finished answer must stay
+/// replayable and an operator's abandonment must stay closed, no matter what
+/// error a later attempt against the same ID ran into on its way out.
 #[must_use]
 pub fn fail(mut record: CheckpointRecord) -> CheckpointRecord {
+    if matches!(
+        record.status,
+        CheckpointStatus::Completed | CheckpointStatus::Abandoned
+    ) {
+        return record;
+    }
     record.status = CheckpointStatus::Failed;
+    record.resume_attempts = record.resume_attempts.saturating_add(1);
     record
 }
 
@@ -393,6 +416,7 @@ mod tests {
             stop_reason: None,
             structured_output: None,
             pending_round: None,
+            resume_attempts: 0,
         }
     }
 
@@ -428,6 +452,7 @@ mod tests {
             token_count,
             usage,
             pending_round,
+            ..
         } = plan
         else {
             panic!("expected a resume, got {plan:?}");
@@ -666,6 +691,7 @@ mod tests {
                     ..Usage::default()
                 },
                 pending_round: None,
+                resume_attempts: 0,
             },
         );
 
@@ -695,6 +721,7 @@ mod tests {
                 token_count: 0,
                 usage: Usage::default(),
                 pending_round: None,
+                resume_attempts: 0,
             },
         );
 
@@ -723,6 +750,7 @@ mod tests {
                 token_count: 0,
                 usage: Usage::default(),
                 pending_round: None,
+                resume_attempts: 0,
             },
         );
 
@@ -790,6 +818,49 @@ mod tests {
         assert_eq!(record.status, CheckpointStatus::Failed);
         assert_eq!(record.rounds_completed, 2);
         assert_eq!(record.messages.len(), 1);
+    }
+
+    #[test]
+    fn fail_counts_the_attempt() {
+        let tools = tool_names();
+        let record = fail(in_progress(&tools));
+        assert_eq!(record.resume_attempts, 1);
+
+        // A failed resume of the failed record counts again.
+        let record = fail(record);
+        assert_eq!(record.resume_attempts, 2);
+        assert_eq!(record.status, CheckpointStatus::Failed);
+    }
+
+    #[test]
+    fn fail_leaves_a_completed_record_untouched() {
+        // A pre-flight refusal — changed inputs, an exhausted budget — errors
+        // out of the loop before anything runs, and the loop marks the record
+        // failed on the way out. That marking must not downgrade a finished
+        // answer: the record stays Completed, still replayable, and the
+        // attempt is not counted against it.
+        let tools = tool_names();
+        let completed = complete(in_progress(&tools), answer("answer", StopReason::EndTurn));
+
+        let record = fail(completed.clone());
+
+        assert_eq!(record, completed);
+        assert_eq!(record.status, CheckpointStatus::Completed);
+        assert_eq!(record.resume_attempts, 0);
+    }
+
+    #[test]
+    fn fail_leaves_an_abandoned_record_untouched() {
+        // Same for an operator's abandonment: resuming an abandoned record is
+        // refused, and that refusal must not quietly reopen the record by
+        // flipping it to Failed — Failed is resumable, Abandoned is closed.
+        let tools = tool_names();
+        let abandoned = abandon(in_progress(&tools));
+
+        let record = fail(abandoned.clone());
+
+        assert_eq!(record, abandoned);
+        assert_eq!(record.status, CheckpointStatus::Abandoned);
     }
 
     #[test]

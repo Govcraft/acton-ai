@@ -407,6 +407,67 @@ impl Request for DeleteCheckpoint {
     type Response = OperationCompleted;
 }
 
+/// Request to claim a checkpoint ID for the turn about to run under it.
+///
+/// The claim registry is in-process, in-memory state owned by this actor: a
+/// checkpoint ID has exactly one live owner, and the prompt loop claims its ID
+/// before planning a resume so two loops in the same process — a live turn and
+/// an operator's `resume_turn`, or a caller's retry racing the `resume_auto`
+/// background task — can never both settle the same pending tool calls. The
+/// registry dies with the process, deliberately: a crashed process's claims
+/// must not outlive it, or nothing could ever be resumed after a crash.
+#[acton_message]
+pub struct ClaimCheckpoint {
+    /// The checkpoint to claim.
+    pub id: CheckpointId,
+}
+
+/// Reply to [`ClaimCheckpoint`].
+#[acton_message]
+pub struct CheckpointClaimed {
+    /// Whether the claim was granted. `false` means another turn in this
+    /// process holds the ID right now.
+    pub granted: bool,
+}
+
+impl Request for ClaimCheckpoint {
+    type Response = CheckpointClaimed;
+}
+
+/// Request to release a claim taken with [`ClaimCheckpoint`].
+///
+/// Releasing an ID nobody holds succeeds: the caller wanted it free, and it
+/// is free.
+#[acton_message]
+pub struct ReleaseCheckpoint {
+    /// The checkpoint to release.
+    pub id: CheckpointId,
+}
+
+/// Reply to [`ReleaseCheckpoint`]. Answered so a releasing turn can use the
+/// reply as a barrier: once it lands, the next claim on the ID will succeed.
+#[acton_message]
+pub struct CheckpointReleased;
+
+impl Request for ReleaseCheckpoint {
+    type Response = CheckpointReleased;
+}
+
+/// Request for the checkpoint IDs currently claimed by running turns.
+#[acton_message]
+pub struct ListCheckpointClaims;
+
+/// Reply to [`ListCheckpointClaims`].
+#[acton_message]
+pub struct CheckpointClaims {
+    /// Every ID a turn in this process holds right now.
+    pub ids: Vec<CheckpointId>,
+}
+
+impl Request for ListCheckpointClaims {
+    type Response = CheckpointClaims;
+}
+
 // =============================================================================
 // Metrics
 // =============================================================================
@@ -537,6 +598,12 @@ pub struct MemoryStore {
     pub connection: Option<Connection>,
     /// Whether the store is shutting down
     pub shutting_down: bool,
+    /// Checkpoint IDs claimed by turns running in this process right now.
+    ///
+    /// Owned here — by the one actor every checkpoint read and write already
+    /// goes through — rather than shared behind a lock, so claim and release
+    /// are ordinary messages and the registry has exactly one owner.
+    pub active_checkpoints: std::collections::HashSet<CheckpointId>,
     /// Metrics
     pub metrics: MemoryStoreMetrics,
 }
@@ -681,6 +748,24 @@ fn configure_checkpoint_write_handlers(builder: &mut ManagedActor<Idle, MemorySt
         })
     });
 
+    builder.mutate_on::<ClaimCheckpoint>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let granted = actor
+            .model
+            .active_checkpoints
+            .insert(envelope.message().id.clone());
+        reply_now(reply, CheckpointClaimed { granted })
+    });
+
+    builder.mutate_on::<ReleaseCheckpoint>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        actor
+            .model
+            .active_checkpoints
+            .remove(&envelope.message().id);
+        reply_now(reply, CheckpointReleased)
+    });
+
     builder.mutate_on::<DeleteCheckpoint>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let id = envelope.message().id.clone();
@@ -727,6 +812,12 @@ fn configure_checkpoint_read_handlers(builder: &mut ManagedActor<Idle, MemorySto
             log_failure("load_checkpoint", &result);
             reply.send(CheckpointLoaded { result }).await;
         })
+    });
+
+    builder.act_on::<ListCheckpointClaims>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let ids: Vec<CheckpointId> = actor.model.active_checkpoints.iter().cloned().collect();
+        reply_now(reply, CheckpointClaims { ids })
     });
 
     builder.act_on::<ListCheckpoints>(|actor, envelope| {

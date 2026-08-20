@@ -43,6 +43,18 @@ pub enum AuditOutcome {
         /// The rendered denial reason.
         reason: String,
     },
+    /// A crash left the call's outcome unknowable, and the resume settlement
+    /// declined to run it again.
+    ///
+    /// Written by a resumed turn for a call the interrupted process had
+    /// `Started` on a non-idempotent tool: it may or may not have had its
+    /// effect, and re-running it on a "maybe" is exactly what the tool's own
+    /// declaration forbids. The entry is the trail's only trace of the call —
+    /// the first attempt died before it could write one.
+    Uncertain {
+        /// The feedback handed to the model in place of a tool result.
+        message: String,
+    },
 }
 
 /// The gate's verdict, and who reached it.

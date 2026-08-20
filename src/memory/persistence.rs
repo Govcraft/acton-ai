@@ -120,6 +120,7 @@ CREATE TABLE IF NOT EXISTS turn_checkpoints (
     stop_reason TEXT,
     structured_output TEXT,
     pending_round TEXT,
+    resume_attempts INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
     updated_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -1433,7 +1434,8 @@ pub async fn find_memories_by_tag(
 /// them. Named once so the SELECT list and the row parser cannot drift apart.
 const CHECKPOINT_COLUMNS: &str = "id, conversation_id, fingerprint, format_version, status, \
                                   rounds_completed, token_count, usage, messages, tool_calls, \
-                                  final_text, stop_reason, structured_output, pending_round";
+                                  final_text, stop_reason, structured_output, pending_round, \
+                                  resume_attempts";
 
 /// Saves a checkpoint, replacing any earlier record under the same ID.
 ///
@@ -1456,8 +1458,8 @@ pub async fn save_checkpoint(
         "INSERT INTO turn_checkpoints
              (id, conversation_id, fingerprint, format_version, status, rounds_completed,
               token_count, usage, messages, tool_calls, final_text, stop_reason,
-              structured_output, pending_round)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+              structured_output, pending_round, resume_attempts)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
          ON CONFLICT(id) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              fingerprint = excluded.fingerprint,
@@ -1472,6 +1474,7 @@ pub async fn save_checkpoint(
              stop_reason = excluded.stop_reason,
              structured_output = excluded.structured_output,
              pending_round = excluded.pending_round,
+             resume_attempts = excluded.resume_attempts,
              updated_at = datetime('now')",
         libsql::params![
             columns.id,
@@ -1488,6 +1491,7 @@ pub async fn save_checkpoint(
             columns.stop_reason,
             columns.structured_output,
             columns.pending_round,
+            columns.resume_attempts,
         ],
     )
     .await
@@ -1622,6 +1626,7 @@ fn parse_checkpoint_row(row: &libsql::Row) -> Result<CheckpointRecord, Persisten
         stop_reason: maybe_text(11)?,
         structured_output: maybe_text(12)?,
         pending_round: maybe_text(13)?,
+        resume_attempts: count(14)?,
     };
 
     decode_row(&columns).map_err(|e| PersistenceError::deserialization_failed(e.to_string()))

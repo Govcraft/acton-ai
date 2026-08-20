@@ -104,8 +104,9 @@ pub use persistence::{delete_checkpoint, list_checkpoints, load_checkpoint, save
 
 // Re-export checkpoint store messages
 pub use store::{
-    CheckpointList, CheckpointLoaded, CheckpointSaved, DeleteCheckpoint, ListCheckpoints,
-    LoadCheckpoint, SaveCheckpoint,
+    CheckpointClaimed, CheckpointClaims, CheckpointList, CheckpointLoaded, CheckpointReleased,
+    CheckpointSaved, ClaimCheckpoint, DeleteCheckpoint, ListCheckpointClaims, ListCheckpoints,
+    LoadCheckpoint, ReleaseCheckpoint, SaveCheckpoint,
 };
 
 // Re-export store types and messages

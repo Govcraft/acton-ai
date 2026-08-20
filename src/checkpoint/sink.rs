@@ -10,7 +10,10 @@ use crate::checkpoint::error::CheckpointError;
 use crate::checkpoint::plan::{self, FinalAnswer, ResumePlan, RoundProgress};
 use crate::checkpoint::record::{CheckpointRecord, TurnFingerprint, TurnInputs};
 use crate::error::ActonAIError;
-use crate::memory::{CheckpointLoaded, CheckpointSaved, LoadCheckpoint, SaveCheckpoint};
+use crate::memory::{
+    CheckpointClaimed, CheckpointLoaded, CheckpointReleased, CheckpointSaved, ClaimCheckpoint,
+    LoadCheckpoint, ReleaseCheckpoint, SaveCheckpoint,
+};
 use crate::types::{CheckpointId, ConversationId};
 use acton_reactive::prelude::*;
 
@@ -146,6 +149,11 @@ impl CheckpointSink {
     /// it on the way out of a failed turn rather than leaving the record
     /// looking like a turn still running.
     ///
+    /// A record already in a terminal state — `Completed` or `Abandoned` — is
+    /// left exactly as it is. A finished answer must stay replayable and an
+    /// operator's abandonment must stay closed, whatever error a later attempt
+    /// against the same ID hit on its way out.
+    ///
     /// Does nothing when the sink is disabled or nothing was ever written.
     ///
     /// # Errors
@@ -161,7 +169,83 @@ impl CheckpointSink {
             return Ok(());
         };
 
-        self.write(target, plan::fail(record)).await
+        let failed = plan::fail(record);
+        if failed.status != crate::checkpoint::CheckpointStatus::Failed {
+            // `fail` declined to touch a terminal record; there is nothing
+            // worth writing back.
+            return Ok(());
+        }
+
+        self.write(target, failed).await
+    }
+
+    /// Claims this sink's checkpoint ID for the turn about to run under it.
+    ///
+    /// A checkpoint has exactly one live owner per process. The prompt loop
+    /// claims before it plans, so a second loop aiming at the same ID — an
+    /// operator resuming a turn that is still in flight, or a caller's retry
+    /// racing the `resume_auto` background task — is refused up front instead
+    /// of double-executing the turn's pending tool calls and interleaving
+    /// checkpoint writes with the live owner.
+    ///
+    /// A disabled sink claims nothing and succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CheckpointErrorKind::AlreadyRunning`](crate::checkpoint::CheckpointErrorKind::AlreadyRunning)
+    /// when another turn in this process holds the ID, and a checkpoint error
+    /// when the store cannot be reached.
+    pub async fn claim(&self) -> Result<(), ActonAIError> {
+        let Some(ref target) = self.target else {
+            return Ok(());
+        };
+
+        let claimed: CheckpointClaimed = target
+            .store
+            .ask(ClaimCheckpoint {
+                id: target.id.clone(),
+            })
+            .await
+            .map_err(|e| {
+                ActonAIError::checkpoint(
+                    target.id.clone(),
+                    format!("the memory store did not answer the checkpoint claim: {e}"),
+                )
+            })?;
+
+        if claimed.granted {
+            Ok(())
+        } else {
+            Err(ActonAIError::from(
+                CheckpointError::already_running().with_checkpoint(target.id.clone()),
+            ))
+        }
+    }
+
+    /// Releases the claim taken by [`claim`](Self::claim).
+    ///
+    /// Best-effort: a release that cannot land is logged, because by the time
+    /// it runs the caller already holds the turn's real outcome and must not
+    /// trade it for a bookkeeping error. An unreachable store here means the
+    /// runtime is shutting down, which releases every claim anyway.
+    pub async fn release(&self) {
+        let Some(ref target) = self.target else {
+            return;
+        };
+
+        let released: Result<CheckpointReleased, _> = target
+            .store
+            .ask(ReleaseCheckpoint {
+                id: target.id.clone(),
+            })
+            .await;
+        if let Err(error) = released {
+            tracing::warn!(
+                checkpoint = %target.id,
+                %error,
+                "could not release the checkpoint claim",
+            );
+        }
     }
 
     /// Reads the stored record, if there is one.
@@ -230,6 +314,7 @@ mod tests {
             token_count: 0,
             usage: Usage::default(),
             pending_round: None,
+            resume_attempts: 0,
         }
     }
 
@@ -278,6 +363,8 @@ mod tests {
         .unwrap();
 
         sink.mark_failed().await.unwrap();
+        sink.claim().await.unwrap();
+        sink.release().await;
     }
 
     #[test]

@@ -77,7 +77,11 @@ pub const MAX_NOTE_CHARS: usize = 1000;
 /// whoever holds it ("plan step 3 **is blank**", "the note **is 1240
 /// characters long; the maximum is 1000**"), because the useful part of the
 /// message — which step — is known one level up.
+///
+/// Marked `#[non_exhaustive]`: new text rules bring new refusals, and a
+/// downstream `match` should not break each time one is added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlanTextError {
     /// The text was empty, or nothing but whitespace.
     Empty,
@@ -128,7 +132,11 @@ impl std::error::Error for UnknownPlanStepStatus {}
 /// Every variant's `Display` names the offending step by its 1-based position
 /// — the way the model itself numbered them — and says what to do about it,
 /// because this text is handed straight back to the model as the tool result.
+///
+/// Marked `#[non_exhaustive]`: new validation rules bring new refusals, and a
+/// downstream `match` should not break each time one is added.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum PlanError {
     /// The plan had no steps at all.
     NoSteps,

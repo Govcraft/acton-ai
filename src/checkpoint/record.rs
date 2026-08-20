@@ -271,6 +271,14 @@ pub struct CheckpointRecord {
     /// The mid-round state, when the turn was interrupted while executing
     /// tools. `None` on a record written at a round boundary.
     pub pending_round: Option<PendingRound>,
+    /// How many attempts at this turn have ended in an error.
+    ///
+    /// Incremented by [`fail`](crate::checkpoint::fail) each time the record
+    /// is marked failed, and carried forward by every progress write, so a
+    /// turn that fails for the same reason on every restart accumulates a
+    /// count an unattended resume loop can bound itself on — see
+    /// [`CheckpointConfig::max_resume_attempts`](crate::checkpoint::CheckpointConfig::max_resume_attempts).
+    pub resume_attempts: u32,
 }
 
 impl CheckpointRecord {
@@ -297,6 +305,7 @@ impl CheckpointRecord {
             stop_reason: None,
             structured_output: None,
             pending_round: None,
+            resume_attempts: 0,
         }
     }
 }
@@ -336,6 +345,8 @@ pub struct CheckpointColumns {
     pub structured_output: Option<String>,
     /// `pending_round`, JSON
     pub pending_round: Option<String>,
+    /// `resume_attempts`
+    pub resume_attempts: u32,
 }
 
 /// Renders a record into the columns that store it.
@@ -380,6 +391,7 @@ pub fn encode_record(record: &CheckpointRecord) -> Result<CheckpointColumns, Che
             }
             .to_string()
         }),
+        resume_attempts: record.resume_attempts,
     })
 }
 
@@ -456,6 +468,7 @@ pub fn decode_row(columns: &CheckpointColumns) -> Result<CheckpointRecord, Check
         stop_reason,
         structured_output,
         pending_round,
+        resume_attempts: columns.resume_attempts,
     })
 }
 
@@ -556,6 +569,7 @@ mod tests {
             stop_reason: None,
             structured_output: None,
             pending_round: None,
+            resume_attempts: 3,
         }
     }
 

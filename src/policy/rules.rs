@@ -95,6 +95,13 @@ pub enum Decider {
     PerTurnCap,
     /// The approval hook decided.
     Callback,
+    /// The crash-recovery settlement decided.
+    ///
+    /// A resumed turn found the call mid-flight in a dead process's pending
+    /// ledger and resolved it on the tool's idempotency declaration rather
+    /// than through the gate — the gate already admitted it once, on the
+    /// attempt that died.
+    Settlement,
 }
 
 impl fmt::Display for Decider {
@@ -106,6 +113,7 @@ impl fmt::Display for Decider {
             Self::Denylist => "denylist",
             Self::PerTurnCap => "per_turn_cap",
             Self::Callback => "callback",
+            Self::Settlement => "settlement",
         };
         f.write_str(name)
     }

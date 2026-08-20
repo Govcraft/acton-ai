@@ -43,6 +43,22 @@ pub struct CheckpointConfig {
     pub db_path: String,
     /// What launch does about interrupted turns it finds there.
     pub policy: ResumePolicy,
+    /// How many failed attempts [`ActonAI::resume_interrupted`](crate::ActonAI::resume_interrupted)
+    /// grants a turn before abandoning it instead of resuming it again.
+    ///
+    /// This is what bounds the unattended paths — the `resume_auto`
+    /// background task and operator-driven `resume_interrupted()` sweeps. A
+    /// turn that fails for the same reason on every process start would
+    /// otherwise be re-dispatched, and re-paid for, on every restart forever.
+    /// Once a `Failed` record's counted attempts reach this ceiling, the
+    /// sweep marks it `Abandoned` — a recorded outcome an operator can list —
+    /// rather than running it. A deliberate, per-turn
+    /// [`resume_turn`](crate::ActonAI::resume_turn) is never subject to the
+    /// ceiling: an operator who picked one specific record out is asking for
+    /// exactly one more attempt.
+    ///
+    /// Defaults to [`Self::DEFAULT_MAX_RESUME_ATTEMPTS`].
+    pub max_resume_attempts: u32,
 }
 
 impl CheckpointConfig {
@@ -55,13 +71,25 @@ impl CheckpointConfig {
         Self {
             db_path: db_path.into(),
             policy: ResumePolicy::default(),
+            max_resume_attempts: Self::DEFAULT_MAX_RESUME_ATTEMPTS,
         }
     }
+
+    /// How many failed attempts an unattended sweep grants a turn by default.
+    pub const DEFAULT_MAX_RESUME_ATTEMPTS: u32 = 3;
 
     /// Sets what launch does about interrupted turns.
     #[must_use]
     pub fn policy(mut self, policy: ResumePolicy) -> Self {
         self.policy = policy;
+        self
+    }
+
+    /// Sets how many failed attempts an unattended sweep grants a turn
+    /// before abandoning it. See [`Self::max_resume_attempts`].
+    #[must_use]
+    pub fn max_resume_attempts(mut self, attempts: u32) -> Self {
+        self.max_resume_attempts = attempts;
         self
     }
 }
@@ -104,5 +132,15 @@ mod tests {
         let config = CheckpointConfig::new("x.db").policy(ResumePolicy::ResumeAuto);
         assert_eq!(config.policy, ResumePolicy::ResumeAuto);
         assert_eq!(config.db_path, "x.db");
+        assert_eq!(
+            config.max_resume_attempts,
+            CheckpointConfig::DEFAULT_MAX_RESUME_ATTEMPTS
+        );
+    }
+
+    #[test]
+    fn the_builder_sets_the_attempt_ceiling() {
+        let config = CheckpointConfig::new("x.db").max_resume_attempts(1);
+        assert_eq!(config.max_resume_attempts, 1);
     }
 }

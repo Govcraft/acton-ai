@@ -1141,18 +1141,36 @@ impl PromptBuilder {
         let checkpoint = self.checkpoint.clone();
 
         let mut stats = TurnStats::default();
-        let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
+        // The claim is the turn's exclusivity: a checkpoint ID has exactly
+        // one live owner per process. It is taken before the loop reads the
+        // record, so two loops aiming at the same ID — a live turn and an
+        // operator's resume, or a retry racing the resume_auto background
+        // task — can never both load the same pending round and settle it
+        // twice. A refused claim skips the loop entirely and, deliberately,
+        // never touches the record: it belongs to the running owner.
+        let result = match checkpoint.claim().await {
+            Ok(()) => {
+                let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
 
-        // A failed turn's record stays exactly as it was, so it is still
-        // resumable; only its status changes, which is what lets an operator
-        // list the turns that fell over separately from the ones still
-        // running. A failure to record that must not replace the error the
-        // caller actually needs to see.
-        if result.is_err() && checkpoint.is_enabled() {
-            if let Err(error) = checkpoint.mark_failed().await {
-                tracing::warn!(%error, "could not mark the turn's checkpoint failed");
+                // A failed turn's record stays exactly as it was, so it is still
+                // resumable; only its status changes, which is what lets an operator
+                // list the turns that fell over separately from the ones still
+                // running (terminal records — Completed, Abandoned — are left
+                // untouched; see `checkpoint::fail`). A failure to record that
+                // must not replace the error the caller actually needs to see.
+                if result.is_err() && checkpoint.is_enabled() {
+                    if let Err(error) = checkpoint.mark_failed().await {
+                        tracing::warn!(%error, "could not mark the turn's checkpoint failed");
+                    }
+                }
+
+                // Released win or lose, and before TurnFinished: once the
+                // turn is over, the ID is free for the next attempt.
+                checkpoint.release().await;
+                result
             }
-        }
+            Err(error) => Err(error),
+        };
 
         broker
             .broadcast(TurnLifecycle::TurnFinished { turn_id })
@@ -1316,7 +1334,16 @@ impl PromptBuilder {
             max_tool_rounds,
             structured_schema: checkpoint_schema.as_deref(),
         };
-        let checkpoint_fingerprint = TurnFingerprint::of(&checkpoint_inputs);
+        // A seeded resume keeps the record's own fingerprint. The seeded
+        // builder's inputs are synthetic — `prompt(String::new())` plus
+        // whatever tools the runtime holds today — and stamping their hash
+        // onto the record would break the original caller's documented
+        // retry: a later `.prompt(P).checkpoint(store, id)` must still
+        // compare equal against the fingerprint the turn was started with.
+        let checkpoint_fingerprint = match resume_seed {
+            Some(ref record) => record.fingerprint.clone(),
+            None => TurnFingerprint::of(&checkpoint_inputs),
+        };
 
         // The seed path is the operator's authority; the sink path is the
         // fingerprint's. Exactly one of the two produces the plan.
@@ -1329,6 +1356,10 @@ impl PromptBuilder {
         // every audit entry the turn writes, so a reader of the trail can
         // tell first-run executions from post-crash ones.
         let mut turn_resumed = false;
+        // Failed attempts already recorded against this checkpoint, carried
+        // through every progress write so a resume does not reset the count
+        // the unattended sweep bounds itself on.
+        let mut turn_resume_attempts = 0_u32;
         // The interrupted round to settle before anything is dispatched, when
         // the previous attempt died between a round's tool calls.
         let mut pending_settlement: Option<PendingRound> = None;
@@ -1356,6 +1387,7 @@ impl PromptBuilder {
                 token_count,
                 usage,
                 pending_round,
+                resume_attempts,
             } => {
                 // `iteration` is seeded rather than reset, so the resumed turn
                 // runs under what is left of the original round budget instead
@@ -1371,6 +1403,7 @@ impl PromptBuilder {
                 total_token_count = token_count;
                 stats.usage = usage;
                 turn_resumed = true;
+                turn_resume_attempts = resume_attempts;
                 pending_settlement = pending_round;
             }
         }
@@ -1403,9 +1436,47 @@ impl PromptBuilder {
                             entry.call.arguments.clone(),
                             feedback.clone(),
                         ));
+                        // The trail hears it too. The first attempt died
+                        // before its entry could be written, so this is the
+                        // only place the chain can account for a call the
+                        // response's tool_calls will show — and the decision
+                        // not to re-run it is itself the auditable event.
+                        let step = ToolStep {
+                            provider_handle: &provider_handle,
+                            turn,
+                            turn_id,
+                            correlation_id: &settle_correlation_id,
+                            conversation_id: conversation_id.as_ref(),
+                            policy: tool_policy.as_ref(),
+                            audit: audit.as_ref(),
+                            resumed: true,
+                        };
+                        step.record_uncertain(&entry.call, &feedback).await;
                         results.push(feedback);
                     }
                     PendingCallAction::Execute => {
+                        // The same augmentation the main round loop applies:
+                        // `get_context_remaining` reads the turn's live
+                        // message state, whose one owner is this loop, so the
+                        // measured budget is injected at call time. The
+                        // original call, not the augmented one, is what goes
+                        // back into `messages` below.
+                        let call_with_state;
+                        let tool_call = if entry.call.name
+                            == crate::tools::builtins::GET_CONTEXT_REMAINING_TOOL
+                        {
+                            call_with_state = ToolCall {
+                                arguments: crate::tools::builtins::inject_context_state(
+                                    &entry.call.arguments,
+                                    runtime.context_window(),
+                                    &messages,
+                                ),
+                                ..entry.call.clone()
+                            };
+                            &call_with_state
+                        } else {
+                            &entry.call
+                        };
                         let step = ToolStep {
                             provider_handle: &provider_handle,
                             turn,
@@ -1417,7 +1488,27 @@ impl PromptBuilder {
                             resumed: true,
                         };
                         let (outcome, executed) =
-                            step.run(&mut tools, &mut turn_counts, &entry.call).await;
+                            step.run(&mut tools, &mut turn_counts, tool_call).await;
+                        // An `update_plan` the settlement itself ran is this
+                        // attempt's own execution, not reconstruction of a
+                        // previous round's state: the plan owner is updated
+                        // and observers hear `PlanUpdated`, exactly as if the
+                        // main loop had run the call.
+                        if let ToolOutcome::Ran(Ok(value)) = &outcome {
+                            if let Some(plan) =
+                                crate::tools::plan::plan_from_tool_result(&tool_call.name, value)
+                            {
+                                provider_handle
+                                    .broadcast(crate::messages::PlanUpdated {
+                                        turn_id: turn_id.clone(),
+                                        correlation_id: settle_correlation_id.clone(),
+                                        tool_call_id: tool_call.id.clone(),
+                                        plan: plan.clone(),
+                                    })
+                                    .await;
+                                turn_plan = Some(plan);
+                            }
+                        }
                         results.push(outcome.as_tool_result());
                         executed_tool_calls.push(executed);
                     }
@@ -1447,6 +1538,7 @@ impl PromptBuilder {
                         tool_calls: executed_tool_calls.clone(),
                         token_count: total_token_count,
                         usage: stats.usage,
+                        resume_attempts: turn_resume_attempts,
                         pending_round: None,
                     },
                 )
@@ -1825,6 +1917,7 @@ impl PromptBuilder {
                                     tool_calls: executed_tool_calls.clone(),
                                     token_count: total_token_count,
                                     usage: stats.usage,
+                                    resume_attempts: turn_resume_attempts,
                                     pending_round: Some(ledger.clone()),
                                 },
                             )
@@ -1849,6 +1942,7 @@ impl PromptBuilder {
                                         tool_calls: executed_tool_calls.clone(),
                                         token_count: total_token_count,
                                         usage: stats.usage,
+                                        resume_attempts: turn_resume_attempts,
                                         pending_round: Some(ledger.clone()),
                                     },
                                 )
@@ -1933,6 +2027,7 @@ impl PromptBuilder {
                                         tool_calls: executed_tool_calls.clone(),
                                         token_count: total_token_count,
                                         usage: stats.usage,
+                                        resume_attempts: turn_resume_attempts,
                                         pending_round: Some(ledger.clone()),
                                     },
                                 )
@@ -1969,6 +2064,7 @@ impl PromptBuilder {
                                     tool_calls: executed_tool_calls.clone(),
                                     token_count: total_token_count,
                                     usage: stats.usage,
+                                    resume_attempts: turn_resume_attempts,
                                     pending_round: None,
                                 },
                             )
@@ -2015,6 +2111,7 @@ impl PromptBuilder {
                         tool_calls: executed_tool_calls.clone(),
                         token_count: total_token_count,
                         usage: stats.usage,
+                        resume_attempts: turn_resume_attempts,
                         pending_round: None,
                     },
                     FinalAnswer {
@@ -2949,6 +3046,27 @@ impl ToolStep<'_> {
         };
 
         (ToolOutcome::Ran(result), executed)
+    }
+
+    /// Writes the settlement's verdict on a call it declined to re-run.
+    ///
+    /// A started, non-idempotent call from an interrupted round may or may
+    /// not have had its effect, and the decision not to run it again is
+    /// itself an auditable event. The first attempt crashed before it could
+    /// record anything, so without this entry the trail would hold no trace
+    /// of a call the response's `tool_calls` reports — on the one path whose
+    /// stated purpose is making crash recovery auditable.
+    async fn record_uncertain(&self, tool_call: &ToolCall, feedback: &str) {
+        self.record(
+            tool_call,
+            &tool_call.arguments,
+            crate::audit::AuditOutcome::Uncertain {
+                message: feedback.to_string(),
+            },
+            crate::audit::AuditDecision::refused(crate::policy::Decider::Settlement),
+            std::time::Instant::now(),
+        )
+        .await;
     }
 
     /// Appends one entry to the trail, if a trail is configured.

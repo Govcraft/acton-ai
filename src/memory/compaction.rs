@@ -95,7 +95,7 @@ pub const COMPACTION_PROMPT: &str =
      transcript's format; reply with the briefing alone.";
 
 /// Default fraction of the available budget at which compaction triggers.
-const DEFAULT_THRESHOLD: f32 = 0.8;
+const DEFAULT_THRESHOLD: f64 = 0.8;
 
 /// Default number of trailing exchanges kept verbatim.
 const DEFAULT_KEEP_RECENT_TURNS: usize = 3;
@@ -131,7 +131,7 @@ pub enum CompactionConfigErrorKind {
     /// A threshold outside `0.0 < value <= 1.0`, or not a number at all.
     ThresholdOutOfRange {
         /// The value that was rejected.
-        value: f32,
+        value: f64,
     },
     /// A threshold string that does not parse as a number.
     ThresholdNotANumber {
@@ -194,7 +194,7 @@ impl std::error::Error for CompactionConfigError {}
 /// for the round that follows; the default of `0.8` compacts while there is
 /// still room to work.
 #[derive(Debug, Clone, Copy, PartialEq, PartialOrd)]
-pub struct CompactionThreshold(f32);
+pub struct CompactionThreshold(f64);
 
 impl CompactionThreshold {
     /// Creates a threshold, rejecting anything outside `0.0 < value <= 1.0`.
@@ -203,7 +203,7 @@ impl CompactionThreshold {
     ///
     /// Returns [`CompactionConfigErrorKind::ThresholdOutOfRange`] for zero,
     /// negative, infinite, `NaN`, and values above `1.0`.
-    pub fn new(value: f32) -> Result<Self, CompactionConfigError> {
+    pub fn new(value: f64) -> Result<Self, CompactionConfigError> {
         if !value.is_finite() || value <= 0.0 || value > 1.0 {
             return Err(CompactionConfigError::new(
                 CompactionConfigErrorKind::ThresholdOutOfRange { value },
@@ -214,7 +214,7 @@ impl CompactionThreshold {
 
     /// Returns the fraction.
     #[must_use]
-    pub fn get(self) -> f32 {
+    pub fn get(self) -> f64 {
         self.0
     }
 }
@@ -235,7 +235,7 @@ impl TryFrom<f32> for CompactionThreshold {
     type Error = CompactionConfigError;
 
     fn try_from(value: f32) -> Result<Self, Self::Error> {
-        Self::new(value)
+        Self::new(f64::from(value))
     }
 }
 
@@ -243,10 +243,7 @@ impl TryFrom<f64> for CompactionThreshold {
     type Error = CompactionConfigError;
 
     fn try_from(value: f64) -> Result<Self, Self::Error> {
-        // A TOML fraction like 0.8 has no exact f32, but the loss is far
-        // below anything a token estimate can resolve.
-        #[allow(clippy::cast_possible_truncation)]
-        Self::new(value as f32)
+        Self::new(value)
     }
 }
 
@@ -254,7 +251,7 @@ impl FromStr for CompactionThreshold {
     type Err = CompactionConfigError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        let parsed: f32 = s.trim().parse().map_err(|_| {
+        let parsed: f64 = s.trim().parse().map_err(|_| {
             CompactionConfigError::new(CompactionConfigErrorKind::ThresholdNotANumber {
                 value: s.to_string(),
             })
@@ -515,11 +512,17 @@ pub fn plan_compaction(
 /// Rounded up, so a threshold of `1.0` means "at the budget" rather than
 /// "just under it".
 fn trigger_tokens(available: usize, threshold: CompactionThreshold) -> usize {
-    let scaled = available as f64 * f64::from(threshold.get());
-    // The scaled trigger is far below 2^52, so the cast back is exact.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-    let trigger = scaled.ceil().max(1.0) as usize;
-    trigger
+    let budget = available as f64;
+    let scaled = (budget * threshold.get()).ceil().max(1.0);
+    if scaled >= budget {
+        // A threshold of 1.0 (or a budget so large the product rounds up to
+        // it) means "at the budget"; clamping here is what makes the cast
+        // below exact rather than truncating.
+        return available.max(1);
+    }
+    // `scaled` is a whole, non-negative f64 strictly below `available`, so
+    // the cast is exact by construction.
+    scaled as usize
 }
 
 /// Splits a leading system message off the front of a history.
@@ -734,7 +737,7 @@ mod tests {
 
     #[test]
     fn a_threshold_rejects_values_outside_its_range() {
-        for bad in [0.0_f32, -0.1, 1.01, f32::NAN, f32::INFINITY] {
+        for bad in [0.0_f64, -0.1, 1.01, f64::NAN, f64::INFINITY] {
             let error = CompactionThreshold::new(bad).unwrap_err();
             assert!(
                 matches!(
