@@ -133,7 +133,11 @@ impl IntrospectionActor {
                         actor.model.turns_started = actor.model.turns_started.saturating_add(1);
                     }
                 }
-                TurnLifecycle::TurnFinished { turn_id } => {
+                // The outcome is deliberately ignored: for the in-flight
+                // picture, a completed, failed, and interrupted turn are the
+                // same fact — the turn is over. Counting only "successful"
+                // finishes would leave every failure holding a drain open.
+                TurnLifecycle::TurnFinished { turn_id, .. } => {
                     actor.model.active_turns.remove(turn_id);
                     // Belt and braces: a turn that ended while a tool was
                     // still recorded would otherwise leak that tool forever.

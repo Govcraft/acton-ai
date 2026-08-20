@@ -671,13 +671,18 @@ pub enum TurnLifecycle {
         /// Identifies this turn across its whole lifecycle.
         turn_id: TurnId,
     },
-    /// A turn ended, successfully or with an error.
+    /// A turn ended, successfully or not.
     ///
     /// Always published for a turn that published [`Self::TurnStarted`],
-    /// whatever the outcome.
+    /// whatever the outcome — including a turn whose driving future was
+    /// dropped mid-flight, which a guard in the prompt loop finishes with
+    /// [`TurnOutcome::Interrupted`] so a drain can still complete.
     TurnFinished {
         /// The turn that ended.
         turn_id: TurnId,
+        /// How it ended. An observer balancing starts against finishes can
+        /// ignore this; an observer reporting *what happened* cannot.
+        outcome: TurnOutcome,
     },
     /// A turn was never admitted, because admission was closed.
     ///
@@ -701,6 +706,53 @@ pub enum TurnLifecycle {
         /// The call that finished.
         tool_call_id: String,
     },
+}
+
+/// How a turn ended.
+///
+/// Carried by [`TurnLifecycle::TurnFinished`] so an observer — an embedder's
+/// session UI, an audit consumer — can tell a turn that answered from one
+/// that failed from one whose driving future was simply dropped. Downstream
+/// embedders that let a user cancel a turn (by dropping the `collect()`
+/// future) need [`Interrupted`](Self::Interrupted) to render "cancelled"
+/// rather than mislabelling the turn as completed or errored.
+///
+/// Marked `#[non_exhaustive]` so a future outcome can be added without
+/// breaking downstream `match`es.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum TurnOutcome {
+    /// The turn ran to completion and its caller got a response.
+    Completed,
+    /// The turn ended with an error returned to its caller.
+    Failed,
+    /// The future driving the turn was dropped before the turn ended.
+    ///
+    /// Published by a drop guard in the prompt loop, not by the loop itself:
+    /// a dropped future never runs again, so nothing inside it can publish
+    /// anything. Without this outcome an interrupted turn would leave its
+    /// [`TurnLifecycle::TurnStarted`] unmatched forever, and a drain waiting
+    /// for in-flight turns to reach zero would never complete.
+    Interrupted,
+}
+
+impl TurnOutcome {
+    /// Short, stable label, for logs and JSON surfaces.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
+impl std::fmt::Display for TurnOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
 }
 
 // =============================================================================

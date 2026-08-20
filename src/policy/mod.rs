@@ -178,50 +178,146 @@ impl ToolPolicy {
         self.hook.is_some()
     }
 
+    /// Classifies one tool call the way the gate itself would, without
+    /// running anything.
+    ///
+    /// This exists for embedders that render policy state *before* a call is
+    /// made — "this tool will run unprompted", "this one will ask", "this one
+    /// is blocked" — without reimplementing the rules. It is not a parallel
+    /// implementation of the gate: [`decide`](Self::decide), the function the
+    /// prompt loop enforces with, is built on this exact classification, so
+    /// the two cannot drift apart.
+    ///
+    /// `counts` is how many calls the turn has already made (per-turn caps
+    /// depend on it). For a "would this ask at the start of a turn" UI, pass
+    /// [`TurnCounts::new()`].
+    ///
+    /// The classification is pure and answers from the rules alone; it never
+    /// consults the approval hook. A call the rules admit is
+    /// [`NeedsApproval`](ToolClassification::NeedsApproval) when a hook is
+    /// installed — the hook *will* be asked, and what it will say is not
+    /// knowable without asking it — and
+    /// [`AutoAllow`](ToolClassification::AutoAllow) otherwise.
+    ///
+    /// ```
+    /// use acton_ai::policy::{ToolClassification, ToolPolicy, TurnCounts};
+    ///
+    /// let policy = ToolPolicy::new().deny(["bash"]);
+    /// let counts = TurnCounts::new();
+    ///
+    /// assert!(matches!(
+    ///     policy.classify("bash", &counts),
+    ///     ToolClassification::Deny { .. }
+    /// ));
+    /// assert!(matches!(
+    ///     policy.classify("read_file", &counts),
+    ///     ToolClassification::AutoAllow
+    /// ));
+    /// ```
+    #[must_use]
+    pub fn classify(&self, tool_name: &str, counts: &TurnCounts) -> ToolClassification {
+        if let Err((reason, decided_by)) = evaluate_rules(
+            self.allow.as_deref(),
+            &self.deny,
+            &self.caps,
+            tool_name,
+            counts,
+        ) {
+            return ToolClassification::Deny { reason, decided_by };
+        }
+        if self.hook.is_some() {
+            ToolClassification::NeedsApproval
+        } else {
+            ToolClassification::AutoAllow
+        }
+    }
+
     /// Decides one tool call.
     ///
-    /// Rules first — they are pure and cheap — then the hook, which is only
-    /// consulted for a call the rules admitted. `counts` is *not* updated
-    /// here: the caller records the invocation, so that a call refused by the
-    /// gate does not consume the budget it was refused for.
+    /// Built on [`classify`](Self::classify) — the same function embedders
+    /// query for "will this ask" UI — so the gate and the introspection
+    /// surface can never disagree. Classification first, because it is pure
+    /// and cheap; the hook runs only for a call the rules admitted. `counts`
+    /// is *not* updated here: the caller records the invocation, so that a
+    /// call refused by the gate does not consume the budget it was refused
+    /// for.
     pub(crate) async fn decide(
         &self,
         invocation: ToolInvocation,
         counts: &TurnCounts,
     ) -> GateOutcome {
-        if let Err((reason, decided_by)) = evaluate_rules(
-            self.allow.as_deref(),
-            &self.deny,
-            &self.caps,
-            &invocation.tool_name,
-            counts,
-        ) {
-            return GateOutcome::Deny { reason, decided_by };
-        }
-
-        let Some(hook) = self.hook.as_ref() else {
-            return GateOutcome::Allow {
+        match self.classify(&invocation.tool_name, counts) {
+            ToolClassification::Deny { reason, decided_by } => {
+                GateOutcome::Deny { reason, decided_by }
+            }
+            ToolClassification::AutoAllow => GateOutcome::Allow {
                 arguments: invocation.arguments,
                 decided_by: Decider::Rules,
-            };
-        };
+            },
+            ToolClassification::NeedsApproval => {
+                let Some(hook) = self.hook.as_ref() else {
+                    // Unreachable: `classify` only says NeedsApproval when a
+                    // hook is installed, and `self` is borrowed for the whole
+                    // match. If it ever became reachable, the rules have
+                    // already admitted the call and there is nobody to ask,
+                    // so the rules' admission stands.
+                    return GateOutcome::Allow {
+                        arguments: invocation.arguments,
+                        decided_by: Decider::Rules,
+                    };
+                };
 
-        let proposed = invocation.arguments.clone();
-        match hook.call(invocation).await {
-            ApprovalDecision::Approve => GateOutcome::Allow {
-                arguments: proposed,
-                decided_by: Decider::Callback,
-            },
-            ApprovalDecision::ApproveWith { arguments } => GateOutcome::Allow {
-                arguments,
-                decided_by: Decider::Callback,
-            },
-            ApprovalDecision::Deny { reason } => GateOutcome::Deny {
-                reason: DenialReason::Callback { reason },
-                decided_by: Decider::Callback,
-            },
+                let proposed = invocation.arguments.clone();
+                // `SyncFuture` because `ApprovalFuture` is `dyn Future +
+                // Send` without `Sync`, and holding it bare across this
+                // await would make every turn future that consults a hook
+                // `!Sync` — unusable inside acton-reactive's `Reply::pending`.
+                match sync_wrapper::SyncFuture::new(hook.call(invocation)).await {
+                    ApprovalDecision::Approve => GateOutcome::Allow {
+                        arguments: proposed,
+                        decided_by: Decider::Callback,
+                    },
+                    ApprovalDecision::ApproveWith { arguments } => GateOutcome::Allow {
+                        arguments,
+                        decided_by: Decider::Callback,
+                    },
+                    ApprovalDecision::Deny { reason } => GateOutcome::Deny {
+                        reason: DenialReason::Callback { reason },
+                        decided_by: Decider::Callback,
+                    },
+                }
+            }
         }
     }
+}
+
+/// What the gate would do with one tool call — queryable without making it.
+///
+/// Returned by [`ToolPolicy::classify`]. This is the taxonomy an embedder
+/// needs to render approval state in a UI (an ACP agent daemon marking which
+/// tools will prompt the user, for instance) without maintaining its own copy
+/// of the allowlist/denylist/cap rules.
+///
+/// Marked `#[non_exhaustive]` so a new classification can be added without
+/// breaking downstream `match`es.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolClassification {
+    /// The rules admit the call and no approval hook is installed: it will
+    /// run without asking anyone.
+    AutoAllow,
+    /// The rules admit the call, and the installed approval hook will be
+    /// consulted before it runs. What the hook will say cannot be known
+    /// without asking it — this is the "this will ask" state.
+    NeedsApproval,
+    /// The rules refuse the call; it will not run and the hook will not be
+    /// asked.
+    Deny {
+        /// Why it would be refused.
+        reason: DenialReason,
+        /// Which rule would refuse it.
+        decided_by: Decider,
+    },
 }
 
 /// What the gate decided about one tool call.
@@ -356,6 +452,153 @@ mod tests {
             .on_approval(|_: ToolInvocation| async move { ApprovalDecision::Approve });
         let rendered = format!("{policy:?}");
         assert!(rendered.contains("hook: true"), "{rendered}");
+    }
+
+    /// The gate outcome `decide` produced, reduced to the same taxonomy
+    /// `classify` speaks, so the two can be compared.
+    async fn gate_view(policy: &ToolPolicy, tool: &str, counts: &TurnCounts) -> ToolClassification {
+        match policy.decide(invocation(tool), counts).await {
+            GateOutcome::Allow {
+                decided_by: Decider::Rules,
+                ..
+            } => ToolClassification::AutoAllow,
+            GateOutcome::Allow {
+                decided_by: Decider::Callback,
+                ..
+            } => ToolClassification::NeedsApproval,
+            GateOutcome::Allow { .. } => panic!("the gate admitted with an unexpected decider"),
+            GateOutcome::Deny { reason, decided_by } => {
+                ToolClassification::Deny { reason, decided_by }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn classification_agrees_with_the_gate_for_the_default_case() {
+        let policy = ToolPolicy::new();
+        let counts = TurnCounts::new();
+
+        assert_eq!(
+            policy.classify("anything", &counts),
+            ToolClassification::AutoAllow
+        );
+        assert_eq!(
+            gate_view(&policy, "anything", &counts).await,
+            policy.classify("anything", &counts),
+        );
+    }
+
+    #[tokio::test]
+    async fn classification_agrees_with_the_gate_for_the_allowlist() {
+        let policy = ToolPolicy::new().allow(["read_file"]);
+        let counts = TurnCounts::new();
+
+        for tool in ["read_file", "bash"] {
+            assert_eq!(
+                policy.classify(tool, &counts),
+                gate_view(&policy, tool, &counts).await,
+                "classify and the gate must agree about '{tool}'",
+            );
+        }
+        assert!(matches!(
+            policy.classify("bash", &counts),
+            ToolClassification::Deny {
+                decided_by: Decider::Allowlist,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn classification_agrees_with_the_gate_for_the_denylist() {
+        let policy = ToolPolicy::new().deny(["bash"]);
+        let counts = TurnCounts::new();
+
+        for tool in ["bash", "read_file"] {
+            assert_eq!(
+                policy.classify(tool, &counts),
+                gate_view(&policy, tool, &counts).await,
+                "classify and the gate must agree about '{tool}'",
+            );
+        }
+        assert!(matches!(
+            policy.classify("bash", &counts),
+            ToolClassification::Deny {
+                decided_by: Decider::Denylist,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn classification_agrees_with_the_gate_for_a_per_turn_cap() {
+        let policy = ToolPolicy::new().cap_per_turn("bash", 1);
+        let mut counts = TurnCounts::new();
+
+        // Under the cap: both admit.
+        assert_eq!(
+            policy.classify("bash", &counts),
+            gate_view(&policy, "bash", &counts).await,
+        );
+        assert_eq!(
+            policy.classify("bash", &counts),
+            ToolClassification::AutoAllow
+        );
+
+        // At the cap: both refuse, for the same reason.
+        counts.record("bash");
+        assert_eq!(
+            policy.classify("bash", &counts),
+            gate_view(&policy, "bash", &counts).await,
+        );
+        assert!(matches!(
+            policy.classify("bash", &counts),
+            ToolClassification::Deny {
+                decided_by: Decider::PerTurnCap,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_hook_reads_as_needs_approval_before_the_hook_is_ever_run() {
+        let policy = ToolPolicy::new()
+            .on_approval(|_: ToolInvocation| async move { ApprovalDecision::Approve });
+        let counts = TurnCounts::new();
+
+        // classify never runs the hook, so "needs approval" is knowable
+        // without side effects; the gate, which does run it, lands on the
+        // same call-will-be-asked classification.
+        assert_eq!(
+            policy.classify("bash", &counts),
+            ToolClassification::NeedsApproval
+        );
+        assert_eq!(
+            gate_view(&policy, "bash", &counts).await,
+            ToolClassification::NeedsApproval
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denylisted_tool_is_deny_even_with_a_hook_installed() {
+        // Precedence surfaces in the classification exactly as it does in
+        // the gate: the hook is never the answer for a call the rules refuse.
+        let policy = ToolPolicy::new()
+            .deny(["bash"])
+            .on_approval(|_: ToolInvocation| async move { ApprovalDecision::Approve });
+        let counts = TurnCounts::new();
+
+        assert_eq!(
+            policy.classify("bash", &counts),
+            gate_view(&policy, "bash", &counts).await,
+        );
+        assert!(matches!(
+            policy.classify("bash", &counts),
+            ToolClassification::Deny {
+                decided_by: Decider::Denylist,
+                ..
+            }
+        ));
     }
 
     #[test]
