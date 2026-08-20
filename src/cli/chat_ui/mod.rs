@@ -27,7 +27,9 @@ use crate::conversation::{Conversation, StreamToken};
 use crate::error::ActonAIError;
 use crate::facade::ActonAI;
 use crate::memory::persistence;
-use crate::messages::{LLMStreamStart, LLMStreamToolCall, LLMStreamToolResult, Message};
+use crate::messages::{
+    LLMStreamStart, LLMStreamToolCall, LLMStreamToolResult, Message, PlanUpdated,
+};
 use crate::types::ConversationId;
 
 use self::style::Theme;
@@ -177,6 +179,23 @@ pub async fn run(
         Reply::ready()
     });
 
+    // The model's plan, rendered as a checklist whenever it publishes one.
+    // Same shape as the tool-call handler above: stop the spinner so the
+    // block lands on a clean line, and stay silent on a cancelled turn.
+    let theme_for_plan = theme.clone();
+    let slot_for_plan = spinner_slot.clone();
+    let muted_for_plan = muted.clone();
+    token_actor.mutate_on::<PlanUpdated>(move |_actor, ctx| {
+        if muted_for_plan.load(Ordering::Relaxed) {
+            return Reply::ready();
+        }
+        if let Some(pb) = take_spinner(&slot_for_plan) {
+            pb.finish_and_clear();
+        }
+        tool_render::render_plan(&ctx.message().plan, &theme_for_plan);
+        Reply::ready()
+    });
+
     let theme_for_result = theme.clone();
     let muted_for_result = muted.clone();
     token_actor.mutate_on::<LLMStreamToolResult>(move |_actor, ctx| {
@@ -221,6 +240,7 @@ pub async fn run(
         .handle()
         .subscribe::<LLMStreamToolResult>()
         .await;
+    token_actor.handle().subscribe::<PlanUpdated>().await;
 
     let token_handle = token_actor.start().await;
 

@@ -1173,6 +1173,12 @@ impl PromptBuilder {
 
         // Track executed tool calls and total tokens
         let mut executed_tool_calls = Vec::new();
+        // The turn's current plan, when the model has published one via the
+        // `update_plan` tool. This local is the plan's one owner: it lives
+        // exactly as long as the turn, carries across every round of the tool
+        // loop, and every observer sees it only through the `PlanUpdated`
+        // broadcasts issued below and the final `CollectedResponse::plan`.
+        let mut turn_plan: Option<crate::tools::plan::Plan> = None;
         let mut total_token_count = 0;
         let mut final_text;
         let final_stop_reason;
@@ -1544,6 +1550,31 @@ impl PromptBuilder {
                         let (outcome, executed) =
                             step.run(&mut tools, &mut turn_counts, tool_call).await;
 
+                        // A successful `update_plan` replaces the turn's plan
+                        // and is announced. The decision is entirely
+                        // `plan_from_tool_result`, a pure function: any other
+                        // tool, a failed or refused call, or a result that no
+                        // longer validates yields `None`, so a rejected plan
+                        // never disturbs the one already recorded. Fire-and-
+                        // forget like the events around it — a plan is an
+                        // observation, and a turn must not wait on anyone
+                        // watching it.
+                        if let ToolOutcome::Ran(Ok(value)) = &outcome {
+                            if let Some(plan) =
+                                crate::tools::plan::plan_from_tool_result(&tool_call.name, value)
+                            {
+                                provider_handle
+                                    .broadcast(crate::messages::PlanUpdated {
+                                        turn_id: turn_id.clone(),
+                                        correlation_id: round_correlation_id.clone(),
+                                        tool_call_id: tool_call.id.clone(),
+                                        plan: plan.clone(),
+                                    })
+                                    .await;
+                                turn_plan = Some(plan);
+                            }
+                        }
+
                         executed_tool_calls.push(executed);
                         tool_results.push(outcome);
                     }
@@ -1592,7 +1623,8 @@ impl PromptBuilder {
                 total_token_count,
                 executed_tool_calls,
             )
-            .with_usage(stats.usage),
+            .with_usage(stats.usage)
+            .with_plan(turn_plan),
             captured,
         ))
     }

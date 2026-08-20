@@ -18,6 +18,9 @@
 //! - **bash**: Execute shell commands (sandboxed by default)
 //! - **calculate**: Evaluate mathematical expressions
 //!
+//! ### Coordination Tools
+//! - **update_plan**: Record the plan for the current task and its progress
+//!
 //! ### Web Tools
 //! - **web_fetch**: Fetch content from URLs
 //!
@@ -72,6 +75,7 @@ mod glob;
 mod grep;
 mod list_directory;
 mod read_file;
+mod update_plan;
 mod web_fetch;
 mod write_file;
 
@@ -90,6 +94,7 @@ pub use glob::{GlobTool, GlobToolActor};
 pub use grep::{GrepTool, GrepToolActor};
 pub use list_directory::{ListDirectoryTool, ListDirectoryToolActor};
 pub use read_file::{ReadFileTool, ReadFileToolActor};
+pub use update_plan::{UpdatePlanTool, UpdatePlanToolActor};
 pub use web_fetch::{WebFetchTool, WebFetchToolActor};
 pub use write_file::{WriteFileTool, WriteFileToolActor};
 
@@ -160,6 +165,11 @@ impl BuiltinTools {
             GetContextRemainingTool::config(),
             Box::new(GetContextRemainingTool::new()),
         );
+        registry.register(
+            "update_plan",
+            UpdatePlanTool::config(),
+            Box::new(UpdatePlanTool::new()),
+        );
 
         registry
     }
@@ -220,6 +230,7 @@ impl BuiltinTools {
             "calculate",
             "web_fetch",
             GET_CONTEXT_REMAINING_TOOL,
+            "update_plan",
         ]
     }
 
@@ -341,6 +352,11 @@ pub async fn spawn_tool_actor(
             let definition = GetContextRemainingToolActor::definition();
             Ok((handle, definition))
         }
+        "update_plan" => {
+            let handle = UpdatePlanToolActor::spawn(runtime).await;
+            let definition = UpdatePlanToolActor::definition();
+            Ok((handle, definition))
+        }
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -366,6 +382,7 @@ pub fn get_tool_definition(tool_name: &str) -> Result<ToolDefinition, ToolError>
         "calculate" => Ok(CalculateToolActor::definition()),
         "web_fetch" => Ok(WebFetchToolActor::definition()),
         GET_CONTEXT_REMAINING_TOOL => Ok(GetContextRemainingToolActor::definition()),
+        "update_plan" => Ok(UpdatePlanToolActor::definition()),
         _ => Err(ToolError::not_found(tool_name)),
     }
 }
@@ -425,7 +442,7 @@ mod tests {
     #[test]
     fn builtin_tools_all_creates_all_tools() {
         let tools = BuiltinTools::all();
-        assert_eq!(tools.len(), 10);
+        assert_eq!(tools.len(), 11);
 
         for name in BuiltinTools::available() {
             assert!(
@@ -458,7 +475,7 @@ mod tests {
     #[test]
     fn builtin_tools_available_returns_all_names() {
         let names = BuiltinTools::available();
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
 
         assert!(names.contains(&"read_file"));
         assert!(names.contains(&"write_file"));
@@ -470,20 +487,21 @@ mod tests {
         assert!(names.contains(&"calculate"));
         assert!(names.contains(&"web_fetch"));
         assert!(names.contains(&GET_CONTEXT_REMAINING_TOOL));
+        assert!(names.contains(&"update_plan"));
     }
 
     #[test]
     fn builtin_tools_configs_iterator() {
         let tools = BuiltinTools::all();
         let configs: Vec<_> = tools.configs().collect();
-        assert_eq!(configs.len(), 10);
+        assert_eq!(configs.len(), 11);
     }
 
     #[test]
     fn builtin_tools_executors_iterator() {
         let tools = BuiltinTools::all();
         let executors: Vec<_> = tools.executors().collect();
-        assert_eq!(executors.len(), 10);
+        assert_eq!(executors.len(), 11);
     }
 
     #[test]

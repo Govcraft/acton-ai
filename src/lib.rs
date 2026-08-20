@@ -176,10 +176,11 @@ pub mod prelude {
         StubEmbeddingProvider, TruncationStrategy,
     };
     pub use crate::messages::*;
-    pub use crate::tools::builtins::BuiltinTools;
+    pub use crate::tools::builtins::{BuiltinTools, UpdatePlanTool, UpdatePlanToolActor};
     pub use crate::tools::{
-        RegisterTool, Tool, ToolConfig, ToolDefinition, ToolError, ToolErrorKind,
-        ToolExecutorTrait, ToolFuture, ToolRegistry,
+        plan_from_tool_result, Plan, PlanError, PlanNote, PlanStep, PlanStepStatus, PlanStepTitle,
+        PlanTextError, RawPlanStep, RegisterTool, Tool, ToolConfig, ToolDefinition, ToolError,
+        ToolErrorKind, ToolExecutorTrait, ToolFuture, ToolRegistry, UPDATE_PLAN_TOOL,
     };
 
     /// The [`#[tool]`](macro@crate::tool) attribute macro.

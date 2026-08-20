@@ -107,7 +107,7 @@ Key types:
 The tool system. Provides infrastructure for tool registration, execution, and sandboxing. Tools can be registered globally (via `ToolRegistry`) or per-agent (via `ToolActor`). The per-agent approach is recommended because each tool actor is supervised as a child of its owning agent.
 
 Key submodules:
-- `builtins/` -- pre-built tools (read_file, write_file, edit_file, list_directory, glob, grep, bash, calculate, web_fetch)
+- `builtins/` -- pre-built tools (read_file, write_file, edit_file, list_directory, glob, grep, bash, calculate, web_fetch, update_plan)
 - `sandbox/` -- `Sandbox`/`SandboxFactory` traits plus the `process/` implementation (re-exec + rlimits + optional landlock/seccomp). See [Process Sandbox](/docs/sandbox).
 - `security/` -- path validation and sanitization (`PathValidator`)
 - `actor.rs` -- per-agent `ToolActor` implementation and the `ToolExecutor` trait

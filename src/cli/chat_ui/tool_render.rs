@@ -8,6 +8,7 @@
 
 use crate::cli::chat_ui::style::Theme;
 use crate::messages::ToolCall;
+use crate::tools::plan::{Plan, PlanStepStatus};
 
 /// Maximum printed width of the args preview line before truncation.
 const ARGS_PREVIEW_MAX: usize = 120;
@@ -51,6 +52,50 @@ pub fn render_tool_result(tool_name: &str, success: bool, summary: &str, theme: 
             tool_name = tool_name,
             summary = summary,
         );
+    }
+}
+
+/// Render the model's current plan as an indented checklist.
+///
+/// Printed whenever a `PlanUpdated` broadcast lands: a header line with the
+/// progress count (and the model's note, when it wrote one), then one line per
+/// step. The in-progress step renders in the accent colour so the eye finds
+/// "what is it doing right now" without reading the whole list.
+pub fn render_plan(plan: &Plan, theme: &Theme) {
+    let reset = if theme.colors_enabled { "\x1b[0m" } else { "" };
+    let note = plan
+        .note()
+        .map(|note| format!("  {note}"))
+        .unwrap_or_default();
+    println!(
+        "\n{dim}[plan {done}/{total}]{note}{reset}",
+        dim = theme.dim_open,
+        done = plan.completed_count(),
+        total = plan.step_count(),
+        note = note,
+        reset = theme.dim_close,
+    );
+    for step in plan.steps() {
+        match step.status() {
+            PlanStepStatus::Completed => println!(
+                "  {dim}[x] {title}{reset}",
+                dim = theme.dim_open,
+                title = step.title(),
+                reset = theme.dim_close,
+            ),
+            PlanStepStatus::InProgress => println!(
+                "  {accent}[>] {title}{reset}",
+                accent = theme.accent_open,
+                title = step.title(),
+                reset = reset,
+            ),
+            PlanStepStatus::Pending => println!(
+                "  {dim}[ ] {title}{reset}",
+                dim = theme.dim_open,
+                title = step.title(),
+                reset = theme.dim_close,
+            ),
+        }
     }
 }
 
