@@ -81,7 +81,7 @@ pub const DEFAULT_DRAIN_TIMEOUT_SECS: u64 = 300;
 /// Polling, because the wire protocol is request/response — there is no
 /// "tell me when you are done" message, and adding one would put a
 /// long-lived subscription in the path of a shutdown.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 const DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Executes `acton-ai status`.
@@ -247,7 +247,7 @@ fn list_sockets(dir: &Path) -> Vec<PathBuf> {
 }
 
 /// Renders an acknowledgement of a state change.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 fn write_ack(
     output: &OutputWriter,
     ack: &crate::introspection::AdmissionAck,
@@ -268,7 +268,7 @@ fn write_ack(
 }
 
 /// Renders a status report in whichever form was asked for.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 fn write_status(
     output: &OutputWriter,
     report: &crate::introspection::StatusReport,
@@ -285,7 +285,7 @@ fn write_status(
 }
 
 /// Renders a status report for a human.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 fn write_status_plain(
     output: &OutputWriter,
     report: &crate::introspection::StatusReport,
@@ -383,7 +383,7 @@ fn write_status_plain(
 ///
 /// Only the plain renderer needs this; `--json` reports raw seconds, because
 /// a machine consumer should never have to parse "1d 1h 1m" back apart.
-#[cfg(any(feature = "ipc", test))]
+#[cfg(any(all(feature = "ipc", unix), test))]
 fn format_uptime(secs: u64) -> String {
     let days = secs / 86_400;
     let hours = (secs % 86_400) / 3_600;
@@ -402,7 +402,7 @@ fn format_uptime(secs: u64) -> String {
 }
 
 /// The client half of the wire protocol.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 mod client {
     use super::{CliError, Path, DRAIN_POLL_INTERVAL};
     use crate::cli::output::{OutputMode, OutputWriter};
@@ -566,7 +566,7 @@ mod client {
     }
 }
 
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 use client::{ask_drain, ask_pause, ask_resume, ask_status, wait_for_drain};
 
 /// The stand-ins a build without the `ipc` feature gets.
@@ -575,7 +575,7 @@ use client::{ask_drain, ask_pause, ask_resume, ask_status, wait_for_drain};
 /// who types `acton-ai status` and is told "unknown subcommand" learns
 /// nothing, while one told the binary was built without the feature knows
 /// exactly what to do next.
-#[cfg(not(feature = "ipc"))]
+#[cfg(not(all(feature = "ipc", unix)))]
 mod stub {
     use super::{CliError, OutputWriter, Path};
 
@@ -620,18 +620,18 @@ mod stub {
     pub(super) enum Unsupported {}
 }
 
-#[cfg(not(feature = "ipc"))]
+#[cfg(not(all(feature = "ipc", unix)))]
 use stub::{ask_drain, ask_pause, ask_resume, ask_status, wait_for_drain, Unsupported};
 
 /// Statically unreachable: `ask_*` never returns an [`Unsupported`], so this
 /// exists only to keep the command bodies identical across both builds.
-#[cfg(not(feature = "ipc"))]
+#[cfg(not(all(feature = "ipc", unix)))]
 fn write_ack(_output: &OutputWriter, ack: &Unsupported, _summary: &str) -> Result<(), CliError> {
     match *ack {}
 }
 
 /// Statically unreachable, for the same reason as [`write_ack`].
-#[cfg(not(feature = "ipc"))]
+#[cfg(not(all(feature = "ipc", unix)))]
 fn write_status(_output: &OutputWriter, report: &Unsupported) -> Result<(), CliError> {
     match *report {}
 }

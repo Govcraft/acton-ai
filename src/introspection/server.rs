@@ -185,7 +185,7 @@ pub(crate) fn ensure_socket_dir(socket_path: &Path) -> Result<(), ActonAIError> 
 /// Returns a configuration error when the exposed name is already taken, or
 /// when the socket cannot be bound — most often because another process is
 /// already listening on the same path.
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 pub(crate) async fn start_listener(
     runtime: &mut acton_reactive::prelude::ActorRuntime,
     handle: acton_reactive::prelude::ActorHandle,

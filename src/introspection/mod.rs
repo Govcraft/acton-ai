@@ -67,17 +67,17 @@ pub mod admission;
 pub mod sd_notify;
 pub mod server;
 
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 pub mod actor;
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 pub mod wire;
 
 pub use admission::{AdmissionGate, AdmissionState};
 pub use server::{default_socket_dir, resolve_socket_path, SOCKET_MODE};
 
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 pub use actor::IntrospectionActor;
-#[cfg(feature = "ipc")]
+#[cfg(all(feature = "ipc", unix))]
 pub use wire::{
     AdmissionAck, BudgetStanding, Drain, GetStatus, McpServerStatus, Pause, ProviderStatus, Resume,
     StatusReport, UsageSummary, INTROSPECTION_ACTOR_NAME, SCHEMA_VERSION,
@@ -184,7 +184,7 @@ impl IntrospectionConfig {
 /// Kept here rather than inline at the call site so the message stays in the
 /// module that owns the feature, and so the feature-off test can assert on
 /// exactly what an operator will read.
-#[cfg(not(feature = "ipc"))]
+#[cfg(not(all(feature = "ipc", unix)))]
 pub(crate) fn unsupported_error() -> crate::error::ActonAIError {
     crate::error::ActonAIError::configuration(
         "introspection",

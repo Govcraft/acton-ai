@@ -148,6 +148,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Windows builds no longer break on the default feature set.** The `ipc`
+  feature (the Unix-socket introspection transport) is now a no-op on
+  non-Unix targets instead of a hard compile error from acton-reactive:
+  the upstream `ipc` feature is enabled through a `cfg(unix)` dependency
+  entry, and every `ipc`-gated code site now gates on
+  `all(feature = "ipc", unix)`. Same philosophy as `sandbox-hardening`,
+  which has always been a no-op off Linux.
 - **A refused resume can no longer reopen a finished turn.** Marking a failed
   turn's checkpoint now leaves terminal records — `Completed`, `Abandoned` —
   exactly as they are, so a pre-flight refusal (changed inputs, an abandoned

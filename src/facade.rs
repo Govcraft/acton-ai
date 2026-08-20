@@ -256,7 +256,7 @@ pub(crate) struct IntrospectionRuntime {
     pub(crate) socket_path: std::path::PathBuf,
     /// Behind a `Mutex` because shutdown runs through a shared `Arc`, and
     /// stopping the listener needs ownership of the handle.
-    #[cfg(feature = "ipc")]
+    #[cfg(all(feature = "ipc", unix))]
     listener: std::sync::Mutex<Option<acton_reactive::ipc::IpcListenerHandle>>,
 }
 
@@ -268,7 +268,7 @@ impl IntrospectionRuntime {
     /// answer `acton-ai status` with a connection that hangs or a routing
     /// error, which is a worse answer than a closed socket.
     pub(crate) fn shutdown(&self) {
-        #[cfg(feature = "ipc")]
+        #[cfg(all(feature = "ipc", unix))]
         {
             let taken = self.listener.lock().ok().and_then(|mut slot| slot.take());
             if let Some(listener) = taken {
@@ -2942,7 +2942,7 @@ impl ActonAIBuilder {
             },
         };
 
-        #[cfg(not(feature = "ipc"))]
+        #[cfg(not(all(feature = "ipc", unix)))]
         if resolved.is_some() {
             return Err(crate::introspection::unsupported_error());
         }
@@ -3466,7 +3466,7 @@ async fn start_introspection(
     let socket_path = crate::introspection::resolve_socket_path(config, app_name);
     crate::introspection::server::ensure_socket_dir(&socket_path)?;
 
-    #[cfg(feature = "ipc")]
+    #[cfg(all(feature = "ipc", unix))]
     {
         let sources = crate::introspection::actor::StatusSources {
             providers: providers.clone(),
@@ -3504,7 +3504,7 @@ async fn start_introspection(
     // section without the feature, so no config ever reaches here. Written out
     // rather than `unreachable!()` so a future caller cannot turn a wiring
     // mistake into a panic in someone's production process.
-    #[cfg(not(feature = "ipc"))]
+    #[cfg(not(all(feature = "ipc", unix)))]
     {
         let _ = (
             runtime,
@@ -4432,7 +4432,7 @@ mod tests {
         ai.shutdown().await.expect("shutdown");
     }
 
-    #[cfg(feature = "ipc")]
+    #[cfg(all(feature = "ipc", unix))]
     #[tokio::test]
     async fn an_introspection_socket_is_bound_owner_only_and_removed_on_shutdown() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4487,7 +4487,7 @@ mod tests {
         restarted.shutdown().await.expect("shutdown");
     }
 
-    #[cfg(feature = "ipc")]
+    #[cfg(all(feature = "ipc", unix))]
     #[tokio::test]
     async fn a_second_runtime_cannot_take_over_a_live_socket() {
         let dir = tempfile::tempdir().expect("temp dir");
@@ -4557,7 +4557,7 @@ mod tests {
         ai.shutdown().await.expect("shutdown");
     }
 
-    #[cfg(feature = "ipc")]
+    #[cfg(all(feature = "ipc", unix))]
     #[tokio::test]
     async fn a_builder_introspection_call_replaces_the_toml_section_wholesale() {
         // The TOML section names a socket mode that would be refused. If the
@@ -4611,7 +4611,7 @@ mod tests {
     /// The mirror of the telemetry case, and for the same reason: an operator
     /// whose `acton-ai status` finds nothing needs to be told the binary
     /// cannot listen, not left debugging the socket.
-    #[cfg(not(feature = "ipc"))]
+    #[cfg(not(all(feature = "ipc", unix)))]
     #[tokio::test]
     async fn launch_fails_when_introspection_is_configured_without_the_ipc_feature() {
         let config = crate::config::from_str(

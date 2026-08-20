@@ -54,7 +54,13 @@ otel = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp"]
 # Admission control itself (`ActonAI::pause`/`resume`/`drain`) is always
 # compiled: it is ordinary in-process state, not IPC, and an embedder that
 # builds without `ipc` still gets it.
-ipc = ["acton-reactive/ipc"]
+#
+# Unix only, like `sandbox-hardening`: the transport is a Unix domain socket,
+# so on non-Unix targets the feature is a no-op rather than a build error.
+# The feature itself is a pure marker; acton-reactive's `ipc` feature is
+# switched on by the `cfg(unix)` dependency entry below, so the default set
+# still builds on Windows. Code sites gate on `all(feature = "ipc", unix)`.
+ipc = []
 # Selects the TLS stack. Exactly one of `tls-ring` and `fips` should be on:
 # both compile, but linking two crypto libraries into a build that exists to
 # claim it uses only one defeats the point of claiming it.
@@ -180,3 +186,7 @@ seccompiler = { version = "0.5.0", optional = true }
 
 [target."cfg(unix)".dependencies]
 nix = { version = "0.31.2", features = ["signal", "user"] }
+# Redeclaring acton-reactive here layers the `ipc` feature onto the
+# unconditional dependency above for Unix targets only: upstream, `ipc` is a
+# hard compile error on Windows (Unix domain sockets).
+acton-reactive = { version = "9.2", features = ["ipc"] }

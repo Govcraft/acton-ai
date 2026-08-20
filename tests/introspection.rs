@@ -25,7 +25,7 @@
 //! Without the second barrier these tests would pass on a fast machine and
 //! flake on a loaded one, which is the worst of both worlds.
 
-#![cfg(feature = "ipc")]
+#![cfg(all(feature = "ipc", unix))]
 
 mod mock_llm;
 
