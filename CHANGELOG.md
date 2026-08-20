@@ -65,6 +65,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **The stream callbacks take an identity.** `.on_start(..)` now receives
+  `&StreamContext` where it previously took no arguments, and `.on_end(..)`
+  receives `(&StreamContext, StopReason)` where it previously took only the
+  stop reason. **Existing callers must add the parameter**, typically
+  `.on_start(|_ctx| ..)` and `.on_end(|_ctx, reason| ..)`. `.on_token(..)` is
+  deliberately unchanged and still takes `&str`: it fires per token, where an
+  identity that is constant for the whole round would be repeated noise.
+- `TurnLifecycle` and its struct variants are now `#[non_exhaustive]`, so a
+  downstream `match` needs a wildcard arm. These are observation events and
+  later additions should not be breaking changes.
 - TLS backend selection moved behind features. The ordinary *ring* stack is
   now the `tls-ring` feature and is part of the default set, so a default
   build is unchanged. **A `--no-default-features` build that relied on TLS
