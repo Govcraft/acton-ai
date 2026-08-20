@@ -208,6 +208,15 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
+    /// An absolute path that exists on no platform. A bare `/nonexistent`
+    /// would not even be absolute on Windows (no drive prefix) and would
+    /// fail validation before path resolution.
+    fn missing_path() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join("acton-ai-definitely-missing")
+            .join("target")
+    }
+
     #[tokio::test]
     async fn glob_finds_files() {
         let dir = TempDir::new().unwrap();
@@ -319,7 +328,7 @@ mod tests {
         let result = tool
             .execute(json!({
                 "pattern": "*.txt",
-                "path": "/nonexistent/directory"
+                "path": missing_path()
             }))
             .await;
 

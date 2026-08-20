@@ -265,6 +265,8 @@ mod tests {
         );
     }
 
+    // Needs a real POSIX bash on PATH, which Windows does not guarantee.
+    #[cfg(unix)]
     #[test]
     fn dispatch_bash_echo_succeeds() {
         let req = Request {

@@ -422,7 +422,7 @@ async fn a_toml_audit_section_arms_the_trail() {
     .await;
 
     let toml = format!(
-        "{}\n[audit]\npath = \"{}\"\n",
+        "{}\n[audit]\npath = '{}'\n",
         mock_llm::provider_toml("mock", &server, "mock-model"),
         path.display()
     );
