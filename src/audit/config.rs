@@ -192,7 +192,9 @@ mod tests {
         std::fs::write(&path, "existing entry\n").expect("writes");
         let config = AuditConfig::new(&path);
 
-        config.ensure_trail_exists().expect("re-arming must succeed");
+        config
+            .ensure_trail_exists()
+            .expect("re-arming must succeed");
 
         assert_eq!(
             std::fs::read_to_string(&path).expect("readable"),
