@@ -1008,6 +1008,16 @@ pub struct NamedProviderConfig {
     #[serde(default)]
     pub api_key_env: Option<String>,
 
+    /// Path to a file whose contents are the API key.
+    ///
+    /// Read when the key is resolved; surrounding whitespace is trimmed, so a
+    /// trailing newline is harmless. A leading `~/` expands to the user's
+    /// home directory. Suits keys provisioned as secret files (systemd
+    /// credentials, a login command writing `~/.config/<app>/key`) where an
+    /// environment variable would leak into every child process.
+    #[serde(default)]
+    pub api_key_file: Option<PathBuf>,
+
     /// Custom base URL for the API.
     ///
     /// Required for Ollama and custom OpenAI-compatible endpoints.
@@ -1149,6 +1159,19 @@ impl PricingFileConfig {
     }
 }
 
+/// Expands a leading `~/` to the user's home directory.
+///
+/// Only the bare `~` component expands; `~user` forms pass through
+/// untouched, as does everything when `HOME` is unset.
+fn expand_home(path: &std::path::Path) -> PathBuf {
+    if let Ok(stripped) = path.strip_prefix("~") {
+        if let Some(home) = std::env::var_os("HOME") {
+            return PathBuf::from(home).join(stripped);
+        }
+    }
+    path.to_path_buf()
+}
+
 impl NamedProviderConfig {
     /// Creates a new Anthropic provider configuration.
     #[must_use]
@@ -1158,6 +1181,7 @@ impl NamedProviderConfig {
             model: model.into(),
             api_key: None,
             api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+            api_key_file: None,
             base_url: None,
             timeout_secs: None,
             max_tokens: None,
@@ -1185,6 +1209,7 @@ impl NamedProviderConfig {
             model: model.into(),
             api_key: None,
             api_key_env: Some("OPENAI_API_KEY".to_string()),
+            api_key_file: None,
             base_url: None,
             timeout_secs: None,
             max_tokens: None,
@@ -1212,6 +1237,7 @@ impl NamedProviderConfig {
             model: model.into(),
             api_key: None,
             api_key_env: None,
+            api_key_file: None,
             base_url: Some("http://localhost:11434/v1".to_string()),
             timeout_secs: Some(300),
             max_tokens: None,
@@ -1245,6 +1271,13 @@ impl NamedProviderConfig {
     #[must_use]
     pub fn with_api_key(mut self, key: impl Into<String>) -> Self {
         self.api_key = Some(key.into());
+        self
+    }
+
+    /// Sets the file the API key is read from.
+    #[must_use]
+    pub fn with_api_key_file(mut self, path: impl Into<PathBuf>) -> Self {
+        self.api_key_file = Some(path.into());
         self
     }
 
@@ -1319,8 +1352,9 @@ impl NamedProviderConfig {
     /// Resolution order:
     /// 1. `api_key_env` - read from environment variable
     /// 2. Standard env var based on type (ANTHROPIC_API_KEY, OPENAI_API_KEY)
-    /// 3. `api_key` - direct value in config (discouraged)
-    /// 4. Empty string (for Ollama/local providers)
+    /// 3. `api_key_file` - read from a file, trimmed
+    /// 4. `api_key` - direct value in config (discouraged)
+    /// 5. Empty string (for Ollama/local providers)
     #[must_use]
     pub fn resolve_api_key(&self) -> String {
         // Try explicit env var first
@@ -1343,6 +1377,27 @@ impl NamedProviderConfig {
             if let Ok(key) = std::env::var(env_var) {
                 if !key.is_empty() {
                     return key;
+                }
+            }
+        }
+
+        // Try a key file before the inline key: a file can be rotated and
+        // permission-guarded; an inline value cannot.
+        if let Some(ref path) = self.api_key_file {
+            let resolved = expand_home(path);
+            match std::fs::read_to_string(&resolved) {
+                Ok(contents) => {
+                    let key = contents.trim();
+                    if !key.is_empty() {
+                        return key.to_string();
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        path = %resolved.display(),
+                        %error,
+                        "api_key_file could not be read; trying the remaining sources"
+                    );
                 }
             }
         }
@@ -1899,6 +1954,59 @@ mod tests {
         let key = config.resolve_api_key();
         // The actual value depends on environment, but the logic is tested
         assert!(!key.is_empty() || config.api_key.is_some());
+    }
+
+    #[test]
+    fn named_provider_config_resolve_api_key_from_file() {
+        let path = std::env::temp_dir().join("acton-ai-key-file-test");
+        std::fs::write(&path, "sk-from-file\n").unwrap();
+
+        // Ollama has no env var sources, so the file is the first hit.
+        let config = NamedProviderConfig::ollama("test").with_api_key_file(&path);
+        assert_eq!(config.resolve_api_key(), "sk-from-file");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn an_unreadable_key_file_falls_back_to_the_inline_key() {
+        let config = NamedProviderConfig::ollama("test")
+            .with_api_key_file("/nonexistent/acton-ai-key")
+            .with_api_key("inline");
+
+        assert_eq!(config.resolve_api_key(), "inline");
+    }
+
+    #[test]
+    fn a_blank_key_file_falls_back_to_the_inline_key() {
+        let path = std::env::temp_dir().join("acton-ai-blank-key-file-test");
+        std::fs::write(&path, "  \n").unwrap();
+
+        let config = NamedProviderConfig::ollama("test")
+            .with_api_key_file(&path)
+            .with_api_key("inline");
+        assert_eq!(config.resolve_api_key(), "inline");
+
+        std::fs::remove_file(&path).unwrap();
+    }
+
+    #[test]
+    fn expand_home_rewrites_only_the_bare_tilde() {
+        let home = std::env::var_os("HOME").expect("tests run with HOME set");
+        let expected = PathBuf::from(&home).join("keys/anthropic");
+
+        assert_eq!(
+            expand_home(std::path::Path::new("~/keys/anthropic")),
+            expected
+        );
+        assert_eq!(
+            expand_home(std::path::Path::new("/etc/keys/anthropic")),
+            PathBuf::from("/etc/keys/anthropic")
+        );
+        assert_eq!(
+            expand_home(std::path::Path::new("~other/keys")),
+            PathBuf::from("~other/keys")
+        );
     }
 
     #[test]
