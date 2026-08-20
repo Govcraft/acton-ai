@@ -648,15 +648,63 @@ impl ActonAI {
         self.inner.context_window.as_ref()
     }
 
-    /// Returns the sandbox factory shared by sandboxed builtin tool calls.
+    /// Returns a handle that executes tools under this runtime's sandbox.
     ///
-    /// Populated when the builder was configured with
+    /// `Some` when the builder was configured with
     /// [`with_process_sandbox`](ActonAIBuilder::with_process_sandbox) or
     /// [`with_process_sandbox_config`](ActonAIBuilder::with_process_sandbox_config)
-    /// (or an equivalent TOML `[sandbox]` section). Returns `None` otherwise.
+    /// (or an equivalent TOML `[sandbox]` section); `None` otherwise. The
+    /// handle shares the runtime's factory, so what it executes is isolated
+    /// exactly as a sandboxed builtin would be.
+    ///
+    /// This exists for embedders that implement their own tool executors —
+    /// an ACP agent daemon wrapping builtin execution with its own approval
+    /// protocol, say — and need to run the underlying work on the same
+    /// sandbox path `.use_builtins()` uses, rather than losing isolation by
+    /// calling executors in-process. For wrapping one specific builtin,
+    /// [`builtin_executor`](Self::builtin_executor) already pairs the tool
+    /// with this decision.
+    ///
+    /// Note that a sandbox configured here re-execs the **current binary**;
+    /// an embedder's `main` must call
+    /// [`runner::run_if_sandbox_child`](crate::tools::sandbox::process::runner::run_if_sandbox_child)
+    /// first thing, as documented there.
     #[must_use]
-    pub(crate) fn sandbox_factory(&self) -> Option<&Arc<dyn SandboxFactory>> {
-        self.inner.sandbox_factory.as_ref()
+    pub fn sandboxed_execution(&self) -> Option<crate::tools::sandbox::SandboxedExecution> {
+        self.inner
+            .sandbox_factory
+            .as_ref()
+            .map(|factory| crate::tools::sandbox::SandboxedExecution::new(Arc::clone(factory)))
+    }
+
+    /// Returns the named builtin's execution path, sandbox routing included.
+    ///
+    /// `None` when builtins were not configured on this runtime or the name
+    /// is not among them. The returned executor makes the same decision
+    /// `.use_builtins()` makes for the prompt loop — and is in fact what the
+    /// prompt loop registers — so a tool configured `sandboxed` on a runtime
+    /// with a sandbox routes through it, and everything else runs in-process.
+    ///
+    /// This exists for embedders that wrap builtin execution (approval
+    /// flows, protocol adapters, extra logging) while keeping the sandboxing
+    /// the runtime would have applied. Note that the prompt loop's
+    /// tool-approval gate and audit trail wrap *registered* tools: a wrapper
+    /// registered on a prompt keeps both, a direct
+    /// [`call`](crate::tools::builtins::BuiltinExecutor::call) outside the
+    /// loop deliberately has neither.
+    #[must_use]
+    pub fn builtin_executor(&self, name: &str) -> Option<crate::tools::builtins::BuiltinExecutor> {
+        let builtins = self.inner.builtins.as_ref()?;
+        let config = builtins.get_config(name)?;
+        let executor = builtins.get_executor(name)?;
+        let sandbox = if config.sandboxed {
+            self.sandboxed_execution()
+        } else {
+            None
+        };
+        Some(crate::tools::builtins::BuiltinExecutor::new(
+            name, executor, sandbox,
+        ))
     }
 
     /// Returns the MCP tools discovered at launch, if any server is configured.
@@ -2731,7 +2779,10 @@ impl ActonAIBuilder {
         };
 
         if let Some(ref config) = resolved {
-            config.ensure_parent_dir()?;
+            // Creates the trail as well as its directory: an armed trail that
+            // has recorded nothing must be an empty file, or `audit verify`
+            // reports a missing trail while `audit_head()` reports genesis.
+            config.ensure_trail_exists()?;
         }
 
         Ok(resolved)

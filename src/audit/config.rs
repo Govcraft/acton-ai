@@ -75,6 +75,49 @@ impl AuditConfig {
             )
         })
     }
+
+    /// Makes sure the trail itself exists, creating an empty one if it does
+    /// not.
+    ///
+    /// Called once at launch, and it is what makes an *absent* trail
+    /// meaningful. Without it, "the file is not there" is ambiguous between
+    /// an armed runtime that has simply not recorded anything yet and a trail
+    /// somebody deleted — and the two readers of the chain disagree about
+    /// which: [`ActonAI::audit_head`](crate::ActonAI::audit_head) answers with
+    /// the genesis head while `acton-ai audit verify` cannot find a file to
+    /// read. Creating it up front collapses that ambiguity: an armed but idle
+    /// trail is an empty file that verifies as genesis, and a missing file
+    /// means somebody removed it.
+    ///
+    /// It also moves an unwritable destination to launch time, which is the
+    /// same reason [`ensure_parent_dir`](Self::ensure_parent_dir) runs there:
+    /// a trail that cannot be written is a configuration failure, not
+    /// something to discover one entry at a time.
+    ///
+    /// An existing trail is left exactly as it is — this never truncates.
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if the parent directory cannot be
+    /// created or the trail cannot be opened for appending.
+    pub fn ensure_trail_exists(&self) -> Result<(), ActonAIError> {
+        self.ensure_parent_dir()?;
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&self.path)
+            .map(|_| ())
+            .map_err(|error| {
+                ActonAIError::configuration(
+                    "audit.path",
+                    format!(
+                        "could not open the audit trail {} for appending: {error}",
+                        self.path.display()
+                    ),
+                )
+            })
+    }
 }
 
 /// Where the trail goes when `[audit]` names no path.
@@ -118,6 +161,64 @@ mod tests {
     fn ensure_parent_dir_is_content_with_a_bare_file_name() {
         let config = AuditConfig::new("audit.jsonl");
         assert!(config.ensure_parent_dir().is_ok());
+    }
+
+    #[test]
+    fn ensure_trail_exists_creates_an_empty_trail() {
+        // An armed-but-idle trail must be an empty file rather than no file,
+        // or `audit verify` reports a missing trail while the runtime reports
+        // a perfectly good genesis head.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("nested").join("audit.jsonl");
+        let config = AuditConfig::new(&path);
+
+        config.ensure_trail_exists().expect("arming must succeed");
+
+        assert!(path.is_file(), "the trail must exist after arming");
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            "",
+            "a fresh trail must be empty, not seeded"
+        );
+    }
+
+    #[test]
+    fn ensure_trail_exists_never_truncates_an_existing_trail() {
+        // The chain is append-only. Re-arming on restart must not erase what
+        // the previous run recorded — that would be the framework itself
+        // destroying the evidence.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        std::fs::write(&path, "existing entry\n").expect("writes");
+        let config = AuditConfig::new(&path);
+
+        config
+            .ensure_trail_exists()
+            .expect("re-arming must succeed");
+
+        assert_eq!(
+            std::fs::read_to_string(&path).expect("readable"),
+            "existing entry\n"
+        );
+    }
+
+    #[test]
+    fn ensure_trail_exists_reports_an_unwritable_destination() {
+        // A directory where the trail should be is a configuration mistake
+        // that must fail the launch, not every append.
+        let dir = tempfile::tempdir().expect("a temp dir");
+        let path = dir.path().join("audit.jsonl");
+        std::fs::create_dir(&path).expect("a directory in the trail's place");
+        let config = AuditConfig::new(&path);
+
+        let error = config
+            .ensure_trail_exists()
+            .expect_err("a directory cannot be appended to");
+
+        assert!(
+            error.to_string().contains("audit trail"),
+            "the error must name what failed, got: {error}"
+        );
     }
 
     #[test]

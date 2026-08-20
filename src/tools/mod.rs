@@ -92,6 +92,7 @@ pub use crate::messages::ToolDefinition;
 pub use actor::{
     ExecuteToolDirect, ToolActor, ToolActorResponse, ToolExecutor as ToolExecutorAsync,
 };
+pub use builtins::BuiltinExecutor;
 pub use definition::{BoxedToolExecutor, ToolConfig, ToolExecutionFuture, ToolExecutorTrait};
 pub use error::{ToolError, ToolErrorKind};
 pub use executor::{Execute, InitExecutor, ToolExecutor};
@@ -99,7 +100,9 @@ pub use registry::{
     InitToolRegistry, ListTools, RegisterTool, RegisteredTool, RegistryMetrics,
     RegistryMetricsSnapshot, ToolListResponse, ToolRegistry, UnregisterTool,
 };
-pub use sandbox::{Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture};
+pub use sandbox::{
+    Sandbox, SandboxExecutionFuture, SandboxFactory, SandboxFactoryFuture, SandboxedExecution,
+};
 pub use security::{PathValidationError, PathValidator};
 pub use tool_trait::{Tool, ToolFuture};
 

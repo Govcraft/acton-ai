@@ -26,7 +26,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the result summary is redacted too, so a tool that echoes its input cannot
   launder a secret past the argument redaction. A restarted process resumes
   the chain it already has, and refuses to start on a file that does not
-  verify. Configured with `[audit]` or `.audit_to(..)`; off by default.
+  verify. An armed trail exists on disk from launch — empty, verifying as
+  the genesis head — so a missing file always means somebody removed it.
+  Configured with `[audit]` or `.audit_to(..)`; off by default.
 - **`acton-ai audit verify`.** Walks the chain and reports the first broken
   link, with `--file` and the global `--json`. Exit code 3 when the chain does
   not hold, distinct from the generic runtime error, so a monitoring check can
@@ -34,6 +36,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`ConversationId` on the wire.** `Conversation::id()` names a conversation
   and every audit entry its turns produce carries it, so the tool calls of one
   exchange can be grouped out of a shared trail.
+- **Embedder access to the sandbox execution path.** A downstream crate
+  wrapping builtin execution — an approval flow, a protocol adapter — could
+  not keep the sandbox while doing it: the factory getter and the executor
+  adapter were crate-private. `SandboxedExecution` is now the public handle
+  over the configured factory, returned by `ActonAI::sandboxed_execution()`,
+  and it owns the one-shot create → execute → destroy lifecycle so nobody
+  re-derives it. `ActonAI::builtin_executor(name)` returns the named
+  builtin's `BuiltinExecutor` with the sandbox-or-in-process decision
+  already made; it is the very value `.use_builtins()` registers, so what an
+  embedder wraps is literally what the prompt loop runs. Because the process
+  sandbox re-execs the current binary, an embedder's `main` installs
+  `runner::run_if_sandbox_child()` first thing — the same guard `acton-ai`'s
+  own entry point now uses — and `runner::supports(name)` says which tools
+  can cross the process boundary at all.
 - **`fips` cargo feature.** Routes every TLS connection the framework opens
   through the FIPS 140-3 validated AWS-LC module instead of *ring*, installed
   as the process-wide rustls default before anything can connect. Off by
@@ -63,6 +79,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callbacks are stored pre-wrapped and the loop's `dyn Future + Send` awaits
   go through `sync_wrapper::SyncFuture`. `tests/prompt_builder_sync.rs`
   makes a regression a compile error.
+
+### Fixed
+
+- A dropped sandbox execution no longer leaks the child process. Cancelling
+  the execute future mid-flight — a caller-side timeout, an aborted turn —
+  left the re-exec'd child running detached until its own resource limits
+  bit: the destroy step lives after the await, and a dropped future never
+  reaches it. The child is now killed when the future is dropped.
+  Grandchildren in the child's process group can still outlive it on this
+  path, exactly as on the non-unix timeout path.
 
 ### Changed
 
