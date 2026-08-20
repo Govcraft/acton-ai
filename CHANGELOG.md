@@ -60,8 +60,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   accumulated results. Without the section nothing is recorded, no store is
   opened, and behavior is exactly what it was.
 - **Per-tool idempotency declarations.** `ToolDefinition` carries an
-  `idempotent` flag (default `false`; the read-only built-ins — `read_file`,
-  `glob`, `grep`, `list_directory`, `calculate` — declare `true`). Crash
+  `idempotent` flag (default `false`; the pure and read-only built-ins —
+  `read_file`, `glob`, `grep`, `list_directory`, `calculate`,
+  `get_context_remaining`, `update_plan` — declare `true`). Crash
   recovery turns on it: a call that was mid-execution when the process died
   re-runs only if its tool is idempotent; otherwise it is NOT re-run, and the
   model is told its outcome is uncertain as that call's tool result.
