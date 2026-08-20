@@ -2,7 +2,7 @@
 
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## Unreleased
+## 0.33.0 - 2026-08-20
 
 ### Added
 
@@ -120,6 +120,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   callbacks are stored pre-wrapped and the loop's `dyn Future + Send` awaits
   go through `sync_wrapper::SyncFuture`. `tests/prompt_builder_sync.rs`
   makes a regression a compile error.
+- **`api_key_file` as a provider key source.** A named provider can point at a
+  file holding its key: `api_key_file = "~/.config/app/anthropic-key"`.
+  Resolution slots between the environment variables and the inline
+  `api_key` — env stays authoritative, a file beats a value baked into the
+  config. Contents are trimmed, `~/` expands, and an unreadable or blank file
+  warns and falls through. This suits keys provisioned as secret files
+  (systemd credentials, a login command writing an 0600 file), where an
+  environment variable would leak into every child process.
+- **One filesystem boundary per caller.** Every filesystem-capable builtin can
+  now be built for exactly one directory: `ActonAI::builtin_executor_in(name,
+  root)` and `PromptBuilder::use_builtins_in(root)` hand back tools that reach
+  `root` and nothing else — not the process working directory, not the system
+  temp directory, both of which the unconfined defaults allow. This is what a
+  host serving several workspaces from one runtime needs, and it could not be
+  expressed before: `ToolExecutorTrait::execute` takes no per-call context, so
+  confinement is a property of construction. `glob` and `grep` default their
+  base path to the root instead of the process cwd, and `bash` starts there
+  and validates any `cwd` it is handed. The boundary crosses the process edge
+  too — `Sandbox::execute_in` carries the root, the process sandbox makes it
+  the child's working directory and passes it as `ACTON_AI_SANDBOX_ROOT`, and
+  the child rebuilds its tools around it — so the in-process and sandboxed
+  paths cannot enforce different rules. The default `execute_in` fails closed:
+  a sandbox that cannot confine says so rather than silently running
+  unconfined.
+- **The sandbox says what it is enforcing.** `ActonAI::sandbox_config()`
+  returns the `ProcessSandboxConfig` in force — limits and
+  [`HardeningMode`] — `Some` exactly when `sandboxed_execution()` is. A
+  governed deployment is usually required to report whether isolation and OS
+  hardening are active, and an operator who has to infer that from a config
+  file is reading an intention rather than a fact.
 
 ### Fixed
 
@@ -161,6 +191,74 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reaches it. The child is now killed when the future is dropped.
   Grandchildren in the child's process group can still outlive it on this
   path, exactly as on the non-unix timeout path.
+- A hardened sandbox child could not spawn a process at all. Every `bash` call
+  under landlock failed with "Permission denied" before the command was
+  parsed: `Stdio::null()` opens `/dev/null`, and `/dev` was in no rule. The
+  ruleset now grants file-level read+write on `/dev/null`, `/dev/zero`,
+  `/dev/full`, `/dev/random` and `/dev/urandom`, plus read-only `/proc`, which
+  shells and the tools they run read routinely. Confinement is unchanged, and
+  a test now pins it: a hardened child runs a command inside its root and is
+  refused the sibling directory by the kernel, with no tool argument naming
+  it.
+- `hardening = "best-effort"` (and `best_effort`) are accepted in TOML. The
+  serde rename made `besteffort` the only spelling, which is the one nobody
+  writes by hand.
+- SSE lines split across network chunks are reassembled. Both streaming
+  clients split each chunk into lines in isolation, so a `data:` line
+  straddling a boundary parsed as truncated JSON in the OpenAI client
+  (failing the turn) and was silently dropped by the Anthropic client (losing
+  tokens); a UTF-8 character split across chunks was corrupted by per-chunk
+  lossy decoding. Localhost streams deliver one event per chunk and never
+  exposed this; fast TLS streams split lines constantly. A new
+  `llm::sse::LineAssembler` carries the unterminated tail between chunks and
+  reassembles at the byte level.
+- An in-band stream error from an OpenAI-compatible provider now surfaces as
+  the provider's message. Providers that hit trouble after the 200 header
+  report it as a `data: {"error": ...}` event, which failed to deserialize as
+  a chunk, so the turn died on our parse error instead. The error shape is
+  detected before the chunk parse, whose defaulted fields would otherwise
+  absorb it as an empty chunk. Chunks without an `id` now parse instead of
+  failing.
+- A round whose stream died after it started is retried instead of killing the
+  turn. The provider actor classifies the failure where the error kind is
+  still known (`LLMError::is_transient`), `LLMStreamEnd` carries a transient
+  note when re-dispatch may succeed, and the prompt loop re-dispatches with a
+  fresh correlation ID, linear backoff, and at most two retries per candidate.
+  Failures *before* any stream started are deliberately untouched: those
+  already belong to retry-after, the circuit breaker, and the failover chain.
+- A hallucinated tool call is now corrected on the retry. Hosts that validate
+  tool calls server-side kill the stream with an in-band error when the model
+  calls a tool that is not in `request.tools`, so the call never reaches the
+  tool loop where an unknown tool would be answered with an error result the
+  model can read. The blind retry re-sent identical context and the model
+  hallucinated identically until the budget ran out. The retry now carries the
+  feedback the tool result would have carried — a user message naming the
+  invented tool and pointing at the real list, appended once.
+- A provider-rejected tool call no longer counts against the host. Every
+  server-side rejection was recorded as a provider failure, walking the
+  circuit breaker open after five of the model's own mistakes on a perfectly
+  healthy host. A shared classifier now gates both the correction and the
+  breaker outcome, so a round the provider killed over what the model wrote
+  reports as succeeded. Corrected retries also draw from their own budget
+  rather than the transient-retry budget a model needing two nudges exhausts,
+  and the `bash` schema no longer declares a `maximum` for `timeout` that a
+  validating host rejects while the executor clamps it anyway.
+- An oversized tool result no longer ends the turn. The fit budget reserved a
+  fixed 1024 tokens for the response while the request asked for the
+  provider's full `max_tokens`, so any prompt in the gap was rejected as too
+  long; `reserved_for_response` now defaults to the default provider's
+  `max_tokens`, clamped to half the window. Truncation also dropped whole
+  exchanges, so a newest exchange that alone exceeded the window emptied the
+  history: an exchange too large to fit now sheds its tool results
+  largest-first, replacing each with a placeholder telling the model to re-run
+  the tool with a narrower query, and call/result pairing stays intact.
+- Every request is now bounded by the context window. The prompt loop resolved
+  a window and reported it to tools through `get_context_remaining` but never
+  enforced it — only the `Conversation` API called `fit_messages` — so one
+  oversized round left the loop sending a raw over-window request the provider
+  rejected. The loop now fits the history right before each request is built,
+  after the compaction gate so a configured summarizer still runs first, and
+  only on estimated overflow.
 
 ### Changed
 
