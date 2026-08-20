@@ -93,6 +93,21 @@ pub enum LLMErrorKind {
     },
 }
 
+/// Whether a provider's mid-stream diagnostic describes the *model's* bad
+/// tool call rather than provider unhealth.
+///
+/// Hosts that validate tool calls server-side (Groq, among others) kill the
+/// stream when the model calls a tool that does not exist, violates its
+/// schema, or emits unparseable arguments. Those rounds failed because of
+/// what the model wrote, not because the provider is struggling — so they
+/// must not trip the circuit breaker, and the useful retry is one that
+/// feeds the diagnostic back to the model, not a blind re-dispatch.
+pub(crate) fn describes_model_tool_fault(message: &str) -> bool {
+    message.contains("not in request.tools")
+        || message.contains("Tool call validation failed")
+        || message.contains("Failed to parse tool call arguments")
+}
+
 impl LLMError {
     /// Creates a new LLMError with the given kind.
     #[must_use]

@@ -91,9 +91,8 @@ impl BashTool {
                     },
                     "timeout": {
                         "type": "integer",
-                        "description": "Timeout in seconds (default: 120, max: 600)",
-                        "minimum": 1,
-                        "maximum": 600
+                        "description": "Timeout in SECONDS, not milliseconds (default: 120; values above 600 are clamped to 600)",
+                        "minimum": 1
                     },
                     "cwd": {
                         "type": "string",

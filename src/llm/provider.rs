@@ -1125,7 +1125,14 @@ async fn process_streaming_request(ctx: &DispatchContext, request: &LLMRequest) 
             // Only a round that reached a terminal event counts as served.
             // The circuit breaker and the failover chain both key off this,
             // so a broken stream has to be reported as the failure it is.
-            let succeeded = stop_reason != StopReason::Error;
+            // A round the provider killed over the model's own bad tool
+            // call was served correctly: the provider is healthy, it just
+            // refused to run what the model wrote. Counting those as
+            // failures walks the circuit breaker open on a healthy host.
+            let model_fault = transient_error
+                .as_deref()
+                .is_some_and(crate::llm::describes_model_tool_fault);
+            let succeeded = stop_reason != StopReason::Error || model_fault;
 
             // Send stream end
             broker

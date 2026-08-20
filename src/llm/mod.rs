@@ -21,6 +21,7 @@ pub use config::{
     CircuitBreakerConfig, ProviderConfig, ProviderType, RateLimitConfig, RetryConfig,
     SamplingParams, DEFAULT_COOLDOWN, DEFAULT_FAILURE_THRESHOLD,
 };
+pub(crate) use error::describes_model_tool_fault;
 pub use error::{LLMError, LLMErrorKind};
 pub use failover::{CheckHealth, FailoverEvent, ProviderHealth};
 pub use openai::OpenAIClient;

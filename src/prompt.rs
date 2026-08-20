@@ -88,27 +88,50 @@ const MAX_STREAM_RETRIES: u32 = 2;
 /// here is a dropped connection that a fresh request usually clears.
 const STREAM_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_millis(500);
 
+/// How many provider-rejected tool calls one candidate may correct before
+/// the turn stands as failed.
+///
+/// Deliberately roomier than [`MAX_STREAM_RETRIES`]: each corrected dispatch
+/// carries new feedback, so it converges the way a tool round with an error
+/// result converges — where a blind transient retry re-rolls the same dice.
+const MAX_CORRECTION_ROUNDS: u32 = 5;
+
 /// A corrective note for a round the provider killed because the model
-/// called a tool that does not exist.
+/// produced a bad tool call — a tool that does not exist, arguments that
+/// violate the tool's schema, or arguments that are not valid JSON.
 ///
 /// Hosts that validate tool calls server-side (Groq, among others) reject
-/// such a round mid-stream, so the hallucinated call never reaches the tool
-/// loop — where an unknown tool would normally be answered with an error
-/// result the model can read and correct from. Re-dispatching the identical
-/// context just reproduces the hallucination; this note gives the retry the
-/// same feedback the tool result would have carried.
-fn hallucinated_tool_correction(reason: &str) -> Option<String> {
-    if !reason.contains("not in request.tools") {
+/// such a round mid-stream, so the bad call never reaches the tool loop —
+/// where it would normally be answered with an error result the model can
+/// read and correct from. Re-dispatching the identical context just
+/// reproduces the mistake; this note gives the retry the same feedback the
+/// tool result would have carried, in the provider's own words.
+fn tool_call_correction(reason: &str) -> Option<String> {
+    if !crate::llm::describes_model_tool_fault(reason) {
         return None;
     }
-    // Groq's message quotes the offending name: "attempted to call tool
-    // 'repo_browser.print_tree' which was not in request.tools". Absent the
-    // quotes, the note still lands — the model knows what it just called.
-    let name = reason.split('\'').nth(1).unwrap_or("that tool");
+
+    // The provider's diagnostic, minus the transport framing this side
+    // wrapped around it on the way up.
+    let detail = reason.rsplit("mid-stream: ").next().unwrap_or(reason);
+
+    if detail.contains("not in request.tools") {
+        // Groq's message quotes the offending name: "attempted to call tool
+        // 'repo_browser.print_tree' which was not in request.tools". Absent
+        // the quotes, the note still lands — the model knows what it called.
+        let name = detail.split('\'').nth(1).unwrap_or("that tool");
+        return Some(format!(
+            "Your previous response called a tool named '{name}', which does \
+             not exist. Call only the tools listed in this conversation's \
+             tool definitions, exactly as they are named there."
+        ));
+    }
+
     Some(format!(
-        "Your previous response called a tool named '{name}', which does not \
-         exist. Call only the tools listed in this conversation's tool \
-         definitions, exactly as they are named there."
+        "Your previous response produced a tool call the provider \
+             rejected before it could run: {detail}. Correct the call so its \
+             arguments are valid JSON that matches the tool's schema, then \
+             continue."
     ))
 }
 
@@ -1934,6 +1957,7 @@ impl PromptBuilder {
                     // scratch below. The counter is per-candidate, so a
                     // failover onto the next provider starts fresh.
                     let mut stream_retries: u32 = 0;
+                    let mut correction_rounds: u32 = 0;
                     let (round_correlation_id, round) = loop {
                         // Generate new IDs for this dispatch. A second candidate
                         // is a second request, so it gets its own correlation ID
@@ -2074,19 +2098,32 @@ impl PromptBuilder {
                             // fresh dispatch: new correlation ID, its own round
                             // span, its own latency sample.
                             if let Some(reason) = round.transient_error.as_deref() {
-                                if stream_retries < MAX_STREAM_RETRIES {
-                                    stream_retries += 1;
-                                    // A hallucinated tool call fails the same
-                                    // way on every identical dispatch, so the
-                                    // retry carries the feedback an unknown
-                                    // tool would normally get as its result.
-                                    if let Some(correction) = hallucinated_tool_correction(reason) {
+                                // A bad tool call the provider rejected is the
+                                // model's mistake, not the provider's — the
+                                // corrected dispatch is really the model's next
+                                // turn given feedback (the feedback an unknown
+                                // tool would have gotten as its result), so it
+                                // draws on its own budget, sized like tool
+                                // rounds, and skips the transport backoff.
+                                if let Some(correction) = tool_call_correction(reason) {
+                                    if correction_rounds < MAX_CORRECTION_ROUNDS {
+                                        correction_rounds += 1;
                                         if messages.last().map(|m| m.content.as_str())
                                             != Some(correction.as_str())
                                         {
                                             messages.push(Message::user(correction));
                                         }
+                                        tracing::warn!(
+                                            provider = %candidate,
+                                            attempt = correction_rounds,
+                                            max_attempts = MAX_CORRECTION_ROUNDS,
+                                            reason,
+                                            "provider rejected the model's tool call; retrying with feedback"
+                                        );
+                                        continue;
                                     }
+                                } else if stream_retries < MAX_STREAM_RETRIES {
+                                    stream_retries += 1;
                                     tracing::warn!(
                                         provider = %candidate,
                                         attempt = stream_retries,
@@ -3732,8 +3769,7 @@ mod tests {
                       Tool call validation failed: tool call validation failed: \
                       attempted to call tool 'repo_browser.print_tree' which was \
                       not in request.tools";
-        let correction =
-            hallucinated_tool_correction(reason).expect("a validation failure must correct");
+        let correction = tool_call_correction(reason).expect("a validation failure must correct");
         assert!(
             correction.contains("'repo_browser.print_tree'"),
             "{correction}"
@@ -3741,11 +3777,34 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_transient_failures_get_no_correction() {
-        assert!(hallucinated_tool_correction("stream read error: connection reset").is_none());
+    fn a_schema_violation_carries_the_providers_diagnostic_into_the_correction() {
+        let reason = "streaming error: provider reported an error mid-stream: \
+                      Tool call validation failed: tool call validation failed: \
+                      parameters for tool bash did not match schema: errors: \
+                      [`/timeout`: must be <= 600 but found 120000]";
+        let correction = tool_call_correction(reason).expect("a schema violation must correct");
         assert!(
-            hallucinated_tool_correction("provider reported an error mid-stream: overloaded")
-                .is_none()
+            correction.contains("must be <= 600 but found 120000"),
+            "the model needs the provider's own diagnostic to fix the call: {correction}"
+        );
+        assert!(
+            !correction.contains("streaming error:"),
+            "the transport framing is this side's noise, not feedback: {correction}"
+        );
+    }
+
+    #[test]
+    fn unparseable_arguments_also_get_the_correction() {
+        let reason = "streaming error: provider reported an error mid-stream: \
+                      Failed to parse tool call arguments as JSON";
+        assert!(tool_call_correction(reason).is_some());
+    }
+
+    #[test]
+    fn ordinary_transient_failures_get_no_correction() {
+        assert!(tool_call_correction("stream read error: connection reset").is_none());
+        assert!(
+            tool_call_correction("provider reported an error mid-stream: overloaded").is_none()
         );
     }
 
