@@ -365,3 +365,89 @@ async fn a_prompt_confined_to_a_root_registers_confined_builtins() {
 
     ai.shutdown().await.expect("clean shutdown");
 }
+
+// =============================================================================
+// Hardened: a confined child still has to be able to run something
+// =============================================================================
+
+/// Whether this kernel actually enforces landlock. Best-effort hardening logs
+/// and continues where it does not, so the escape assertions below only mean
+/// something on a kernel that has it.
+#[cfg(all(unix, feature = "sandbox-hardening"))]
+fn landlock_is_enforced() -> bool {
+    std::fs::read_to_string("/sys/kernel/security/lsm")
+        .map(|lsms| lsms.split(',').any(|lsm| lsm.trim() == "landlock"))
+        .unwrap_or(false)
+}
+
+#[cfg(all(unix, feature = "sandbox-hardening"))]
+#[tokio::test]
+async fn a_hardened_child_can_still_spawn_a_shell_inside_its_root() {
+    let tree = tree();
+    std::fs::write(tree.root.join("greeting.txt"), "hardened hello\n").expect("writes");
+    let sandbox = SandboxedExecution::process_with_exe(
+        PathBuf::from(env!("CARGO_BIN_EXE_acton-ai")),
+        ProcessSandboxConfig::new()
+            .with_timeout(Duration::from_secs(15))
+            .with_hardening(HardeningMode::BestEffort),
+    )
+    .expect("the crate's binary must canonicalize");
+
+    // Spawning a process opens `/dev/null` for the null stdin. A landlock
+    // ruleset that omits it makes every `bash` call fail with EACCES before
+    // the command is even parsed, which is a sandbox that cannot run
+    // anything rather than a sandbox that confines what it runs.
+    let result = sandbox
+        .execute_in(
+            Some(&tree.root),
+            "bash",
+            json!({"command": "cat greeting.txt"}),
+        )
+        .await
+        .expect("a hardened child must still be able to run a command");
+    assert_eq!(
+        result["stdout"].as_str().expect("bash reports stdout"),
+        "hardened hello\n"
+    );
+}
+
+#[cfg(all(unix, feature = "sandbox-hardening"))]
+#[tokio::test]
+async fn a_hardened_child_cannot_write_outside_its_root() {
+    if !landlock_is_enforced() {
+        return; // nothing to assert: hardening degraded to a warning
+    }
+    let tree = tree();
+    let sandbox = SandboxedExecution::process_with_exe(
+        PathBuf::from(env!("CARGO_BIN_EXE_acton-ai")),
+        ProcessSandboxConfig::new()
+            .with_timeout(Duration::from_secs(15))
+            .with_hardening(HardeningMode::BestEffort),
+    )
+    .expect("the crate's binary must canonicalize");
+
+    // The shell runs arbitrary commands, so the boundary here is the kernel's
+    // rather than the path validator's: the sibling is unreachable even
+    // though no tool argument named it.
+    let escape = tree.sibling.join("outside.txt");
+    let result = sandbox
+        .execute_in(
+            Some(&tree.root),
+            "bash",
+            json!({"command": format!("cat {0} ; echo escaped > {0}", escape.display())}),
+        )
+        .await
+        .expect("the command runs; it is the kernel that refuses the access");
+    assert!(
+        result["stderr"]
+            .as_str()
+            .expect("bash reports stderr")
+            .contains("Permission denied"),
+        "got: {result}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&escape).expect("still there"),
+        "outside\n",
+        "the sibling must be untouched"
+    );
+}

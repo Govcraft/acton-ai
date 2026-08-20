@@ -8,8 +8,11 @@
 //!
 //! - a **landlock** ruleset that confines the child to read-only access on
 //!   standard system paths (`/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`,
-//!   `/etc`, `/sys/kernel`) plus read/write access on `$TMPDIR` and the
-//!   current working directory;
+//!   `/etc`, `/sys/kernel`, `/proc`), read/write access on a handful of
+//!   character devices (`/dev/null` and friends, without which no
+//!   subprocess can be spawned at all), plus read/write access on `$TMPDIR`
+//!   and the current working directory — which for a confined call is the
+//!   root the parent handed it, and otherwise a throwaway directory;
 //! - a **seccomp** filter that returns `EPERM` for a small set of dangerous
 //!   syscalls (`ptrace`, `keyctl`, `mount`, `umount2`, `reboot`,
 //!   `kexec_load`, `init_module`, `finit_module`, `delete_module`, `bpf`,
@@ -62,7 +65,24 @@ fn apply_landlock(cfg: &ProcessSandboxConfig) -> Result<(), ToolError> {
         "/etc",
         "/sys/kernel",
     ];
+    // Character devices a spawned process cannot do without: `/dev/null`
+    // alone is opened by every `Stdio::null()` redirect, so without it the
+    // child cannot start a subprocess at all. These are granted file-level
+    // read+write, which for a character device is the whole of its use.
+    let device_paths: &[&str] = &[
+        "/dev/null",
+        "/dev/zero",
+        "/dev/full",
+        "/dev/random",
+        "/dev/urandom",
+    ];
+
+    // Process metadata a shell and the tools it runs read routinely
+    // (`/proc/self/*`, `/proc/meminfo`); read-only, and only where it exists.
+    let proc_paths: &[&str] = &["/proc"];
+
     let read_access = AccessFs::from_read(abi);
+    let device_access = AccessFs::ReadFile | AccessFs::WriteFile;
     let rw_access = AccessFs::from_all(abi);
 
     let mut ruleset = match Ruleset::default()
@@ -75,11 +95,18 @@ fn apply_landlock(cfg: &ProcessSandboxConfig) -> Result<(), ToolError> {
         }
     };
 
-    for path in read_paths {
+    for path in read_paths.iter().chain(proc_paths) {
         if !Path::new(path).exists() {
             continue;
         }
         add_landlock_rule(cfg, &mut ruleset, path, read_access, "read")?;
+    }
+
+    for path in device_paths {
+        if !Path::new(path).exists() {
+            continue;
+        }
+        add_landlock_rule(cfg, &mut ruleset, path, device_access, "device")?;
     }
 
     let mut rw_paths: Vec<String> = Vec::new();
