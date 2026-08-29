@@ -2,9 +2,44 @@
 
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## Unreleased
+
+## 0.35.0 - 2026-08-29
+
+The embedder release: everything an agent host needs to run one governed
+daemon over one audit trail and to own its sessions. One trail has one
+writer, one identity, and a health it can report; a session survives the
+process; a compaction can be replayed by whoever keeps the history.
 
 ### Added
+
+- **Audit durability and writer health.** `[audit] durability = "strict"`
+  (or `AuditConfig::with_durability(AuditDurability::Strict)`) makes every
+  entry fsync and be acknowledged before the prompt loop considers the next
+  tool call, and once an append has failed the loop refuses every tool not
+  declared idempotent — through the ordinary refusal path, so the attempt is
+  recorded as denied by the new `Decider::AuditGuard` with
+  `DenialReason::AuditDegraded`, and the model is told mutating tools stay
+  refused for the session. An audit actor that does not answer the guard is
+  refused the same way (`DenialReason::AuditUnreachable`): the guard fails
+  closed. The default stays `best_effort`, so nothing changes for an
+  existing embedder. The writer's state is readable as `AuditHealth`
+  (`healthy`, `degraded`, or `disabled`; appended and failed counts; the
+  first failed sequence; the last error; when it degraded) through
+  `ActonAI::audit_health()` and the `GetAuditHealth` request, and the
+  healthy-to-degraded transition is broadcast once as `AuditHealthChanged`.
+  `RecordInvocationDurably` is the acknowledged form of `RecordInvocation`,
+  answering with an `AppendReceipt`; `ActonAI::audit_durability()` reports
+  what the trail promises.
+
+- **Compaction as a strict prefix elision.** The prompt loop has always
+  compacted from the front — a leading system message held aside, the
+  oldest exchanges replaced by the summary — but an embedder that keeps its
+  own copy of the history had to infer how much of it the summary stood for.
+  `CompactionRecord.elided_prefix_len` now states it: the number of leading
+  non-system messages the summary replaced, and `CompactionRecord::adopt`
+  replays that onto the embedder's copy so the next turn sends the summary
+  instead of the elided span and does not pay for the same summary twice.
+  `CompactionPlan::elided_prefix_len()` is where the number comes from.
 
 - **Session persistence for embedders.** The `MemoryStore` actor now answers
   the named-session messages the CLI used to reach only through free
@@ -65,24 +100,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose `Busy` variant names the holder's pid where the platform can tell
   (`/proc/locks` on Linux). Read-only verification of a live trail is
   unaffected (Govcraft/acton-ai#14).
-- **Audit durability and writer health.** `[audit] durability = "strict"`
-  (or `AuditConfig::with_durability(AuditDurability::Strict)`) makes every
-  entry fsync and be acknowledged before the prompt loop considers the next
-  tool call, and once an append has failed the loop refuses every tool not
-  declared idempotent — through the ordinary refusal path, so the attempt is
-  recorded as denied by the new `Decider::AuditGuard` with
-  `DenialReason::AuditDegraded`, and the model is told mutating tools stay
-  refused for the session. An audit actor that does not answer the guard is
-  refused the same way (`DenialReason::AuditUnreachable`): the guard fails
-  closed. The default stays `best_effort`, so nothing changes for an
-  existing embedder. The writer's state is readable as `AuditHealth`
-  (`healthy`, `degraded`, or `disabled`; appended and failed counts; the
-  first failed sequence; the last error; when it degraded) through
-  `ActonAI::audit_health()` and the `GetAuditHealth` request, and the
-  healthy-to-degraded transition is broadcast once as `AuditHealthChanged`.
-  `RecordInvocationDurably` is the acknowledged form of `RecordInvocation`,
-  answering with an `AppendReceipt`; `ActonAI::audit_durability()` reports
-  what the trail promises.
+
+- **`CompactionRecord` carries `elided_prefix_len`.** The struct gained a
+  public field, so an embedder that builds records itself must set it;
+  the prompt loop is the only in-tree constructor.
+
+- **Minimum supported Rust is 1.89.** The trail lock uses
+  `std::fs::File::try_lock`, stabilized in 1.89; `rust-version` now says
+  so, so an older toolchain fails at resolution rather than mid-build.
 
 ## 0.34.0 - 2026-08-28
 
