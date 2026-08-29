@@ -155,6 +155,7 @@ mod tests {
             sequence,
             hash: format!("hash-{sequence}"),
             entries: sequence,
+            trail_id: None,
         }
     }
 
@@ -208,7 +209,10 @@ mod tests {
         assert_eq!(health.state, AuditHealthState::Degraded);
         assert_eq!(health.failures, 2);
         assert_eq!(health.first_failed_sequence, Some(3));
-        assert_eq!(health.degraded_since.as_deref(), Some("2026-08-29T10:00:00Z"));
+        assert_eq!(
+            health.degraded_since.as_deref(),
+            Some("2026-08-29T10:00:00Z")
+        );
         assert_eq!(health.head, head(4), "the head still advances past a gap");
     }
 

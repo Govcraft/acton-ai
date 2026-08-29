@@ -6,7 +6,7 @@
 //! hash, and every hash after it was computed from the old value.
 
 use crate::policy::Decider;
-use crate::types::{ConversationId, CorrelationId, TurnId};
+use crate::types::{ConversationId, CorrelationId, TrailId, TurnId};
 use serde::{Deserialize, Serialize};
 
 /// The `prev_hash` of the first entry in a chain.
@@ -175,6 +175,14 @@ pub struct AuditEntry {
     /// bytes their hashes were computed over.
     #[serde(default, skip_serializing_if = "is_false")]
     pub resumed: bool,
+    /// The identity of the trail this entry was sealed into.
+    ///
+    /// Covered by the hash, so a sealed entry cannot be relabelled as
+    /// belonging to a different trail without breaking its own hash. Absent
+    /// on entries written before trails had an identity; those keep the exact
+    /// bytes their hashes were computed over.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<TrailId>,
     /// The hash of the entry before this one, or [`GENESIS_HASH`].
     pub prev_hash: String,
     /// This entry's hash, covering every field above.
@@ -208,6 +216,10 @@ struct HashPreimage<'a> {
     /// pre-image bytes and break verification of every chain already written.
     #[serde(skip_serializing_if = "Option::is_none")]
     resumed: Option<bool>,
+    /// Skipped when absent for the same reason as `resumed`: a legacy entry
+    /// must hash to what it hashed to when it was written.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trail_id: Option<&'a TrailId>,
     prev_hash: &'a str,
 }
 
@@ -234,13 +246,21 @@ fn hash_preimage(preimage: &HashPreimage<'_>) -> String {
 }
 
 impl AuditEntry {
-    /// Seals a record into the chain behind `prev_hash`.
+    /// Seals a record into the chain behind `prev_hash`, under `trail_id`.
     ///
     /// Pure: the same record at the same position behind the same predecessor
-    /// always produces the same entry, which is what lets verification
-    /// recompute it later.
+    /// in the same trail always produces the same entry, which is what lets
+    /// verification recompute it later. `None` for the trail is the legacy
+    /// form — what every entry looked like before trails had an identity —
+    /// kept so old fixtures can still be reproduced; a running audit log
+    /// always passes its identity.
     #[must_use]
-    pub fn seal(record: InvocationRecord, sequence: u64, prev_hash: &str) -> Self {
+    pub fn seal(
+        record: InvocationRecord,
+        sequence: u64,
+        prev_hash: &str,
+        trail_id: Option<&TrailId>,
+    ) -> Self {
         let InvocationRecord {
             timestamp,
             correlation_id,
@@ -272,6 +292,7 @@ impl AuditEntry {
             duration_ms,
             response_size_bytes,
             resumed: resumed.then_some(true),
+            trail_id,
             prev_hash,
         });
 
@@ -290,6 +311,7 @@ impl AuditEntry {
             duration_ms,
             response_size_bytes,
             resumed,
+            trail_id: trail_id.cloned(),
             prev_hash: prev_hash.to_string(),
             hash,
         }
@@ -316,6 +338,7 @@ impl AuditEntry {
             duration_ms: self.duration_ms,
             response_size_bytes: self.response_size_bytes,
             resumed: self.resumed.then_some(true),
+            trail_id: self.trail_id.as_ref(),
             prev_hash: &self.prev_hash,
         })
     }
@@ -359,7 +382,7 @@ mod tests {
 
     #[test]
     fn sealing_is_deterministic() {
-        let first = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let first = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         let second = AuditEntry::seal(
             InvocationRecord {
                 correlation_id: first.correlation_id.clone(),
@@ -368,6 +391,7 @@ mod tests {
             },
             1,
             GENESIS_HASH,
+            None,
         );
 
         assert_eq!(first.hash, second.hash);
@@ -375,13 +399,13 @@ mod tests {
 
     #[test]
     fn a_sealed_entry_verifies_against_itself() {
-        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         assert_eq!(entry.hash, entry.recompute_hash());
     }
 
     #[test]
     fn editing_any_covered_field_changes_the_hash() {
-        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
 
         let mut tampered = entry.clone();
         tampered.arguments = json!({"value": 2});
@@ -412,7 +436,7 @@ mod tests {
 
     #[test]
     fn the_tool_call_id_survives_a_seal_and_verify_round_trip() {
-        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         assert_eq!(entry.tool_call_id, "toolu_01");
 
         let line = entry.to_jsonl().expect("an entry must serialize");
@@ -424,21 +448,21 @@ mod tests {
 
     #[test]
     fn position_in_the_chain_is_part_of_the_hash() {
-        let first = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
-        let moved = AuditEntry::seal(record("bash"), 2, GENESIS_HASH);
+        let first = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
+        let moved = AuditEntry::seal(record("bash"), 2, GENESIS_HASH, None);
         assert_ne!(first.hash, moved.hash);
     }
 
     #[test]
     fn the_predecessor_is_part_of_the_hash() {
-        let behind_genesis = AuditEntry::seal(record("bash"), 2, GENESIS_HASH);
-        let behind_other = AuditEntry::seal(record("bash"), 2, &"a".repeat(64));
+        let behind_genesis = AuditEntry::seal(record("bash"), 2, GENESIS_HASH, None);
+        let behind_other = AuditEntry::seal(record("bash"), 2, &"a".repeat(64), None);
         assert_ne!(behind_genesis.hash, behind_other.hash);
     }
 
     #[test]
     fn an_entry_survives_a_jsonl_round_trip_with_its_hash_intact() {
-        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         let line = entry.to_jsonl().expect("an entry must serialize");
 
         assert!(!line.contains('\n'), "a JSONL line must be one line");
@@ -456,7 +480,7 @@ mod tests {
     fn a_first_run_entry_serializes_without_the_resumed_field() {
         // The marker must not change the bytes of ordinary entries: every
         // chain written before the field existed has to keep verifying.
-        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         let line = entry.to_jsonl().unwrap();
         assert!(!line.contains("resumed"), "{line}");
 
@@ -477,7 +501,7 @@ mod tests {
 
     #[test]
     fn a_resumed_entry_is_marked_and_hashes_differently() {
-        let plain = AuditEntry::seal(record("bash"), 1, GENESIS_HASH);
+        let plain = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
         let resumed = AuditEntry::seal(
             InvocationRecord {
                 resumed: true,
@@ -487,6 +511,7 @@ mod tests {
             },
             1,
             GENESIS_HASH,
+            None,
         );
 
         assert!(resumed.resumed);
@@ -512,10 +537,72 @@ mod tests {
             duration_ms: 0,
             ..record("bash")
         };
-        let entry = AuditEntry::seal(denied, 1, GENESIS_HASH);
+        let entry = AuditEntry::seal(denied, 1, GENESIS_HASH, None);
 
         assert!(!entry.decision.approved);
         assert_eq!(entry.decision.decided_by, Decider::Denylist);
         assert_eq!(entry.hash, entry.recompute_hash());
+    }
+
+    #[test]
+    fn an_identified_entry_carries_its_trail_and_hashes_differently() {
+        let trail = TrailId::new();
+        let plain = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
+        let identified = AuditEntry::seal(
+            InvocationRecord {
+                correlation_id: plain.correlation_id.clone(),
+                turn_id: plain.turn_id.clone(),
+                ..record("bash")
+            },
+            1,
+            GENESIS_HASH,
+            Some(&trail),
+        );
+
+        assert_eq!(identified.trail_id.as_ref(), Some(&trail));
+        assert_ne!(
+            plain.hash, identified.hash,
+            "the identity must be covered by the hash, or it could be stripped undetected"
+        );
+        assert_eq!(identified.recompute_hash(), identified.hash);
+
+        let line = identified.to_jsonl().unwrap();
+        assert!(
+            line.contains(&format!("\"trail_id\":\"{trail}\"")),
+            "{line}"
+        );
+        let parsed: AuditEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed, identified);
+        assert_eq!(parsed.recompute_hash(), identified.hash);
+    }
+
+    #[test]
+    fn relabelling_a_sealed_entry_to_another_trail_breaks_its_hash() {
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, Some(&TrailId::new()));
+
+        let mut relabelled = entry.clone();
+        relabelled.trail_id = Some(TrailId::new());
+        assert_ne!(relabelled.hash, relabelled.recompute_hash());
+
+        let mut stripped = entry;
+        stripped.trail_id = None;
+        assert_ne!(
+            stripped.hash,
+            stripped.recompute_hash(),
+            "removing the identity must be as detectable as changing it"
+        );
+    }
+
+    #[test]
+    fn an_unidentified_entry_serializes_without_the_trail_field() {
+        // Byte-identical to what a build before trail identity wrote, so every
+        // chain already on disk keeps verifying.
+        let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
+        let line = entry.to_jsonl().unwrap();
+        assert!(!line.contains("trail_id"), "{line}");
+
+        let parsed: AuditEntry = serde_json::from_str(&line).unwrap();
+        assert_eq!(parsed.trail_id, None);
+        assert_eq!(parsed.recompute_hash(), entry.hash);
     }
 }

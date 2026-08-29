@@ -39,9 +39,12 @@
 //! [`AuditHealthChanged`].
 
 use crate::audit::chain::ChainHead;
-use crate::audit::config::{AuditConfig, AuditDurability};
+use crate::audit::config::{
+    read_trail_id, resolve_trail_id, write_trail_id, AuditConfig, AuditDurability,
+};
 use crate::audit::entry::{AuditEntry, InvocationRecord};
 use crate::audit::health::AuditHealth;
+use crate::types::TrailId;
 use acton_reactive::prelude::tokio::io::AsyncWriteExt;
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -343,6 +346,12 @@ pub struct AuditLog {
     prev_hash: String,
     /// How many entries have been written.
     sequence: u64,
+    /// The identity every entry is sealed under.
+    ///
+    /// Settled once at spawn from the sidecar and the chain (see
+    /// [`AuditLog::spawn`]); the derived `Default` mints a throwaway id that
+    /// `spawn` always replaces.
+    trail_id: TrailId,
     /// What an append promises before it is acknowledged.
     durability: AuditDurability,
     /// How the writer is doing. Defaults to disabled, which is a lie for a
@@ -362,12 +371,21 @@ impl AuditLog {
     /// is read once at spawn so a restarted process appends to the chain it
     /// already has instead of silently starting a second one in the same file.
     ///
+    /// The trail's identity is settled here too. The sidecar
+    /// ([`AuditConfig::trail_id_path`]) and the chain's own entries are both
+    /// read; when they agree, or only one of them speaks, that is the
+    /// identity, and a missing sidecar is written from it. A trail with no
+    /// identity anywhere — a first run, or a trail from before identities —
+    /// is given a fresh one. Every entry sealed from now on carries it.
+    ///
     /// # Errors
     ///
     /// Returns a configuration error if another process already owns the
-    /// trail (see [`claim_trail`]), if the existing file cannot be read, or if
+    /// trail (see [`claim_trail`]), if the existing file cannot be read, if
     /// its chain does not verify — refusing to start is the right answer,
-    /// because appending to a forked or broken chain would bury the evidence.
+    /// because appending to a forked or broken chain would bury the evidence
+    /// — or if the sidecar and the chain name different trails, which means
+    /// one of the two files was moved or copied from somewhere else.
     pub async fn spawn(
         runtime: &mut ActorRuntime,
         config: &AuditConfig,
@@ -376,7 +394,9 @@ impl AuditLog {
         // between the read and the first seal: the head we resume from is
         // exact for as long as we hold the lock.
         let lock = claim_trail(config.path())?;
-        let head = read_head(config.path()).await?;
+        let mut head = read_head(config.path()).await?;
+        let trail_id = settle_trail_id(config, head.trail_id.as_ref())?;
+        head.trail_id = Some(trail_id.clone());
 
         let mut builder = runtime.new_actor_with_name::<AuditLog>("audit_log".to_string());
 
@@ -385,6 +405,7 @@ impl AuditLog {
         builder.model.path = config.path().to_path_buf();
         builder.model.prev_hash = head.hash.clone();
         builder.model.sequence = head.sequence;
+        builder.model.trail_id = trail_id;
         builder.model.durability = config.durability();
         builder.model.health = AuditHealth::armed(head, config.durability());
         builder.model.lock = Some(lock);
@@ -425,7 +446,7 @@ impl AuditLog {
     /// Seals the next entry and advances the head. Pure bookkeeping.
     fn seal_next(&mut self, record: InvocationRecord) -> AuditEntry {
         let sequence = self.sequence.saturating_add(1);
-        let entry = AuditEntry::seal(record, sequence, &self.prev_hash);
+        let entry = AuditEntry::seal(record, sequence, &self.prev_hash, Some(&self.trail_id));
 
         self.sequence = sequence;
         self.prev_hash.clone_from(&entry.hash);
@@ -434,13 +455,75 @@ impl AuditLog {
     }
 
     /// The chain head as it currently stands.
+    ///
+    /// Reports the identity the log seals under even before the first
+    /// identified entry is written: it is settled and on disk in the sidecar
+    /// from spawn.
     fn head(&self) -> ChainHead {
         ChainHead {
             sequence: self.sequence,
             hash: self.prev_hash.clone(),
             entries: self.sequence,
+            trail_id: Some(self.trail_id.clone()),
         }
     }
+}
+
+/// Settles the trail's identity from its sidecar and its chain, writing the
+/// sidecar if it did not exist.
+///
+/// `chain` is the identity the existing entries are sealed under, `None` for
+/// an empty or legacy chain. Runs under the trail lock, so nothing else can
+/// write the sidecar between the read and the write.
+fn settle_trail_id(
+    config: &AuditConfig,
+    chain: Option<&TrailId>,
+) -> Result<TrailId, crate::error::ActonAIError> {
+    let sidecar_path = config.trail_id_path();
+    let sidecar = read_trail_id(&sidecar_path).map_err(|error| {
+        crate::error::ActonAIError::configuration(
+            "audit.path",
+            format!(
+                "could not read the trail identity at {}: {error}",
+                sidecar_path.display()
+            ),
+        )
+    })?;
+    let had_sidecar = sidecar.is_some();
+
+    let trail_id = resolve_trail_id(sidecar, chain.cloned()).map_err(|conflict| {
+        crate::error::ActonAIError::configuration(
+            "audit.path",
+            format!(
+                "the audit trail at {} carries trail id {} but {} says {}; refusing to start — \
+                 a trail cannot be two trails, so one of the files was moved or copied from \
+                 elsewhere. Investigate which, and put the pair back together",
+                config.path().display(),
+                conflict.chain,
+                sidecar_path.display(),
+                conflict.sidecar,
+            ),
+        )
+    })?;
+
+    if !had_sidecar {
+        write_trail_id(&sidecar_path, &trail_id).map_err(|error| {
+            crate::error::ActonAIError::configuration(
+                "audit.path",
+                format!(
+                    "could not write the trail identity to {}: {error}",
+                    sidecar_path.display()
+                ),
+            )
+        })?;
+        tracing::info!(
+            trail_id = %trail_id,
+            sidecar = %sidecar_path.display(),
+            "recorded the audit trail's identity",
+        );
+    }
+
+    Ok(trail_id)
 }
 
 /// Everything an append future needs, cloned out of the model before the
@@ -513,7 +596,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
     // follow each other.
     let handle = self_handle.clone();
     builder.mutate_on::<RecordInvocation>(move |actor, envelope| {
-        let prepared = actor.model.prepare_append(envelope.message().record.clone());
+        let prepared = actor
+            .model
+            .prepare_append(envelope.message().record.clone());
         let handle = handle.clone();
 
         Reply::pending(async move {
@@ -528,7 +613,9 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
     // ordering is what makes the strict-mode guard race-free.
     let handle = self_handle.clone();
     builder.mutate_on::<RecordInvocationDurably>(move |actor, envelope| {
-        let prepared = actor.model.prepare_append(envelope.message().record.clone());
+        let prepared = actor
+            .model
+            .prepare_append(envelope.message().record.clone());
         let reply = envelope.reply_envelope();
         let handle = handle.clone();
 
@@ -677,10 +764,12 @@ mod tests {
 
     #[test]
     fn sealing_advances_the_head_and_links_each_entry_to_the_last() {
+        let trail_id = TrailId::new();
         let mut log = AuditLog {
             path: PathBuf::from("/dev/null"),
             prev_hash: GENESIS_HASH.to_string(),
             sequence: 0,
+            trail_id: trail_id.clone(),
             durability: AuditDurability::BestEffort,
             health: AuditHealth::armed(ChainHead::empty(), AuditDurability::BestEffort),
             lock: None,
@@ -689,6 +778,7 @@ mod tests {
         let first = log.seal_next(record("a"));
         assert_eq!(first.sequence, 1);
         assert_eq!(first.prev_hash, GENESIS_HASH);
+        assert_eq!(first.trail_id.as_ref(), Some(&trail_id));
 
         let second = log.seal_next(record("b"));
         assert_eq!(second.sequence, 2);
@@ -696,9 +786,196 @@ mod tests {
             second.prev_hash, first.hash,
             "each entry must point at the one before it"
         );
+        assert_eq!(second.trail_id.as_ref(), Some(&trail_id));
 
         assert_eq!(log.head().sequence, 2);
         assert_eq!(log.head().hash, second.hash);
+        assert_eq!(log.head().trail_id, Some(trail_id));
+    }
+
+    #[tokio::test]
+    async fn a_first_spawn_mints_an_identity_and_writes_the_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+        let mut runtime = ActonApp::launch_async().await;
+
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+
+        let head = log.ask(GetChainHead).await.unwrap();
+        let trail_id = head
+            .trail_id
+            .expect("a spawned log has an identity from the start");
+        assert_eq!(
+            read_trail_id(&config.trail_id_path()).unwrap(),
+            Some(trail_id.clone()),
+            "the sidecar holds the identity before any entry is written"
+        );
+
+        log.send(RecordInvocation::new(record("a"))).await;
+        log.ask(GetChainHead).await.unwrap();
+        let entries = crate::audit::read_entries(config.path()).await.unwrap();
+        assert_eq!(entries[0].trail_id, Some(trail_id));
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_restart_keeps_the_identity_it_was_given() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.send(RecordInvocation::new(record("a"))).await;
+        let first_head = log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.send(RecordInvocation::new(record("b"))).await;
+        let second_head = log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        assert_eq!(second_head.trail_id, first_head.trail_id);
+        let entries = crate::audit::read_entries(config.path()).await.unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].trail_id, first_head.trail_id);
+        assert_eq!(
+            crate::audit::verify_chain(&entries).unwrap().trail_id,
+            first_head.trail_id
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_trail_gains_an_identity_without_a_move_aside() {
+        // A trail written before identities: no sidecar, entries without a
+        // trail_id. It keeps verifying, gets an identity, and every entry
+        // from here on carries it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+        let legacy = AuditEntry::seal(record("old"), 1, GENESIS_HASH, None);
+        std::fs::write(config.path(), format!("{}\n", legacy.to_jsonl().unwrap())).unwrap();
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config)
+            .await
+            .expect("a legacy trail is still a valid trail");
+        log.send(RecordInvocation::new(record("new"))).await;
+        let head = log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        let trail_id = head.trail_id.expect("the legacy trail now has an identity");
+        assert_eq!(
+            read_trail_id(&config.trail_id_path()).unwrap(),
+            Some(trail_id.clone())
+        );
+        let entries = crate::audit::read_entries(config.path()).await.unwrap();
+        assert_eq!(entries[0].trail_id, None, "history is not rewritten");
+        assert_eq!(entries[1].trail_id, Some(trail_id.clone()));
+        assert_eq!(
+            crate::audit::verify_chain(&entries).unwrap().trail_id,
+            Some(trail_id)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_sidecar_is_rebuilt_from_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.send(RecordInvocation::new(record("a"))).await;
+        let head = log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        std::fs::remove_file(config.trail_id_path()).unwrap();
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config)
+            .await
+            .expect("the chain still knows who it is");
+        assert_eq!(log.ask(GetChainHead).await.unwrap().trail_id, head.trail_id);
+        runtime.shutdown_all().await.unwrap();
+
+        assert_eq!(
+            read_trail_id(&config.trail_id_path()).unwrap(),
+            head.trail_id
+        );
+    }
+
+    #[tokio::test]
+    async fn a_sidecar_that_disagrees_with_the_chain_refuses_to_spawn() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.send(RecordInvocation::new(record("a"))).await;
+        let head = log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        // Somebody drops another trail's sidecar next to this chain.
+        let other = TrailId::new();
+        std::fs::remove_file(config.trail_id_path()).unwrap();
+        write_trail_id(&config.trail_id_path(), &other).unwrap();
+
+        let mut runtime = ActonApp::launch_async().await;
+        let error = match AuditLog::spawn(&mut runtime, &config).await {
+            Err(error) => error,
+            Ok(_) => panic!("two identities for one trail must be refused"),
+        };
+        runtime.shutdown_all().await.unwrap();
+
+        assert!(error.is_configuration(), "{error:?}");
+        let text = error.to_string();
+        assert!(text.contains("refusing to start"), "{text}");
+        assert!(text.contains(&other.to_string()), "{text}");
+        assert!(
+            text.contains(&head.trail_id.unwrap().to_string()),
+            "the refusal names both identities: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relabelled_trail_refuses_to_spawn_as_broken() {
+        // The forger rewrites every entry's trail_id and the sidecar to match:
+        // the identity is inside each hash, so the chain no longer verifies
+        // and the log refuses to append to it.
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.send(RecordInvocation::new(record("a"))).await;
+        log.send(RecordInvocation::new(record("b"))).await;
+        log.ask(GetChainHead).await.unwrap();
+        runtime.shutdown_all().await.unwrap();
+
+        let other = TrailId::new();
+        let mut entries = crate::audit::read_entries(config.path()).await.unwrap();
+        for entry in &mut entries {
+            entry.trail_id = Some(other.clone());
+        }
+        let relabelled: String = entries
+            .iter()
+            .map(|entry| format!("{}\n", entry.to_jsonl().unwrap()))
+            .collect();
+        std::fs::write(config.path(), relabelled).unwrap();
+        std::fs::remove_file(config.trail_id_path()).unwrap();
+        write_trail_id(&config.trail_id_path(), &other).unwrap();
+
+        let mut runtime = ActonApp::launch_async().await;
+        let error = match AuditLog::spawn(&mut runtime, &config).await {
+            Err(error) => error,
+            Ok(_) => panic!("a relabelled trail must not be appended to"),
+        };
+        runtime.shutdown_all().await.unwrap();
+
+        assert!(error.is_configuration(), "{error:?}");
+        assert!(
+            error.to_string().contains("does not verify"),
+            "the relabelling is caught as a broken chain: {error}"
+        );
     }
 
     fn trail_in(dir: &tempfile::TempDir) -> PathBuf {
@@ -742,7 +1019,10 @@ mod tests {
                 matches!(error, TrailClaimError::Busy { holder_pid: Some(pid), .. } if pid == std::process::id()),
                 "the holder is this very process, and /proc/locks says so: {error:?}"
             );
-            assert!(message.contains(&format!("pid {}", std::process::id())), "{message}");
+            assert!(
+                message.contains(&format!("pid {}", std::process::id())),
+                "{message}"
+            );
         }
     }
 
@@ -788,7 +1068,9 @@ mod tests {
         };
         assert!(error.is_configuration(), "{error:?}");
         assert!(
-            error.to_string().contains("already owned by another process"),
+            error
+                .to_string()
+                .contains("already owned by another process"),
             "{error}"
         );
 
@@ -803,7 +1085,10 @@ mod tests {
         let mut runtime = ActonApp::launch_async().await;
         let _log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
         assert!(
-            matches!(claim_trail(config.path()), Err(TrailClaimError::Busy { .. })),
+            matches!(
+                claim_trail(config.path()),
+                Err(TrailClaimError::Busy { .. })
+            ),
             "the running actor holds the lock"
         );
         runtime.shutdown_all().await.unwrap();
@@ -837,7 +1122,12 @@ mod tests {
         assert_eq!(health.durability, AuditDurability::Strict);
         assert_eq!(health.appended, 0);
         assert_eq!(health.failures, 0);
-        assert_eq!(health.head, ChainHead::empty());
+        assert_eq!(health.head.sequence, 0);
+        assert_eq!(health.head.hash, GENESIS_HASH);
+        assert!(
+            health.head.trail_id.is_some(),
+            "even an empty trail knows who it is once spawned"
+        );
         runtime.shutdown_all().await.unwrap();
     }
 

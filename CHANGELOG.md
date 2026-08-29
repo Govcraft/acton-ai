@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Trail identity bound into the chain.** Every audit trail now has a
+  `TrailId` (TypeID, prefix `trail`), minted the first time an audit log
+  opens it, kept in a sidecar beside the file (`audit.jsonl.trail`,
+  `AuditConfig::trail_id_path()`), and sealed into every entry's hash as
+  `AuditEntry.trail_id`. An entry can no longer be relabelled as another
+  trail's, and a chain cannot change identity part-way: `verify_chain`
+  reports the new `ChainBreakKind::TrailMismatch`. The per-link rule is
+  exposed as `verify_next(head, entry, line)` so a verifier holding the head
+  elsewhere applies exactly the file walk's rule. `ChainHead.trail_id`
+  carries the identity through `ActonAI::audit_head()` and `audit verify`
+  (`trail:` line, `trail_id` in the JSON report). Trails written before
+  identities keep verifying — the unidentified prefix is allowed — and gain
+  an identity on their next spawn; a sidecar that disagrees with the chain
+  refuses the spawn. `ActonAI::audit_config()` exposes the resolved audit
+  settings so an embedder can find the trail and its sidecar. The sidecar
+  helpers `read_trail_id`, `write_trail_id` and the pure `resolve_trail_id`
+  (with `TrailIdConflict`) are public under `audit`.
+
+### Changed
+
+- **`AuditEntry::seal` takes the trail identity.** The signature is now
+  `seal(record, sequence, prev_hash, trail_id: Option<&TrailId>)`; `None`
+  reproduces the legacy pre-identity form. Any embedder sealing entries
+  itself must adapt.
+
 - **One writer per audit trail, enforced.** `AuditLog::spawn` now claims the
   trail with an exclusive advisory lock (`std::fs::File::try_lock`) before it
   reads the chain head, and holds it for the actor's lifetime; the kernel

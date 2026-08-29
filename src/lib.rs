@@ -203,7 +203,7 @@ pub mod prelude {
     pub use crate::tool;
     pub use crate::types::{
         AgentId, CheckpointId, ConversationId, CorrelationId, InvalidTaskId, MemoryId, MessageId,
-        TaskId, ToolName, TurnId,
+        TaskId, ToolName, TrailId, TurnId,
     };
 
     // Re-export acton-reactive prelude

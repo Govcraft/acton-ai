@@ -19,6 +19,21 @@
 //! same trail fails to launch with a configuration error naming the holder,
 //! instead of forking the chain. See [`claim_trail`] and [`TrailClaimError`].
 //!
+//! # One identity per trail
+//!
+//! A trail is given a [`TrailId`](crate::types::TrailId) the first time an
+//! audit log opens it. The id is kept in a sidecar beside the file
+//! (`audit.jsonl.trail`, see [`AuditConfig::trail_id_path`]) and sealed into
+//! every entry's hash, so an entry cannot be relabelled as another trail's
+//! and a chain cannot change identity part-way: [`verify_chain`] reports
+//! [`ChainBreakKind::TrailMismatch`] where it tries. Trails written before
+//! identities existed keep verifying — their unidentified prefix is allowed
+//! — and gain an identity on the next spawn. A sidecar that names a different
+//! trail than the chain is sealed under refuses the spawn: one of the two
+//! files was moved or copied from somewhere else. [`ChainHead::trail_id`]
+//! reports the identity through [`ActonAI::audit_head`](crate::ActonAI::audit_head)
+//! and `audit verify`.
+//!
 //! # Off by default
 //!
 //! No `[audit]` section and no `.audit(..)` call means no actor is spawned and
@@ -84,10 +99,13 @@ pub use actor::{
     claim_trail, AppendReceipt, AuditHealthChanged, AuditLog, GetAuditHealth, GetChainHead,
     RecordInvocation, RecordInvocationDurably, TrailClaimError,
 };
-pub use chain::{verify_chain, ChainBreak, ChainBreakKind, ChainHead};
-pub use config::{default_audit_path, AuditConfig, AuditDurability, DEFAULT_AUDIT_FILE};
-pub use health::{AuditHealth, AuditHealthState};
+pub use chain::{verify_chain, verify_next, ChainBreak, ChainBreakKind, ChainHead};
+pub use config::{
+    default_audit_path, read_trail_id, resolve_trail_id, write_trail_id, AuditConfig,
+    AuditDurability, TrailIdConflict, DEFAULT_AUDIT_FILE, TRAIL_ID_SUFFIX,
+};
 pub use entry::{AuditDecision, AuditEntry, AuditOutcome, InvocationRecord, GENESIS_HASH};
+pub use health::{AuditHealth, AuditHealthState};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS, REDACTED};
 
 use std::path::Path;
@@ -161,6 +179,7 @@ mod tests {
             },
             sequence,
             prev_hash,
+            None,
         )
     }
 

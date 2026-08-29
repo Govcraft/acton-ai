@@ -50,6 +50,9 @@ struct VerifyReport {
     head_sequence: u64,
     /// The hash of the last entry, or the genesis hash for an empty trail.
     head_hash: String,
+    /// The identity the chain is sealed under; `null` for a trail written
+    /// entirely before trails had identities, or one with no entries yet.
+    trail_id: Option<String>,
 }
 
 impl VerifyReport {
@@ -61,8 +64,16 @@ impl VerifyReport {
             entries: head.entries,
             head_sequence: head.sequence,
             head_hash: head.hash.clone(),
+            trail_id: head.trail_id.as_ref().map(ToString::to_string),
         }
     }
+}
+
+/// The identity as `audit verify` prints it: the id, or `unidentified`.
+fn describe_trail(head: &ChainHead) -> String {
+    head.trail_id
+        .as_ref()
+        .map_or_else(|| "unidentified".to_string(), ToString::to_string)
 }
 
 /// Execute the audit command.
@@ -139,6 +150,7 @@ fn report_intact(output: &OutputWriter, path: &Path, head: &ChainHead) -> Result
         OutputMode::Json => output.write_json(&VerifyReport::new(path, head))?,
         OutputMode::Plain => {
             output.write_line(&format!("audit trail: {}", path.display()))?;
+            output.write_line(&format!("trail:       {}", describe_trail(head)))?;
             output.write_line(&format!("entries:     {}", head.entries))?;
             output.write_line(&format!("head:        {}", head.hash))?;
             output.write_line("chain:       verified")?;
@@ -157,6 +169,24 @@ fn chain_broken(path: PathBuf, break_found: ChainBreak) -> CliError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::TrailId;
+
+    #[test]
+    fn the_report_names_the_trail_or_says_it_is_unidentified() {
+        let legacy = ChainHead::empty();
+        assert_eq!(describe_trail(&legacy), "unidentified");
+        let report = VerifyReport::new(Path::new("/tmp/audit.jsonl"), &legacy);
+        assert_eq!(report.trail_id, None);
+
+        let trail = TrailId::new();
+        let identified = ChainHead {
+            trail_id: Some(trail.clone()),
+            ..ChainHead::empty()
+        };
+        assert_eq!(describe_trail(&identified), trail.to_string());
+        let report = VerifyReport::new(Path::new("/tmp/audit.jsonl"), &identified);
+        assert_eq!(report.trail_id, Some(trail.to_string()));
+    }
 
     #[test]
     fn an_explicit_file_wins_over_everything_else() {

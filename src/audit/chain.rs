@@ -2,9 +2,17 @@
 //!
 //! Pure: entries in, verdict out. The CLI reads the file and hands the parsed
 //! entries here, which is what lets the interesting cases — a tampered middle
-//! entry, a reordering, a truncation — be tested without touching a disk.
+//! entry, a reordering, a truncation, a relabelled trail — be tested without
+//! touching a disk.
+//!
+//! The walk is one step, [`verify_next`], folded over the entries. Exposing
+//! the step is deliberate: a verifier that holds the head somewhere else — a
+//! control plane checking entries as they arrive, one at a time — applies
+//! exactly the rule the file walk applies, rather than a reimplementation
+//! that could drift.
 
 use crate::audit::entry::{AuditEntry, GENESIS_HASH};
+use crate::types::TrailId;
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
@@ -17,6 +25,13 @@ pub struct ChainHead {
     pub hash: String,
     /// How many entries the chain holds.
     pub entries: u64,
+    /// The identity the chain is sealed under, once one has been seen.
+    ///
+    /// `None` for an empty chain and for a chain written entirely before
+    /// trails had an identity. Once an entry carries an identity, every
+    /// later entry must carry the same one, and the head reports it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub trail_id: Option<TrailId>,
 }
 
 impl ChainHead {
@@ -27,7 +42,14 @@ impl ChainHead {
             sequence: 0,
             hash: GENESIS_HASH.to_string(),
             entries: 0,
+            trail_id: None,
         }
+    }
+
+    /// Whether the chain holds no entries.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries == 0
     }
 }
 
@@ -61,6 +83,18 @@ pub enum ChainBreakKind {
         /// What it holds.
         found: u64,
     },
+    /// The entry names a different trail than the chain it sits in, or no
+    /// trail at all where the chain already has one: an entry from another
+    /// trail was spliced in, or the trail was relabelled.
+    TrailMismatch {
+        /// The identity the chain is sealed under, rendered; `None` never
+        /// occurs today (a chain without an identity accepts anything) but
+        /// is kept so the two sides read alike.
+        expected: Option<String>,
+        /// The identity this entry carries, rendered; `None` for an entry
+        /// with no identity at all.
+        found: Option<String>,
+    },
 }
 
 impl fmt::Display for ChainBreakKind {
@@ -79,6 +113,13 @@ impl fmt::Display for ChainBreakKind {
             Self::SequenceGap { expected, found } => write!(
                 f,
                 "expected sequence {expected} but found {found} — an entry is missing",
+            ),
+            Self::TrailMismatch { expected, found } => write!(
+                f,
+                "the chain is sealed under trail {} but the entry carries {} \
+                 — an entry from another trail was spliced in, or the trail was relabelled",
+                expected.as_deref().unwrap_or("unidentified"),
+                found.as_deref().unwrap_or("unidentified"),
             ),
         }
     }
@@ -105,12 +146,88 @@ impl fmt::Display for ChainBreak {
     }
 }
 
+/// Checks that `entry` is the next link after `head`, and returns the head it
+/// advances to.
+///
+/// Four things are checked, in the order that gives the most specific
+/// diagnosis first: that the sequence number is the next one, that the entry
+/// points at the entry before it, that the entry's contents still hash to the
+/// hash it carries, and that the entry belongs to the trail the chain is
+/// sealed under.
+///
+/// The identity rule: an entry without an identity is accepted only while
+/// the chain has not seen one — the prefix written before trails had
+/// identities. Once an identity has been seen, every later entry must carry
+/// exactly that identity. A chain can gain an identity once and never change
+/// or lose it.
+///
+/// `line` is the 1-based position of the entry in the file, reported on a
+/// break; a verifier without a file passes the sequence number.
+///
+/// # Errors
+///
+/// Returns the [`ChainBreak`] describing why `entry` does not follow `head`.
+pub fn verify_next(
+    head: &ChainHead,
+    entry: &AuditEntry,
+    line: usize,
+) -> Result<ChainHead, ChainBreak> {
+    let broken = |kind| ChainBreak {
+        line,
+        sequence: entry.sequence,
+        kind,
+    };
+
+    let expected_sequence = head.sequence.saturating_add(1);
+    if entry.sequence != expected_sequence {
+        return Err(broken(ChainBreakKind::SequenceGap {
+            expected: expected_sequence,
+            found: entry.sequence,
+        }));
+    }
+
+    if entry.prev_hash != head.hash {
+        return Err(broken(ChainBreakKind::PrevHashMismatch {
+            expected: head.hash.clone(),
+            found: entry.prev_hash.clone(),
+        }));
+    }
+
+    let recomputed = entry.recompute_hash();
+    if recomputed != entry.hash {
+        return Err(broken(ChainBreakKind::HashMismatch {
+            expected: recomputed,
+            found: entry.hash.clone(),
+        }));
+    }
+
+    let trail_id = match (&head.trail_id, &entry.trail_id) {
+        // Legacy prefix: nothing identified yet, and this entry does not
+        // change that.
+        (None, None) => None,
+        // The first identified entry: the chain takes on its identity.
+        (None, Some(found)) => Some(found.clone()),
+        (Some(expected), Some(found)) if expected == found => Some(expected.clone()),
+        (Some(expected), found) => {
+            return Err(broken(ChainBreakKind::TrailMismatch {
+                expected: Some(expected.to_string()),
+                found: found.as_ref().map(ToString::to_string),
+            }));
+        }
+    };
+
+    Ok(ChainHead {
+        sequence: entry.sequence,
+        hash: entry.hash.clone(),
+        entries: head.entries.saturating_add(1),
+        trail_id,
+    })
+}
+
 /// Walks a chain from the genesis hash and reports the first break.
 ///
-/// Three things are checked per entry, in the order that gives the most
-/// specific diagnosis first: that sequence numbers are consecutive, that the
-/// entry points at the entry before it, and that the entry's contents still
-/// hash to the hash it carries.
+/// A fold of [`verify_next`] over the entries, starting from
+/// [`ChainHead::empty`]; see there for what is checked.
 ///
 /// # Errors
 ///
@@ -124,55 +241,12 @@ impl fmt::Display for ChainBreak {
 /// hash chaining: detecting it needs the head compared against a value kept
 /// somewhere the writer cannot reach. [`ChainHead`] is what to compare.
 pub fn verify_chain(entries: &[AuditEntry]) -> Result<ChainHead, ChainBreak> {
-    let mut prev_hash = GENESIS_HASH.to_string();
-    let mut expected_sequence: u64 = 1;
-
-    for (index, entry) in entries.iter().enumerate() {
-        let line = index + 1;
-
-        if entry.sequence != expected_sequence {
-            return Err(ChainBreak {
-                line,
-                sequence: entry.sequence,
-                kind: ChainBreakKind::SequenceGap {
-                    expected: expected_sequence,
-                    found: entry.sequence,
-                },
-            });
-        }
-
-        if entry.prev_hash != prev_hash {
-            return Err(ChainBreak {
-                line,
-                sequence: entry.sequence,
-                kind: ChainBreakKind::PrevHashMismatch {
-                    expected: prev_hash,
-                    found: entry.prev_hash.clone(),
-                },
-            });
-        }
-
-        let recomputed = entry.recompute_hash();
-        if recomputed != entry.hash {
-            return Err(ChainBreak {
-                line,
-                sequence: entry.sequence,
-                kind: ChainBreakKind::HashMismatch {
-                    expected: recomputed,
-                    found: entry.hash.clone(),
-                },
-            });
-        }
-
-        prev_hash = entry.hash.clone();
-        expected_sequence = expected_sequence.saturating_add(1);
-    }
-
-    Ok(ChainHead {
-        sequence: entries.last().map_or(0, |entry| entry.sequence),
-        hash: prev_hash,
-        entries: entries.len() as u64,
-    })
+    entries
+        .iter()
+        .enumerate()
+        .try_fold(ChainHead::empty(), |head, (index, entry)| {
+            verify_next(&head, entry, index + 1)
+        })
 }
 
 #[cfg(test)]
@@ -203,12 +277,19 @@ mod tests {
         }
     }
 
-    /// Builds an intact chain of `count` entries.
+    /// Builds an intact chain of `count` legacy (unidentified) entries.
     fn chain(count: u64) -> Vec<AuditEntry> {
+        chain_under(count, &[])
+    }
+
+    /// Builds an intact chain of `count` entries, where entry `i` (1-based)
+    /// carries `trails[i - 1]` — `None` past the end of the slice.
+    fn chain_under(count: u64, trails: &[Option<&TrailId>]) -> Vec<AuditEntry> {
         let mut prev = GENESIS_HASH.to_string();
         let mut entries = Vec::new();
         for index in 1..=count {
-            let entry = AuditEntry::seal(record(index), index, &prev);
+            let trail = trails.get(index as usize - 1).copied().flatten();
+            let entry = AuditEntry::seal(record(index), index, &prev, trail);
             prev.clone_from(&entry.hash);
             entries.push(entry);
         }
@@ -219,6 +300,8 @@ mod tests {
     fn an_empty_chain_verifies_to_the_genesis_head() {
         let head = verify_chain(&[]).expect("an empty chain is intact");
         assert_eq!(head, ChainHead::empty());
+        assert!(head.is_empty());
+        assert_eq!(head.trail_id, None);
     }
 
     #[test]
@@ -229,6 +312,8 @@ mod tests {
         assert_eq!(head.entries, 5);
         assert_eq!(head.sequence, 5);
         assert_eq!(head.hash, entries[4].hash);
+        assert!(!head.is_empty());
+        assert_eq!(head.trail_id, None, "a legacy chain has no identity");
     }
 
     #[test]
@@ -267,6 +352,7 @@ mod tests {
             },
             3,
             &entries[1].hash,
+            None,
         );
         entries[2] = resealed;
 
@@ -329,5 +415,116 @@ mod tests {
 
         let broken = verify_chain(&entries).expect_err("the chain is broken");
         assert_eq!(broken.line, 2, "the earliest break is the one reported");
+    }
+
+    #[test]
+    fn verifying_one_step_at_a_time_reaches_the_same_head_as_the_walk() {
+        let trail = TrailId::new();
+        let entries = chain_under(4, &[Some(&trail); 4]);
+
+        let mut head = ChainHead::empty();
+        for (index, entry) in entries.iter().enumerate() {
+            head = verify_next(&head, entry, index + 1).expect("each link holds");
+            assert_eq!(head.sequence, entry.sequence);
+            assert_eq!(head.entries, entry.sequence);
+            assert_eq!(head.trail_id.as_ref(), Some(&trail));
+        }
+
+        assert_eq!(head, verify_chain(&entries).unwrap());
+    }
+
+    #[test]
+    fn an_identified_chain_reports_its_trail_in_the_head() {
+        let trail = TrailId::new();
+        let entries = chain_under(3, &[Some(&trail); 3]);
+
+        let head = verify_chain(&entries).expect("an identified chain verifies");
+        assert_eq!(head.trail_id, Some(trail));
+    }
+
+    #[test]
+    fn a_legacy_prefix_followed_by_identified_entries_verifies() {
+        // A trail written before identities existed, appended to by a build
+        // that has one: the chain takes on the identity where it first
+        // appears and keeps verifying.
+        let trail = TrailId::new();
+        let entries = chain_under(4, &[None, None, Some(&trail), Some(&trail)]);
+
+        let head = verify_chain(&entries).expect("gaining an identity is allowed once");
+        assert_eq!(head.trail_id, Some(trail));
+        assert_eq!(head.entries, 4);
+    }
+
+    #[test]
+    fn an_identified_chain_cannot_lose_its_identity() {
+        let trail = TrailId::new();
+        let entries = chain_under(3, &[Some(&trail), Some(&trail), None]);
+
+        let broken =
+            verify_chain(&entries).expect_err("dropping the identity must break the chain");
+
+        assert_eq!(broken.line, 3);
+        assert_eq!(
+            broken.kind,
+            ChainBreakKind::TrailMismatch {
+                expected: Some(trail.to_string()),
+                found: None,
+            }
+        );
+        assert!(broken.to_string().contains("unidentified"), "{broken}");
+    }
+
+    #[test]
+    fn two_different_identities_break_the_chain() {
+        let ours = TrailId::new();
+        let theirs = TrailId::new();
+        let entries = chain_under(3, &[Some(&ours), Some(&ours), Some(&theirs)]);
+
+        let broken = verify_chain(&entries).expect_err("a second identity must break the chain");
+
+        assert_eq!(broken.line, 3);
+        assert_eq!(
+            broken.kind,
+            ChainBreakKind::TrailMismatch {
+                expected: Some(ours.to_string()),
+                found: Some(theirs.to_string()),
+            }
+        );
+        let text = broken.to_string();
+        assert!(text.contains(&ours.to_string()), "{text}");
+        assert!(text.contains(&theirs.to_string()), "{text}");
+    }
+
+    #[test]
+    fn relabelling_a_whole_trail_is_caught_at_the_first_entry() {
+        // The forger who rewrites every entry's trail_id to pass one trail's
+        // evidence off as another's: the identity is in the hash, so the very
+        // first entry no longer hashes to itself.
+        let mut entries = chain_under(3, &[Some(&TrailId::new()); 3]);
+        let other = TrailId::new();
+        for entry in &mut entries {
+            entry.trail_id = Some(other.clone());
+        }
+
+        let broken = verify_chain(&entries).expect_err("a relabelled trail must not verify");
+        assert_eq!(broken.line, 1);
+        assert!(matches!(broken.kind, ChainBreakKind::HashMismatch { .. }));
+    }
+
+    #[test]
+    fn the_head_serializes_without_an_absent_identity() {
+        // Consumers reading the head as JSON — the CLI report, an embedder's
+        // status endpoint — see the same shape they did before identities.
+        let json = serde_json::to_value(ChainHead::empty()).unwrap();
+        assert!(json.get("trail_id").is_none(), "{json}");
+
+        let trail = TrailId::new();
+        let head = ChainHead {
+            trail_id: Some(trail.clone()),
+            ..ChainHead::empty()
+        };
+        let json = serde_json::to_value(&head).unwrap();
+        assert_eq!(json["trail_id"], json!(trail.to_string()));
+        assert_eq!(serde_json::from_value::<ChainHead>(json).unwrap(), head);
     }
 }

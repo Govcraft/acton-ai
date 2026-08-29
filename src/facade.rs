@@ -594,11 +594,26 @@ impl ActonAI {
         self.inner.audit.is_some()
     }
 
+    /// The audit settings in force, or `None` when no trail is configured.
+    ///
+    /// What an embedder reads to find the trail on disk — its path, and the
+    /// identity sidecar beside it via
+    /// [`AuditConfig::trail_id_path`](crate::audit::AuditConfig::trail_id_path)
+    /// — without re-reading the TOML the runtime already resolved.
+    #[must_use]
+    pub fn audit_config(&self) -> Option<&crate::audit::AuditConfig> {
+        self.inner.audit_config.as_ref()
+    }
+
     /// Where the audit trail's hash chain currently ends.
     ///
     /// Doubles as a barrier: mailboxes are FIFO, so a reply proves every
     /// invocation recorded before this call has already been written. That is
     /// how an audited flow is awaited without sleeping.
+    ///
+    /// The head also carries the trail's identity
+    /// ([`ChainHead::trail_id`](crate::audit::ChainHead::trail_id)), settled
+    /// at launch and sealed into every entry.
     ///
     /// # Errors
     ///

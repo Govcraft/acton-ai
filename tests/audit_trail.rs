@@ -639,6 +639,20 @@ async fn the_cli_reports_the_same_head_the_runtime_does() {
         json!(head.hash),
         "the CLI re-hashed the trail to something other than the runtime's head"
     );
+    // The identity the runtime sealed under is the one the file walk finds
+    // in the entries, and it is the one the sidecar beside the trail holds.
+    let trail_id = head
+        .trail_id
+        .as_ref()
+        .expect("a spawned trail has an identity");
+    assert_eq!(
+        report["trail_id"],
+        json!(trail_id.to_string()),
+        "the CLI and the runtime disagree about the trail's identity"
+    );
+    let sidecar = std::fs::read_to_string(dir.path().join("audit.jsonl.trail"))
+        .expect("the sidecar is written at launch");
+    assert_eq!(sidecar.trim(), trail_id.to_string());
 
     // The report names the file it actually checked, which is what makes it
     // usable as evidence rather than just a green tick.
