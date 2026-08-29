@@ -16,7 +16,17 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Database schema version for migrations.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Version 3 added the nullable `sessions.metadata` column. A database
+/// written at version 2 is upgraded in place by [`initialize_schema`], which
+/// adds the column when it is missing and leaves everything else untouched.
+pub const SCHEMA_VERSION: u32 = 3;
+
+/// The column an embedder keeps its own per-session state in.
+///
+/// Free-form text — JSON by convention — that the store never interprets.
+/// Named here so the migration and the fresh-schema definition agree.
+const SESSION_METADATA_COLUMN: &str = "metadata";
 
 /// SQL statements for schema creation.
 const CREATE_SCHEMA: &str = r"
@@ -67,7 +77,8 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent_id TEXT NOT NULL,
     system_prompt TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
-    last_active TEXT NOT NULL DEFAULT (datetime('now'))
+    last_active TEXT NOT NULL DEFAULT (datetime('now')),
+    metadata TEXT
 );
 
 CREATE TABLE IF NOT EXISTS heartbeat_entries (
@@ -232,6 +243,12 @@ pub async fn initialize_schema(conn: &Connection) -> Result<(), PersistenceError
         .await
         .map_err(|e| PersistenceError::schema_init(e.to_string()))?;
 
+    // `CREATE TABLE IF NOT EXISTS` leaves a table written by an older schema
+    // exactly as it was, so columns added since are applied one by one,
+    // each guarded by a look at what the table actually has. Idempotent:
+    // a database already at the current version is not touched.
+    ensure_session_metadata_column(conn).await?;
+
     // Set schema version
     conn.execute(
         "INSERT OR REPLACE INTO schema_version (version) VALUES (?1)",
@@ -241,6 +258,56 @@ pub async fn initialize_schema(conn: &Connection) -> Result<(), PersistenceError
     .map_err(|e| PersistenceError::schema_init(e.to_string()))?;
 
     Ok(())
+}
+
+/// Adds `sessions.metadata` to a database created before schema version 3.
+///
+/// A no-op when the column is already there.
+async fn ensure_session_metadata_column(conn: &Connection) -> Result<(), PersistenceError> {
+    let columns = table_columns(conn, "sessions").await?;
+    if has_column(&columns, SESSION_METADATA_COLUMN) {
+        return Ok(());
+    }
+
+    conn.execute(
+        &format!("ALTER TABLE sessions ADD COLUMN {SESSION_METADATA_COLUMN} TEXT"),
+        (),
+    )
+    .await
+    .map_err(|e| PersistenceError::schema_init(e.to_string()))?;
+
+    tracing::info!(
+        column = SESSION_METADATA_COLUMN,
+        "upgraded the sessions table to schema version {SCHEMA_VERSION}"
+    );
+    Ok(())
+}
+
+/// The column names of `table`, in declaration order.
+async fn table_columns(conn: &Connection, table: &str) -> Result<Vec<String>, PersistenceError> {
+    let mut rows = conn
+        .query(&format!("PRAGMA table_info({table})"), ())
+        .await
+        .map_err(|e| PersistenceError::schema_init(e.to_string()))?;
+
+    let mut columns = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .await
+        .map_err(|e| PersistenceError::schema_init(e.to_string()))?
+    {
+        // `PRAGMA table_info` columns: cid, name, type, notnull, dflt_value, pk.
+        let name: String = row
+            .get(1)
+            .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+        columns.push(name);
+    }
+    Ok(columns)
+}
+
+/// Whether `columns` (as reported by `PRAGMA table_info`) contains `wanted`.
+fn has_column(columns: &[String], wanted: &str) -> bool {
+    columns.iter().any(|column| column == wanted)
 }
 
 /// Creates a new conversation record.
@@ -930,31 +997,74 @@ pub struct SessionInfo {
     pub last_active: String,
     /// Number of messages in the conversation.
     pub message_count: usize,
+    /// The embedder's own state for this session, stored verbatim.
+    ///
+    /// The store never reads it; JSON is the convention. `None` for a
+    /// session created without any, including every session written before
+    /// schema version 3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<String>,
 }
 
 /// Creates a new session, including its backing conversation.
+///
+/// `metadata` is stored verbatim and handed back on
+/// [`SessionInfo::metadata`]; pass `None` when the caller keeps no state of
+/// its own.
 pub async fn create_session(
     conn: &Connection,
     name: &str,
     agent_id: &AgentId,
     system_prompt: Option<&str>,
+    metadata: Option<&str>,
 ) -> Result<ConversationId, PersistenceError> {
     let conv_id = create_conversation(conn, agent_id).await?;
 
     conn.execute(
-        "INSERT INTO sessions (name, conversation_id, agent_id, system_prompt)
-         VALUES (?1, ?2, ?3, ?4)",
+        "INSERT INTO sessions (name, conversation_id, agent_id, system_prompt, metadata)
+         VALUES (?1, ?2, ?3, ?4, ?5)",
         libsql::params![
             name.to_string(),
             conv_id.to_string(),
             agent_id.to_string(),
             system_prompt.map(|s| s.to_string()),
+            metadata.map(|s| s.to_string()),
         ],
     )
     .await
     .map_err(|e| PersistenceError::query_failed("create_session", e.to_string()))?;
 
     Ok(conv_id)
+}
+
+/// Replaces the metadata stored on a session.
+///
+/// `None` clears it. The session's `last_active` is left alone: metadata
+/// changes are bookkeeping, and only [`touch_session`] says a session was
+/// used.
+///
+/// # Errors
+///
+/// Returns a not-found error when no session has that name, so a caller
+/// updating a session it believes exists learns otherwise instead of
+/// silently writing nothing.
+pub async fn update_session_metadata(
+    conn: &Connection,
+    name: &str,
+    metadata: Option<&str>,
+) -> Result<(), PersistenceError> {
+    let changed = conn
+        .execute(
+            "UPDATE sessions SET metadata = ?1 WHERE name = ?2",
+            libsql::params![metadata.map(|s| s.to_string()), name.to_string()],
+        )
+        .await
+        .map_err(|e| PersistenceError::query_failed("update_session_metadata", e.to_string()))?;
+
+    if changed == 0 {
+        return Err(PersistenceError::not_found("session", name));
+    }
+    Ok(())
 }
 
 /// Resolves a session by name.
@@ -966,7 +1076,8 @@ pub async fn resolve_session(
         .query(
             "SELECT s.name, s.conversation_id, s.agent_id, s.system_prompt,
                     s.created_at, s.last_active,
-                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count
+                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count,
+                    s.metadata
              FROM sessions s WHERE s.name = ?1",
             [name.to_string()],
         )
@@ -990,7 +1101,8 @@ pub async fn list_sessions(conn: &Connection) -> Result<Vec<SessionInfo>, Persis
         .query(
             "SELECT s.name, s.conversation_id, s.agent_id, s.system_prompt,
                     s.created_at, s.last_active,
-                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count
+                    (SELECT COUNT(*) FROM messages WHERE conversation_id = s.conversation_id) as msg_count,
+                    s.metadata
              FROM sessions s ORDER BY s.last_active DESC",
             (),
         )
@@ -1058,6 +1170,9 @@ fn parse_session_row(row: &libsql::Row) -> Result<SessionInfo, PersistenceError>
     let msg_count: i64 = row
         .get(6)
         .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
+    let metadata: Option<String> = row
+        .get(7)
+        .map_err(|e| PersistenceError::deserialization_failed(e.to_string()))?;
 
     Ok(SessionInfo {
         name,
@@ -1069,6 +1184,7 @@ fn parse_session_row(row: &libsql::Row) -> Result<SessionInfo, PersistenceError>
         created_at,
         last_active,
         message_count: msg_count as usize,
+        metadata,
     })
 }
 
@@ -1681,6 +1797,181 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(err.to_string().contains("unknown"));
+    }
+
+    /// A connection over a fresh in-memory database with the current schema.
+    async fn fresh_connection() -> Connection {
+        let db = open_database(&PersistenceConfig::in_memory())
+            .await
+            .expect("an in-memory database opens");
+        let conn = db.connect().expect("a connection opens");
+        initialize_schema(&conn).await.expect("the schema applies");
+        conn
+    }
+
+    /// The `sessions` table exactly as schema version 2 created it, plus the
+    /// version row a v2 process would have left behind.
+    const V2_SESSIONS: &str = r"
+CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);
+INSERT OR REPLACE INTO schema_version (version) VALUES (2);
+CREATE TABLE IF NOT EXISTS conversations (
+    id TEXT PRIMARY KEY,
+    agent_id TEXT NOT NULL,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+    role TEXT NOT NULL,
+    content TEXT NOT NULL,
+    tool_calls TEXT,
+    tool_call_id TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    name TEXT PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    agent_id TEXT NOT NULL,
+    system_prompt TEXT,
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    last_active TEXT NOT NULL DEFAULT (datetime('now'))
+);
+";
+
+    async fn schema_version(conn: &Connection) -> u32 {
+        let mut rows = conn
+            // `version` is the primary key, so an upgrade adds a row rather
+            // than replacing the old one; the newest is the one in force.
+            .query("SELECT MAX(version) FROM schema_version", ())
+            .await
+            .expect("the version row reads");
+        let row = rows
+            .next()
+            .await
+            .expect("the version row reads")
+            .expect("a version row exists");
+        let version: i64 = row.get(0).expect("the version is an integer");
+        u32::try_from(version).expect("the version is small")
+    }
+
+    #[tokio::test]
+    async fn a_session_keeps_its_metadata_through_the_database() {
+        let conn = fresh_connection().await;
+        let agent = AgentId::new();
+
+        let with = create_session(&conn, "with", &agent, Some("sys"), Some(r#"{"a":1}"#))
+            .await
+            .expect("creating succeeds");
+        let without = create_session(&conn, "without", &agent, None, None)
+            .await
+            .expect("creating succeeds");
+        assert_ne!(with, without);
+
+        let with = resolve_session(&conn, "with")
+            .await
+            .expect("resolving succeeds")
+            .expect("the session exists");
+        assert_eq!(with.metadata.as_deref(), Some(r#"{"a":1}"#));
+        assert_eq!(with.system_prompt.as_deref(), Some("sys"));
+
+        let without = resolve_session(&conn, "without")
+            .await
+            .expect("resolving succeeds")
+            .expect("the session exists");
+        assert_eq!(without.metadata, None);
+
+        // Metadata rides through the listing too, and is absent from the
+        // serialized form when there is none.
+        let listed = list_sessions(&conn).await.expect("listing succeeds");
+        assert_eq!(listed.len(), 2);
+        let json = serde_json::to_string(&without).expect("serializes");
+        assert!(!json.contains("metadata"), "{json}");
+    }
+
+    #[tokio::test]
+    async fn metadata_is_updated_in_place_and_refused_for_a_missing_session() {
+        let conn = fresh_connection().await;
+        create_session(&conn, "s", &AgentId::new(), None, Some("v1"))
+            .await
+            .expect("creating succeeds");
+
+        update_session_metadata(&conn, "s", Some("v2"))
+            .await
+            .expect("updating succeeds");
+        assert_eq!(
+            resolve_session(&conn, "s").await.unwrap().unwrap().metadata,
+            Some("v2".to_string())
+        );
+
+        update_session_metadata(&conn, "s", None)
+            .await
+            .expect("clearing succeeds");
+        assert_eq!(
+            resolve_session(&conn, "s").await.unwrap().unwrap().metadata,
+            None
+        );
+
+        let error = update_session_metadata(&conn, "missing", Some("v1"))
+            .await
+            .expect_err("a missing session cannot be updated");
+        assert!(error.is_not_found(), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_version_2_database_gains_the_metadata_column_once() {
+        let db = open_database(&PersistenceConfig::in_memory())
+            .await
+            .expect("an in-memory database opens");
+        let conn = db.connect().expect("a connection opens");
+        conn.execute_batch(V2_SESSIONS)
+            .await
+            .expect("the v2 schema applies");
+        // A session a v2 process wrote, with no metadata column to write to.
+        conn.execute(
+            "INSERT INTO sessions (name, conversation_id, agent_id) VALUES ('old', 'c', 'a')",
+            (),
+        )
+        .await
+        .expect("a v2 row inserts");
+        assert!(!has_column(
+            &table_columns(&conn, "sessions").await.unwrap(),
+            SESSION_METADATA_COLUMN
+        ));
+        assert_eq!(schema_version(&conn).await, 2);
+
+        initialize_schema(&conn).await.expect("the upgrade applies");
+
+        let columns = table_columns(&conn, "sessions").await.unwrap();
+        assert!(has_column(&columns, SESSION_METADATA_COLUMN), "{columns:?}");
+        assert_eq!(schema_version(&conn).await, SCHEMA_VERSION);
+
+        // The old row survives, reads back with no metadata, and is
+        // updatable now that the column exists.
+        let mut rows = conn
+            .query("SELECT metadata FROM sessions WHERE name = 'old'", ())
+            .await
+            .expect("the old row reads");
+        let row = rows.next().await.unwrap().expect("the old row is there");
+        let metadata: Option<String> = row.get(0).expect("the new column reads");
+        assert_eq!(metadata, None);
+        update_session_metadata(&conn, "old", Some("migrated"))
+            .await
+            .expect("the upgraded row updates");
+
+        // Running the initializer again is a no-op, not a second ALTER.
+        initialize_schema(&conn)
+            .await
+            .expect("re-initializing an upgraded database succeeds");
+        let again = table_columns(&conn, "sessions").await.unwrap();
+        assert_eq!(again, columns);
+    }
+
+    #[test]
+    fn has_column_matches_exact_names_only() {
+        let columns = vec!["name".to_string(), "metadata".to_string()];
+        assert!(has_column(&columns, "metadata"));
+        assert!(!has_column(&columns, "meta"));
+        assert!(!has_column(&[], "metadata"));
     }
 
     #[test]

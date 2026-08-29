@@ -22,7 +22,7 @@ use crate::checkpoint::{CheckpointRecord, CheckpointStatus};
 use crate::memory::context::{ContextStats, ContextWindow, ContextWindowConfig};
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
-use crate::memory::persistence::{self, AgentStateSnapshot, PersistenceConfig};
+use crate::memory::persistence::{self, AgentStateSnapshot, PersistenceConfig, SessionInfo};
 use crate::messages::Message;
 use crate::types::{AgentId, CheckpointId, ConversationId, MemoryId, MessageId};
 use acton_reactive::prelude::*;
@@ -189,6 +189,121 @@ pub struct OperationCompleted {
     pub operation: &'static str,
     /// Whether it succeeded, and why not if it did not
     pub result: Result<(), PersistenceError>,
+}
+
+// -----------------------------------------------------------------------------
+// Session Messages
+//
+// A session is a named handle on a conversation: the name is the caller's
+// (an embedder's own session id, a CLI user's label), the conversation is
+// minted here. `metadata` is the embedder's per-session state, stored
+// verbatim and never interpreted by the store.
+// -----------------------------------------------------------------------------
+
+/// Request to create a named session and the conversation behind it.
+///
+/// Fails when a session with that name already exists: names are the
+/// caller's identity for a session, so a collision is a caller bug, not a
+/// reason to hand back somebody else's conversation.
+#[acton_message]
+pub struct CreateSession {
+    /// The caller's name for the session; unique across the store.
+    pub name: String,
+    /// The agent owning the session's conversation.
+    pub agent_id: AgentId,
+    /// The system prompt the session runs under, if it has one.
+    pub system_prompt: Option<String>,
+    /// The caller's own state for the session, stored verbatim.
+    pub metadata: Option<String>,
+}
+
+/// Reply to [`CreateSession`].
+#[acton_message]
+pub struct SessionCreated {
+    /// The conversation minted for the session, or why none was.
+    pub result: Result<ConversationId, PersistenceError>,
+}
+
+impl Request for CreateSession {
+    type Response = SessionCreated;
+}
+
+/// Request to look a session up by name.
+#[acton_message]
+pub struct ResolveSession {
+    /// The session's name.
+    pub name: String,
+}
+
+/// Reply to [`ResolveSession`].
+#[acton_message]
+pub struct SessionResolved {
+    /// The session, `None` when no session has that name, or why the lookup
+    /// failed.
+    pub result: Result<Option<SessionInfo>, PersistenceError>,
+}
+
+impl Request for ResolveSession {
+    type Response = SessionResolved;
+}
+
+/// Request for every session in the store, most recently active first.
+#[acton_message]
+pub struct ListSessions;
+
+/// Reply to [`ListSessions`].
+#[acton_message]
+pub struct SessionList {
+    /// The sessions, or why they could not be listed.
+    pub result: Result<Vec<SessionInfo>, PersistenceError>,
+}
+
+impl Request for ListSessions {
+    type Response = SessionList;
+}
+
+/// Request to mark a session as active now.
+///
+/// Touching a name nobody holds succeeds and changes nothing.
+#[acton_message]
+pub struct TouchSession {
+    /// The session's name.
+    pub name: String,
+}
+
+impl Request for TouchSession {
+    type Response = OperationCompleted;
+}
+
+/// Request to replace a session's metadata.
+///
+/// `None` clears it. Answers a not-found failure when no session has that
+/// name, so a caller keeping state for a session it believes exists learns
+/// that it does not.
+#[acton_message]
+pub struct UpdateSessionMetadata {
+    /// The session's name.
+    pub name: String,
+    /// The new metadata, stored verbatim.
+    pub metadata: Option<String>,
+}
+
+impl Request for UpdateSessionMetadata {
+    type Response = OperationCompleted;
+}
+
+/// Request to delete a session, its conversation, and every message in it.
+///
+/// Deleting a name nobody holds succeeds: the caller wanted it gone, and it
+/// is gone.
+#[acton_message]
+pub struct DeleteSession {
+    /// The session's name.
+    pub name: String,
+}
+
+impl Request for DeleteSession {
+    type Response = OperationCompleted;
 }
 
 // -----------------------------------------------------------------------------
@@ -479,6 +594,7 @@ impl Request for ListCheckpointClaims {
 #[derive(Debug, Default)]
 struct MemoryStoreCounters {
     conversations_created: AtomicU64,
+    sessions_created: AtomicU64,
     messages_saved: AtomicU64,
     conversations_loaded: AtomicU64,
     state_saves: AtomicU64,
@@ -502,6 +618,8 @@ pub struct MemoryStoreMetrics {
 pub struct MemoryStoreMetricsSnapshot {
     /// Number of conversations created
     pub conversations_created: u64,
+    /// Number of named sessions created
+    pub sessions_created: u64,
     /// Number of messages saved
     pub messages_saved: u64,
     /// Number of conversations loaded
@@ -523,6 +641,12 @@ impl MemoryStoreMetrics {
     #[must_use]
     pub fn conversations_created(&self) -> u64 {
         self.counters.conversations_created.load(Ordering::Relaxed)
+    }
+
+    /// Number of named sessions created.
+    #[must_use]
+    pub fn sessions_created(&self) -> u64 {
+        self.counters.sessions_created.load(Ordering::Relaxed)
     }
 
     /// Number of messages saved.
@@ -572,6 +696,7 @@ impl MemoryStoreMetrics {
     pub fn snapshot(&self) -> MemoryStoreMetricsSnapshot {
         MemoryStoreMetricsSnapshot {
             conversations_created: self.conversations_created(),
+            sessions_created: self.sessions_created(),
             messages_saved: self.messages_saved(),
             conversations_loaded: self.conversations_loaded(),
             state_saves: self.state_saves(),
@@ -715,6 +840,8 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     configure_init_handler(builder);
     configure_conversation_write_handlers(builder);
     configure_conversation_read_handlers(builder);
+    configure_session_write_handlers(builder);
+    configure_session_read_handlers(builder);
     configure_state_handlers(builder);
     configure_memory_write_handlers(builder);
     configure_memory_read_handlers(builder);
@@ -1041,6 +1168,159 @@ fn configure_conversation_read_handlers(builder: &mut ManagedActor<Idle, MemoryS
             let result = persistence::list_conversations(&conn, &agent_id).await;
             log_failure("list_conversations", &result);
             reply.send(ConversationList { result }).await;
+        })
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Session writes
+//
+// `mutate_on`, like conversation writes: a session row is created, touched,
+// re-labelled and deleted by the same embedder in a definite order, and that
+// order has to be the one the database ends up with.
+// -----------------------------------------------------------------------------
+
+/// The database work behind a session write that only reports success or
+/// failure.
+type SessionWork = Pin<Box<dyn Future<Output = Result<(), PersistenceError>> + Send>>;
+
+/// Replies to a session write whose only outcome is success or failure.
+fn session_operation<F>(
+    actor: &MemoryStore,
+    reply: OutboundEnvelope,
+    operation: &'static str,
+    work: F,
+) -> ReplyFuture
+where
+    F: FnOnce(Connection) -> SessionWork + Send + 'static,
+{
+    let conn = match actor.ready_connection() {
+        Ok(conn) => conn,
+        Err(e) => {
+            return reply_now(
+                reply,
+                OperationCompleted {
+                    operation,
+                    result: Err(e),
+                },
+            );
+        }
+    };
+
+    attached(async move {
+        let result = work(conn).await;
+        log_failure(operation, &result);
+        reply.send(OperationCompleted { operation, result }).await;
+    })
+}
+
+/// Configures the session handlers that write.
+fn configure_session_write_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.mutate_on::<CreateSession>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let msg = envelope.message();
+        let name = msg.name.clone();
+        let agent_id = msg.agent_id.clone();
+        let system_prompt = msg.system_prompt.clone();
+        let metadata = msg.metadata.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, SessionCreated { result: Err(e) }),
+        };
+
+        actor
+            .model
+            .metrics
+            .counters
+            .sessions_created
+            .fetch_add(1, Ordering::Relaxed);
+
+        attached(async move {
+            let result = persistence::create_session(
+                &conn,
+                &name,
+                &agent_id,
+                system_prompt.as_deref(),
+                metadata.as_deref(),
+            )
+            .await;
+            log_failure("create_session", &result);
+            reply.send(SessionCreated { result }).await;
+        })
+    });
+
+    builder.mutate_on::<TouchSession>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let name = envelope.message().name.clone();
+
+        session_operation(&actor.model, reply, "touch_session", move |conn| {
+            Box::pin(async move { persistence::touch_session(&conn, &name).await })
+        })
+    });
+
+    builder.mutate_on::<UpdateSessionMetadata>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let msg = envelope.message();
+        let name = msg.name.clone();
+        let metadata = msg.metadata.clone();
+
+        session_operation(
+            &actor.model,
+            reply,
+            "update_session_metadata",
+            move |conn| {
+                Box::pin(async move {
+                    persistence::update_session_metadata(&conn, &name, metadata.as_deref()).await
+                })
+            },
+        )
+    });
+
+    builder.mutate_on::<DeleteSession>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let name = envelope.message().name.clone();
+
+        session_operation(&actor.model, reply, "delete_session", move |conn| {
+            Box::pin(async move { persistence::delete_session(&conn, &name).await })
+        })
+    });
+}
+
+// -----------------------------------------------------------------------------
+// Session reads
+// -----------------------------------------------------------------------------
+
+/// Configures the session handlers that only read.
+fn configure_session_read_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
+    builder.act_on::<ResolveSession>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let name = envelope.message().name.clone();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, SessionResolved { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::resolve_session(&conn, &name).await;
+            log_failure("resolve_session", &result);
+            reply.send(SessionResolved { result }).await;
+        })
+    });
+
+    builder.act_on::<ListSessions>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+
+        let conn = match actor.model.ready_connection() {
+            Ok(conn) => conn,
+            Err(e) => return reply_now(reply, SessionList { result: Err(e) }),
+        };
+
+        attached(async move {
+            let result = persistence::list_sessions(&conn).await;
+            log_failure("list_sessions", &result);
+            reply.send(SessionList { result }).await;
         })
     });
 }
@@ -1389,6 +1669,7 @@ mod tests {
         counters
             .conversations_created
             .fetch_add(1, Ordering::Relaxed);
+        counters.sessions_created.fetch_add(9, Ordering::Relaxed);
         counters.messages_saved.fetch_add(2, Ordering::Relaxed);
         counters
             .conversations_loaded
@@ -1405,6 +1686,7 @@ mod tests {
             metrics.snapshot(),
             MemoryStoreMetricsSnapshot {
                 conversations_created: 1,
+                sessions_created: 9,
                 messages_saved: 2,
                 conversations_loaded: 3,
                 state_saves: 4,

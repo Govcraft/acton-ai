@@ -709,6 +709,24 @@ impl ActonAI {
             .map(|checkpoint| checkpoint.store.clone())
     }
 
+    /// The [`ResumePolicy`](crate::checkpoint::ResumePolicy) this runtime
+    /// applied to interrupted turns at launch, when checkpointing is
+    /// configured.
+    ///
+    /// Exists so an embedder can refuse a policy it cannot honour. One that
+    /// executes tools only under a connected client's approval, say, must
+    /// not run under
+    /// [`ResumeAuto`](crate::checkpoint::ResumePolicy::ResumeAuto): the
+    /// background resume would settle pending tool calls with nobody to ask.
+    /// `None` when the runtime does not checkpoint at all.
+    #[must_use]
+    pub fn checkpoint_policy(&self) -> Option<crate::checkpoint::ResumePolicy> {
+        self.inner
+            .checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.policy)
+    }
+
     /// Lists the turns a previous process left unfinished.
     ///
     /// In-progress and failed records, newest first. Abandoned and completed
@@ -1102,6 +1120,15 @@ impl ActonAI {
     /// If [`with_builtins`](ActonAIBuilder::with_builtins) was configured, builtins
     /// are automatically enabled (unless [`manual_builtins`](ActonAIBuilder::manual_builtins)
     /// was used).
+    ///
+    /// Unlike [`prompt`](Self::prompt), this attaches **no** checkpoint sink,
+    /// even when the runtime was launched with a `[checkpoint]` section: the
+    /// history is the caller's, so the checkpoint's identity is too. A caller
+    /// that wants the turn recorded calls
+    /// [`PromptBuilder::checkpoint`](crate::prompt::PromptBuilder::checkpoint)
+    /// with the store from [`checkpoint_store`](Self::checkpoint_store) and an
+    /// ID of its own, usually alongside
+    /// [`conversation_id`](crate::prompt::PromptBuilder::conversation_id).
     ///
     /// # Example
     ///

@@ -54,7 +54,8 @@ use crate::facade::ActonAI;
 use crate::llm::{CheckHealth, FailoverEvent, ProviderHealth, SamplingParams};
 use crate::messages::{
     LLMRequest, LLMStreamEnd, LLMStreamStart, LLMStreamToken, LLMStreamToolCall, Message,
-    StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, TurnOutcome, Usage,
+    MessageRole, StopReason, ToolCall, ToolChoice, ToolDefinition, TurnLifecycle, TurnOutcome,
+    Usage,
 };
 use crate::stream::{CollectedResponse, ExecutedToolCall, StreamContext};
 use crate::tools::ToolError;
@@ -1054,6 +1055,20 @@ impl PromptBuilder {
     /// `CheckpointId` that nobody wrote down is a checkpoint nobody can
     /// resume.
     ///
+    /// # Which builders carry a sink
+    ///
+    /// [`ActonAI::prompt`](crate::ActonAI::prompt) attaches a sink under a
+    /// fresh ID whenever the runtime was launched with a `[checkpoint]`
+    /// section; calling this afterwards replaces it with the caller's ID.
+    /// [`ActonAI::continue_with`](crate::ActonAI::continue_with) never
+    /// attaches one: a turn driven from a caller-owned history belongs to a
+    /// session the caller is already keeping, so the caller chooses the ID
+    /// — and calls this method — itself. The sink composes with
+    /// [`conversation_id`](Self::conversation_id): the record carries the
+    /// conversation it belongs to, and its fingerprint is taken over the
+    /// history's last user message, so each turn of a session is its own
+    /// checkpoint rather than one indistinguishable from the next.
+    ///
     /// # What counts as the same turn
     ///
     /// A resume is refused, with
@@ -1441,6 +1456,13 @@ impl PromptBuilder {
         // never touches the record: it belongs to the running owner.
         let result = match checkpoint.claim().await {
             Ok(()) => {
+                // The claim is held by a guard from here on, so the one exit
+                // the code below cannot see — this future being dropped
+                // mid-turn by a caller that cancelled it — still frees the
+                // ID. Without that, a cancelled turn would hold its
+                // checkpoint's claim until the process died, and the record
+                // it left behind could never be resumed or abandoned.
+                let claim = ClaimGuard::new(checkpoint.clone());
                 let result = self.run_rounds(session, &turn, &mut stats, &turn_id).await;
 
                 // A failed turn's record stays exactly as it was, so it is still
@@ -1457,7 +1479,7 @@ impl PromptBuilder {
 
                 // Released win or lose, and before TurnFinished: once the
                 // turn is over, the ID is free for the next attempt.
-                checkpoint.release().await;
+                claim.release().await;
                 result
             }
             Err(error) => Err(error),
@@ -1563,6 +1585,13 @@ impl PromptBuilder {
         );
         let mut compaction_records: Vec<crate::memory::CompactionRecord> = Vec::new();
 
+        // What this turn is actually about, for the checkpoint fingerprint.
+        // Resolved before the history is moved into `messages`: with a
+        // history, `user_content` is the empty placeholder `continue_with`
+        // passed and the real question is the history's last user message.
+        let fingerprint_content =
+            turn_user_content(conversation_history.as_deref(), &user_content).to_string();
+
         // Build the initial messages
         let mut messages = Vec::new();
         if let Some(ref system) = system_prompt {
@@ -1625,7 +1654,7 @@ impl PromptBuilder {
             .map(|spec| spec.tool_definition().input_schema.to_string());
         let checkpoint_inputs = TurnInputs {
             system_prompt: system_prompt.as_deref(),
-            user_content: &user_content,
+            user_content: &fingerprint_content,
             tool_names: &checkpoint_tool_names,
             provider: &billed_provider,
             max_tool_rounds,
@@ -2565,6 +2594,82 @@ impl std::fmt::Display for DisplayId<'_> {
 /// keeps in-flight turns in a `HashSet`, where a second remove is a no-op.
 /// The failure direction is chosen deliberately: an occasional duplicate
 /// finish is idempotent, while a missing one wedges a drain forever.
+/// The user content a turn is about, for its checkpoint fingerprint.
+///
+/// A builder driven from a history — [`ActonAI::continue_with`] — carries
+/// the empty string as its `user_content`, so fingerprinting that would make
+/// every turn of a session look like the same turn. The history's last user
+/// message is the question this turn answers, and it is what goes into the
+/// hash instead. Without a history, or with one that holds no user message,
+/// the placeholder `user_content` stands.
+fn turn_user_content<'a>(history: Option<&'a [Message]>, user_content: &'a str) -> &'a str {
+    history
+        .and_then(|messages| {
+            messages
+                .iter()
+                .rev()
+                .find(|message| message.role == MessageRole::User)
+        })
+        .map_or(user_content, |message| message.content.as_str())
+}
+
+/// Holds a checkpoint claim for exactly as long as the turn that took it.
+///
+/// The prompt loop releases explicitly on every path it can see, through
+/// [`release`](Self::release), so the reply doubles as a barrier before
+/// `TurnFinished`. The path it cannot see is the caller dropping the turn's
+/// future mid-await; `Drop` covers that one by spawning the release, so a
+/// cancelled turn's ID is free for the resume or abandonment that follows.
+/// Same shape, and same `Handle` note, as [`TurnFinishedGuard`].
+struct ClaimGuard {
+    sink: CheckpointSink,
+    handle: Option<tokio::runtime::Handle>,
+    released: bool,
+}
+
+impl ClaimGuard {
+    /// Arms the guard for a claim [`CheckpointSink::claim`] just granted.
+    fn new(sink: CheckpointSink) -> Self {
+        Self {
+            sink,
+            handle: tokio::runtime::Handle::try_current().ok(),
+            released: false,
+        }
+    }
+
+    /// Releases the claim and waits for the store to acknowledge it.
+    ///
+    /// Consumes the guard: after this, its `Drop` is a no-op.
+    async fn release(mut self) {
+        self.sink.release().await;
+        self.released = true;
+    }
+}
+
+impl Drop for ClaimGuard {
+    fn drop(&mut self) {
+        if self.released || !self.sink.is_enabled() {
+            return;
+        }
+        let sink = self.sink.clone();
+        let handle = self
+            .handle
+            .take()
+            .or_else(|| tokio::runtime::Handle::try_current().ok());
+        match handle {
+            Some(handle) => {
+                handle.spawn(async move {
+                    sink.release().await;
+                });
+            }
+            None => tracing::warn!(
+                checkpoint = ?sink.id(),
+                "a cancelled turn's checkpoint claim could not be released: no runtime"
+            ),
+        }
+    }
+}
+
 struct TurnFinishedGuard {
     broker: BrokerRef,
     turn_id: TurnId,
@@ -3852,6 +3957,42 @@ struct CollectorResultData {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn without_a_history_the_placeholder_content_is_the_turn() {
+        assert_eq!(turn_user_content(None, "what is 2 + 2?"), "what is 2 + 2?");
+    }
+
+    #[test]
+    fn with_a_history_the_last_user_message_is_the_turn() {
+        let history = vec![
+            Message::user("What is Rust?"),
+            Message::assistant("A systems language."),
+            Message::user("How does ownership work?"),
+            Message::assistant("Each value has one owner."),
+            Message::user("And borrowing?"),
+        ];
+
+        assert_eq!(turn_user_content(Some(&history), ""), "And borrowing?");
+    }
+
+    #[test]
+    fn a_trailing_assistant_message_does_not_hide_the_user_question() {
+        let history = vec![
+            Message::user("Deploy the fix"),
+            Message::assistant("Deploying."),
+        ];
+
+        assert_eq!(turn_user_content(Some(&history), ""), "Deploy the fix");
+    }
+
+    #[test]
+    fn a_history_without_a_user_message_falls_back_to_the_placeholder() {
+        let history = vec![Message::system("Be brief."), Message::assistant("Hello.")];
+
+        assert_eq!(turn_user_content(Some(&history), "seed"), "seed");
+        assert_eq!(turn_user_content(Some(&[]), ""), "");
+    }
 
     #[test]
     fn a_refused_turn_gets_its_own_span_outcome() {

@@ -106,7 +106,8 @@ pub async fn execute(
         let agent_id = AgentId::new();
         let system = args.system.as_deref().unwrap_or(DEFAULT_SYSTEM_PROMPT);
         let conv_id =
-            persistence::create_session(&conn, &session_name, &agent_id, Some(system)).await?;
+            persistence::create_session(&conn, &session_name, &agent_id, Some(system), None)
+                .await?;
         (conv_id, Some(system.to_string()), "created")
     } else {
         let available = persistence::list_sessions(&conn)

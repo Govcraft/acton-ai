@@ -177,12 +177,14 @@ pub mod prelude {
     pub use crate::memory::{
         AgentStateSnapshot, CheckpointList, CheckpointLoaded, CheckpointSaved, CompactionConfig,
         CompactionOutcome, CompactionRecord, CompactionThreshold, ContextStats, ContextWindow,
-        ContextWindowConfig, ContextWindowData, ContextWindowResponse, DeleteCheckpoint, Embedding,
-        EmbeddingError, EmbeddingProvider, GetContextWindow, InitMemoryStore, KeepRecentTurns,
-        ListCheckpoints, LoadCheckpoint, LoadMemories, MemoriesLoaded, Memory, MemorySearchResults,
-        MemoryStore, MemoryStoreMetrics, MemoryStoreMetricsSnapshot, MemoryStored,
-        OperationCompleted, PersistenceConfig, PersistenceError, SaveCheckpoint, ScoredMemory,
-        SearchMemories, StoreMemory, StubEmbeddingProvider, TruncationStrategy,
+        ContextWindowConfig, ContextWindowData, ContextWindowResponse, CreateSession,
+        DeleteCheckpoint, DeleteSession, Embedding, EmbeddingError, EmbeddingProvider,
+        GetContextWindow, InitMemoryStore, KeepRecentTurns, ListCheckpoints, ListSessions,
+        LoadCheckpoint, LoadMemories, MemoriesLoaded, Memory, MemorySearchResults, MemoryStore,
+        MemoryStoreMetrics, MemoryStoreMetricsSnapshot, MemoryStored, OperationCompleted,
+        PersistenceConfig, PersistenceError, ResolveSession, SaveCheckpoint, ScoredMemory,
+        SearchMemories, SessionCreated, SessionInfo, SessionList, SessionResolved, StoreMemory,
+        StubEmbeddingProvider, TouchSession, TruncationStrategy, UpdateSessionMetadata,
     };
     pub use crate::messages::*;
     pub use crate::tools::builtins::{

@@ -175,6 +175,7 @@ pub async fn execute(
                 session_name,
                 &agent_id,
                 Some(&job.system_prompt),
+                None,
             )
             .await?
         };

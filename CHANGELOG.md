@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Session persistence for embedders.** The `MemoryStore` actor now answers
+  the named-session messages the CLI used to reach only through free
+  functions: `CreateSession` (-> `SessionCreated`), `ResolveSession`
+  (-> `SessionResolved`), `ListSessions` (-> `SessionList`), `TouchSession`,
+  `UpdateSessionMetadata` and `DeleteSession` (-> `OperationCompleted`).
+  Sessions carry an opaque `metadata` column (`SessionInfo::metadata`,
+  `update_session_metadata`) for the embedder's own per-session state;
+  the database schema is version 3 and a version-2 file gains the column in
+  place on its next open. `ActonAI::checkpoint_policy()` reports the
+  `ResumePolicy` a runtime launched under, so an embedder can refuse
+  `resume_auto`. A turn whose future is dropped mid-flight — an embedder's
+  cancel — now releases its checkpoint claim from `Drop`, so the record it
+  left is listed by `interrupted_turns()` and can be resumed or abandoned
+  by id instead of staying claimed until the process dies. A turn driven by
+  `continue_with` fingerprints its checkpoint over the history's last user
+  message rather than the empty placeholder, so the turns of one session no
+  longer all look like the same turn; `continue_with` still attaches no
+  sink of its own, which is now documented on both it and
+  `PromptBuilder::checkpoint`.
+
 - **Trail identity bound into the chain.** Every audit trail now has a
   `TrailId` (TypeID, prefix `trail`), minted the first time an audit log
   opens it, kept in a sidecar beside the file (`audit.jsonl.trail`,
@@ -25,6 +45,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (with `TrailIdConflict`) are public under `audit`.
 
 ### Changed
+
+- **`create_session` takes the session metadata.** The persistence function
+  is now `create_session(conn, name, agent_id, system_prompt, metadata:
+  Option<&str>)`; pass `None` to keep the old behaviour.
 
 - **`AuditEntry::seal` takes the trail identity.** The signature is now
   `seal(record, sequence, prev_hash, trail_id: Option<&TrailId>)`; `None`

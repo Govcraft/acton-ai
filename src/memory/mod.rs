@@ -91,7 +91,13 @@ pub use persistence::{
 pub use persistence::{
     complete_entry, create_heartbeat_entry, create_session, delete_session, list_due_entries,
     list_entries_for_session, list_sessions, resolve_session, touch_session,
-    update_entry_after_run, HeartbeatEntry, SessionInfo,
+    update_entry_after_run, update_session_metadata, HeartbeatEntry, SessionInfo,
+};
+
+// Re-export session store messages
+pub use store::{
+    CreateSession, DeleteSession, ListSessions, ResolveSession, SessionCreated, SessionList,
+    SessionResolved, TouchSession, UpdateSessionMetadata,
 };
 
 // Re-export memory graph types
