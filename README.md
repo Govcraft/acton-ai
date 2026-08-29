@@ -42,7 +42,9 @@ Five lines to an interactive chat with file access and command execution.
 - **OpenTelemetry export** — Traces spanning each prompt loop (turn → rounds → tools) plus token, latency, and reliability metrics, over OTLP to any collector
 - **Failover & circuit breaking** — Named provider chains tried in order, a per-provider circuit breaker with half-open recovery, and model degradation when a vendor throttles instead of dies
 - **Tool-approval policy** — Allowlists, denylists, and per-turn invocation caps over every tool the model can reach, plus an async approval hook for a human in the loop; a refusal is fed back to the model and the turn carries on
-- **Tamper-evident audit trail** — Every tool invocation appended to a BLAKE3 hash-chained JSONL log with secrets redacted, verified by `acton-ai audit verify`
+- **Tamper-evident audit trail** — Every tool invocation appended to a BLAKE3 hash-chained JSONL log with secrets redacted, verified by `acton-ai audit verify`; the trail carries its own identity and admits exactly one writer
+- **Durable audit and writer health** — `durability = "strict"` acknowledges every entry before the next tool runs, and a trail that has started failing refuses mutating tools through the ordinary refusal path instead of quietly losing evidence; the writer's state is readable as `AuditHealth`
+- **Persistent sessions** — Named sessions with their messages, an opaque metadata column for the embedder's own per-session state, and checkpoint recovery that lists the turns a crash interrupted
 - **FIPS mode** — An optional `fips` build routes every TLS connection through the FIPS 140-3 validated AWS-LC module
 - **Rate limiting** — Built-in request and token limits per provider
 - **Actor-based architecture** — Fault-tolerant, concurrent design via [acton-reactive](https://docs.rs/acton-reactive)
@@ -72,6 +74,10 @@ process sandbox; a no-op elsewhere), `derive` (the [`#[tool]`](#deriving-tools-w
 attribute macro), and `otel` ([OpenTelemetry export](#observability)). All three are
 independent — `--no-default-features --features derive` gets you the macro with no OS
 hardening and no telemetry stack.
+
+The minimum supported Rust is **1.89**. That is where `std::fs::File::try_lock`
+stabilized, and the audit trail's single-writer claim uses it, so an older
+toolchain fails at resolution rather than part-way through a build.
 
 For Ollama (local), no API key is needed. For cloud providers, set environment variables:
 
@@ -616,8 +622,44 @@ a key name; a matched key has its whole subtree replaced. Setting
 in your config is the list in force.
 
 One actor owns the chain and is the only thing that writes the file, which is
-what makes the ordering guarantee real rather than hopeful. Recording is
-fire-and-forget: a turn is never blocked on a disk.
+what makes the ordering guarantee real rather than hopeful.
+
+**Every trail has an identity.** The first time an audit log opens a trail it
+mints a `TrailId` (a TypeID with prefix `trail`), keeps it in a sidecar beside
+the file (`audit.jsonl.trail`), and seals it into every entry's hash. An entry
+cannot be relabelled as some other trail's, and a chain cannot change identity
+part-way: `verify_chain` reports that as `ChainBreakKind::TrailMismatch`.
+`audit verify` prints the identity on a `trail:` line and carries `trail_id` in
+its JSON report. Trails written before identities existed keep verifying, and
+gain one on their next spawn; a sidecar that disagrees with the chain refuses
+the spawn.
+
+**One writer, enforced by the kernel.** `AuditLog::spawn` claims the trail with
+an exclusive advisory lock before it reads the chain head, and holds it for the
+actor's lifetime. A second process opening the same trail fails to launch with
+a configuration error rather than forking the chain, and on Linux the refusal
+names the pid holding the lock. There is no pid file to go stale: the kernel
+releases the claim on shutdown or on `SIGKILL`. Read-only verification of a
+live trail is unaffected.
+
+**Durability is a choice.** The default, `best_effort`, is fire-and-forget: a
+turn is never blocked on a disk.
+
+```toml
+[audit]
+durability = "strict"
+```
+
+Under `strict`, every entry is fsynced and acknowledged before the prompt loop
+considers the next tool call, and once an append has failed the loop refuses
+every tool not declared idempotent. That refusal travels the ordinary path, so
+the attempt is itself recorded as denied and the model is told that mutating
+tools stay refused for the rest of the session. An audit actor that does not
+answer the guard at all is treated the same way, because the guard fails
+closed. Read the writer's state with `ActonAI::audit_health()`: healthy,
+degraded or disabled, with appended and failed counts, the first sequence that
+failed, and the last error. The healthy-to-degraded transition is broadcast
+once as `AuditHealthChanged`.
 
 ### FIPS mode
 
