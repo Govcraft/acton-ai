@@ -824,9 +824,10 @@ async fn drive_around_a_failure(ai: &ActonAI, path: &Path) -> CollectedResponse 
                 Ok(args)
             }
         })
-        .with_tool(idempotent_tool_definition("read_thing"), |args| async move {
-            Ok(args)
-        })
+        .with_tool(
+            idempotent_tool_definition("read_thing"),
+            |args| async move { Ok(args) },
+        )
         .collect()
         .await
         .expect("the turn must complete")
@@ -844,7 +845,11 @@ async fn strict_mode_refuses_mutating_calls_after_an_append_failure() {
     assert_eq!(server.request_count(), 4, "every round was served");
     let calls = &response.tool_calls;
     assert_eq!(calls.len(), 3);
-    assert!(calls[0].result.is_ok(), "the first call ran: {:?}", calls[0]);
+    assert!(
+        calls[0].result.is_ok(),
+        "the first call ran: {:?}",
+        calls[0]
+    );
 
     // The second mutating call is refused: its record could not be made.
     let refusal = calls[1]
@@ -855,7 +860,11 @@ async fn strict_mode_refuses_mutating_calls_after_an_append_failure() {
     assert!(refusal.contains("denied by policy"), "{refusal}");
 
     // The read-only call still ran: refusing a read protects nothing.
-    assert!(calls[2].result.is_ok(), "an idempotent call runs: {:?}", calls[2]);
+    assert!(
+        calls[2].result.is_ok(),
+        "an idempotent call runs: {:?}",
+        calls[2]
+    );
 
     let health = ai.audit_health().await.expect("health is reported");
     assert!(health.is_degraded());
@@ -916,8 +925,8 @@ async fn strict_mode_acknowledges_each_entry_before_the_next_call() {
         Round::text("done"),
     ])
     .await;
-    let ai = runtime_with_durability("audit-strict-ack", &server, &path, AuditDurability::Strict)
-        .await;
+    let ai =
+        runtime_with_durability("audit-strict-ack", &server, &path, AuditDurability::Strict).await;
 
     ai.prompt("echo twice")
         .with_tool(tool_definition("echo"), |args| async move { Ok(args) })
@@ -949,7 +958,8 @@ async fn audit_health_reports_healthy_before_any_write_and_disabled_without_a_tr
     let path = dir.path().join("audit.jsonl");
     let server = MockServer::start(vec![Round::text("hello")]).await;
 
-    let armed = runtime_with_durability("audit-armed", &server, &path, AuditDurability::Strict).await;
+    let armed =
+        runtime_with_durability("audit-armed", &server, &path, AuditDurability::Strict).await;
     let health = armed.audit_health().await.expect("health is reported");
     assert_eq!(health.state, AuditHealthState::Healthy);
     assert_eq!(health.appended, 0);
@@ -967,7 +977,10 @@ async fn audit_health_reports_healthy_before_any_write_and_disabled_without_a_tr
         .launch()
         .await
         .expect("launching the runtime must succeed");
-    let health = unaudited.audit_health().await.expect("disabled is an answer");
+    let health = unaudited
+        .audit_health()
+        .await
+        .expect("disabled is an answer");
     assert_eq!(health.state, AuditHealthState::Disabled);
     assert!(!health.is_degraded());
     assert_eq!(unaudited.audit_durability(), None);

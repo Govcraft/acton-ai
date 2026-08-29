@@ -437,9 +437,15 @@ mod tests {
             last_error: Some("No space left on device".to_string()),
         }
         .to_string();
-        assert!(with_error.contains("audit trail is degraded"), "{with_error}");
+        assert!(
+            with_error.contains("audit trail is degraded"),
+            "{with_error}"
+        );
         assert!(with_error.contains("3 append failure"), "{with_error}");
-        assert!(with_error.contains("No space left on device"), "{with_error}");
+        assert!(
+            with_error.contains("No space left on device"),
+            "{with_error}"
+        );
         assert!(with_error.contains("restarted"), "{with_error}");
 
         let without_error = DenialReason::AuditDegraded {
@@ -453,7 +459,10 @@ mod tests {
             error: "timed out".to_string(),
         }
         .to_string();
-        assert!(unreachable.contains("could not be consulted"), "{unreachable}");
+        assert!(
+            unreachable.contains("could not be consulted"),
+            "{unreachable}"
+        );
         assert!(unreachable.contains("timed out"), "{unreachable}");
     }
 
