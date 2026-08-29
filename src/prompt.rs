@@ -2926,7 +2926,11 @@ impl CompactionGate {
             })
             .await;
 
-        Some(crate::memory::CompactionRecord { summary, outcome })
+        Some(crate::memory::CompactionRecord {
+            summary,
+            outcome,
+            elided_prefix_len: plan.elided_prefix_len(),
+        })
     }
 }
 

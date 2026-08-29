@@ -392,6 +392,18 @@ impl CompactionPlan {
         &self.elided
     }
 
+    /// How many leading non-system messages the summary will replace.
+    ///
+    /// [`plan_compaction`] always elides from the front: the elided span is
+    /// exactly the first `elided_prefix_len()` messages of the history with
+    /// its leading system message held aside, and [`preserved`](Self::preserved)
+    /// is everything after them. This is the number a caller that keeps its
+    /// own copy of the history needs in order to replay the compaction on it.
+    #[must_use]
+    pub fn elided_prefix_len(&self) -> usize {
+        self.elided.len()
+    }
+
     /// The trailing turns that survive verbatim, in order.
     #[must_use]
     pub fn preserved(&self) -> &[Message] {
@@ -440,12 +452,31 @@ impl CompactionOutcome {
 /// stores a session can write [`Self::as_message`] alongside the turn's own
 /// messages, and the stored conversation then records that — and what — the
 /// model was told it forgot. The CLI's session store does exactly that.
+///
+/// An embedder that owns the history itself — one that hands the prompt loop
+/// `history + prompt` on every turn and keeps its own copy — needs more than
+/// the summary: it needs to know *which* of its messages the summary stands
+/// for, or the next turn resends the elided span and pays for the same
+/// summary again. [`Self::elided_prefix_len`] is that promise, stated as a
+/// guarantee rather than left to be inferred from
+/// [`CompactionOutcome::messages_elided`], and [`Self::adopt`] applies it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CompactionRecord {
     /// The provider-written summary that replaced the elided span.
     pub summary: String,
     /// The measured effect of the pass.
     pub outcome: CompactionOutcome,
+    /// How many leading messages the summary replaced, counted from the first
+    /// **non-system** message of the history as the loop held it when the
+    /// pass ran.
+    ///
+    /// The loop always elides a strict prefix: a leading system message is
+    /// held aside and never counted, and the summary takes the place of
+    /// exactly the next `elided_prefix_len` messages, in order, with nothing
+    /// removed from the middle. Two records of one turn apply in sequence,
+    /// each against the history the previous one produced (which then opens
+    /// with that record's summary message).
+    pub elided_prefix_len: usize,
 }
 
 impl CompactionRecord {
@@ -454,6 +485,32 @@ impl CompactionRecord {
     #[must_use]
     pub fn as_message(&self) -> Message {
         summary_message(&self.summary)
+    }
+
+    /// Replays this compaction onto a caller's own copy of the history.
+    ///
+    /// Holds a leading system message aside, drops the first
+    /// [`elided_prefix_len`](Self::elided_prefix_len) messages after it —
+    /// or all of them, when the caller's copy is shorter than the span the
+    /// loop elided, because the loop's list also carried the turn's prompt
+    /// and rounds the caller never keeps — and puts [`Self::as_message`] in
+    /// their place. The caller's messages are otherwise left as they are:
+    /// the structural repair the loop applies on the wire (which can merge a
+    /// preserved user turn into the summary message) is not applied here,
+    /// because the loop applies it again to whatever the caller sends next,
+    /// and a stored session should keep the participants' turns separate.
+    ///
+    /// Pure and total: it never fails, and the summary is present in the
+    /// result exactly once.
+    #[must_use]
+    pub fn adopt(&self, history: &[Message]) -> Vec<Message> {
+        let (system, rest) = split_leading_system(history);
+        let dropped = self.elided_prefix_len.min(rest.len());
+        let mut adopted = Vec::with_capacity(rest.len() - dropped + 2);
+        adopted.extend(system);
+        adopted.push(self.as_message());
+        adopted.extend(rest[dropped..].iter().cloned());
+        adopted
     }
 }
 
@@ -1131,8 +1188,157 @@ mod tests {
                 tokens_after: 200,
                 messages_elided: 7,
             },
+            elided_prefix_len: 7,
         };
 
         assert_eq!(record.as_message(), summary_message(SUMMARY));
+    }
+
+    // -- prefix elision and adoption --------------------------------------
+
+    /// A record whose summary stands for the first `n` non-system messages.
+    fn record(n: usize) -> CompactionRecord {
+        CompactionRecord {
+            summary: SUMMARY.to_string(),
+            outcome: CompactionOutcome {
+                messages_before: 0,
+                messages_after: 0,
+                tokens_before: 0,
+                tokens_after: 0,
+                messages_elided: n,
+            },
+            elided_prefix_len: n,
+        }
+    }
+
+    #[test]
+    fn a_plan_elides_a_strict_prefix_of_the_non_system_history() {
+        let history = chatty_history(6, 400);
+        let plan = plan_compaction(&window(1_000), &CompactionConfig::default(), &history)
+            .expect("over threshold");
+
+        let n = plan.elided_prefix_len();
+        assert!(n > 0);
+        assert_eq!(n, plan.elided().len());
+        assert_eq!(plan.system(), Some(&history[0]));
+        assert_eq!(plan.elided(), &history[1..=n]);
+        assert_eq!(plan.preserved(), &history[n + 1..]);
+    }
+
+    #[test]
+    fn a_plan_over_a_history_with_no_system_message_elides_from_index_zero() {
+        let history: Vec<Message> = chatty_history(6, 400).into_iter().skip(1).collect();
+        let plan = plan_compaction(&window(1_000), &CompactionConfig::default(), &history)
+            .expect("over threshold");
+
+        let n = plan.elided_prefix_len();
+        assert!(n > 0);
+        assert_eq!(plan.system(), None);
+        assert_eq!(plan.elided(), &history[..n]);
+        assert_eq!(plan.preserved(), &history[n..]);
+    }
+
+    #[test]
+    fn the_prefix_length_is_what_the_outcome_counts_as_elided() {
+        let history = chatty_history(6, 400);
+        let plan = plan_compaction(&window(1_000), &CompactionConfig::default(), &history)
+            .expect("over threshold");
+        let (_, outcome) =
+            finish_compaction(&window(1_000), &plan, SUMMARY).expect("summary is smaller");
+
+        assert_eq!(plan.elided_prefix_len(), outcome.messages_elided);
+    }
+
+    #[test]
+    fn adopting_replaces_the_prefix_and_keeps_the_system_message() {
+        let history = vec![
+            Message::system("sys"),
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+        ];
+
+        let adopted = record(2).adopt(&history);
+
+        assert_eq!(
+            adopted,
+            vec![
+                Message::system("sys"),
+                summary_message(SUMMARY),
+                Message::user("u2"),
+                Message::assistant("a2"),
+            ]
+        );
+    }
+
+    #[test]
+    fn adopting_without_a_system_message_starts_with_the_summary() {
+        let history = vec![
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+        ];
+
+        let adopted = record(2).adopt(&history);
+
+        assert_eq!(adopted, vec![summary_message(SUMMARY), Message::user("u2")]);
+    }
+
+    #[test]
+    fn adopting_a_span_longer_than_the_owned_history_leaves_only_the_summary() {
+        let history = vec![Message::user("u1"), Message::assistant("a1")];
+
+        let adopted = record(5).adopt(&history);
+
+        assert_eq!(adopted, vec![summary_message(SUMMARY)]);
+    }
+
+    #[test]
+    fn adopting_matches_what_the_loop_produced_for_the_owned_prefix() {
+        // The embedder owns the exchanges; the loop's list is those plus the
+        // turn's own prompt, which the embedder does not keep.
+        let owned = chatty_history(6, 400);
+        let mut loop_view = owned.clone();
+        loop_view.push(Message::user("this turn's prompt"));
+
+        let plan = plan_compaction(&window(1_000), &CompactionConfig::default(), &loop_view)
+            .expect("over threshold");
+        let (compacted, outcome) =
+            finish_compaction(&window(1_000), &plan, SUMMARY).expect("summary is smaller");
+        let record = CompactionRecord {
+            summary: SUMMARY.to_string(),
+            outcome,
+            elided_prefix_len: plan.elided_prefix_len(),
+        };
+
+        // `adopt` leaves the embedder's messages as they are; the loop's copy
+        // has additionally been through the wire repair, which may merge a
+        // preserved user turn into the summary message. The next turn sends
+        // the adopted history through the same repair, so the two agree on
+        // the wire.
+        let adopted = sanitize_history(&record.adopt(&owned));
+        assert!(adopted.len() <= compacted.len());
+        assert_eq!(adopted.as_slice(), &compacted[..adopted.len()]);
+    }
+
+    #[test]
+    fn two_records_adopt_in_sequence_against_the_previous_result() {
+        let history = vec![
+            Message::user("u1"),
+            Message::assistant("a1"),
+            Message::user("u2"),
+            Message::assistant("a2"),
+            Message::user("u3"),
+        ];
+
+        // The second pass saw a list opening with the first summary, so its
+        // prefix counts that summary as message zero.
+        let first = record(2);
+        let mut second = record(3);
+        second.summary = "later".to_string();
+        let adopted = second.adopt(&first.adopt(&history));
+
+        assert_eq!(adopted, vec![summary_message("later"), Message::user("u3")]);
     }
 }
