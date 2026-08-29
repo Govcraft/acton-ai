@@ -96,6 +96,16 @@ impl ProcessSandbox {
         set_optional_u64_env(&mut cmd, env_vars::MEM_BYTES, self.config.memory_limit);
         set_optional_u64_env(&mut cmd, env_vars::CPU_SECS, self.config.cpu_limit_secs);
         set_optional_u64_env(&mut cmd, env_vars::FSIZE_BYTES, self.config.fsize_limit);
+        set_path_list_env(
+            &mut cmd,
+            env_vars::READ_EXEC_PATHS,
+            &self.config.read_exec_paths,
+        );
+        set_path_list_env(
+            &mut cmd,
+            env_vars::READ_WRITE_PATHS,
+            &self.config.read_write_paths,
+        );
 
         #[cfg(unix)]
         cmd.process_group(0);
@@ -272,6 +282,32 @@ fn hardening_to_env(mode: HardeningMode) -> &'static str {
         HardeningMode::Off => "off",
         HardeningMode::BestEffort => "besteffort",
         HardeningMode::Enforce => "enforce",
+    }
+}
+
+/// Carries one declared path list to the child.
+///
+/// An empty list sets nothing: the child treats an absent variable as "no
+/// extra rules", which is the same thing and keeps the child's environment
+/// free of noise. A list that cannot be joined is logged at `error` rather
+/// than dropped quietly — [`ProcessSandboxConfig::validate`] already refuses
+/// the separator that would cause it, so reaching here means the config
+/// bypassed validation, and a silent narrowing of the ruleset is precisely
+/// the failure mode this configuration exists to remove.
+fn set_path_list_env(cmd: &mut Command, key: &str, paths: &[PathBuf]) {
+    if paths.is_empty() {
+        return;
+    }
+    match std::env::join_paths(paths) {
+        Ok(joined) => {
+            cmd.env(key, joined);
+        }
+        Err(err) => {
+            tracing::error!(
+                target: "acton_ai::sandbox::process",
+                "{key}: refusing to forward an unjoinable path list: {err}",
+            );
+        }
     }
 }
 

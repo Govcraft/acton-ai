@@ -270,6 +270,13 @@ hardening = "besteffort"    # "off" | "besteffort" | "enforce"
 max_execution_ms = 30000
 max_memory_mb = 256
 
+# The hardened child reaches the system directories, $TMPDIR and the session
+# root, and nothing else — so a toolchain installed under $HOME is found by
+# the shell on PATH and then refused by the kernel. Declare what it needs.
+[sandbox.paths]
+read_exec = ["~/.local/bin", "~/.local/share/uv"]
+read_write = ["~/.cache/uv"]
+
 # Optional: rates for usage costs. Dollars per million tokens, copied
 # straight off a vendor pricing page. Required for budgets.
 [providers.claude.pricing]
@@ -577,19 +584,20 @@ refused, or failed:
 ```toml
 [audit]
 path = "/var/log/acton-ai/audit.jsonl"
+user = "acct:alice"
 redact_patterns = ["password", "token", "api_key", "authorization"]
 ```
 
 or `.audit_to("/var/log/acton-ai/audit.jsonl")` on the builder. Off unless one
 of the two is present.
 
-Each line is one entry: timestamp, correlation / conversation / turn IDs, tool
-name, the arguments with secret-bearing keys redacted *before* they are
-written, a bounded result summary, who approved or refused it and under which
-rule, and how long it took. Every entry carries the BLAKE3 hash of the one
-before it, so editing an entry invalidates it, and re-sealing that entry
-invalidates its successor. The chain starts at a fixed genesis hash and is
-resumed, never restarted, when the process restarts.
+Each line is one entry: timestamp, acting user, correlation / conversation /
+turn IDs, tool name, the arguments with secret-bearing keys redacted *before*
+they are written, a bounded result summary, the complete response size, who
+approved or refused it and under which rule, and how long it took. Every entry
+carries the BLAKE3 hash of the one before it, so editing an entry invalidates
+it, and re-sealing that entry invalidates its successor. The chain starts at a
+fixed genesis hash and is resumed, never restarted, when the process restarts.
 
 ```bash
 acton-ai audit verify                                   # the configured trail

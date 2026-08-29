@@ -364,6 +364,9 @@ fn write_plain(output: &OutputWriter, report: &ConfigReport) -> Result<(), CliEr
                 crate::audit::default_audit_path().display()
             ))?,
         }
+        if let Some(user) = &audit.user {
+            output.write_line(&format!("  user:             {user}"))?;
+        }
         // Patterns, not what they matched: these are key fragments an operator
         // chose, and printing them is how you check the list is the one you
         // meant. Nothing they matched is ever in this report.

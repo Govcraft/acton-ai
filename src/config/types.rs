@@ -341,6 +341,7 @@ impl ToolPolicyFileConfig {
 /// [audit]
 /// enabled = true                              # optional, default true
 /// path = "/var/log/acton-ai/audit.jsonl"      # optional, defaults under the data dir
+/// user = "acct:alice"                         # optional acting principal
 /// redact_patterns = ["password", "ssn"]       # optional, replaces the defaults
 /// ```
 ///
@@ -360,6 +361,10 @@ pub struct AuditFileConfig {
     /// is created at launch.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<PathBuf>,
+
+    /// The principal on whose behalf this process invokes tools.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
 
     /// Argument key fragments whose values are redacted before writing.
     ///
@@ -415,6 +420,16 @@ impl AuditFileConfig {
         }
 
         let mut config = crate::audit::AuditConfig::new(path);
+
+        if let Some(user) = self.user.as_deref() {
+            if user.trim().is_empty() {
+                return Err(ActonAIError::configuration(
+                    "audit.user",
+                    "the acting user cannot be empty",
+                ));
+            }
+            config = config.with_user(user);
+        }
 
         if !self.redact_patterns.is_empty() {
             if self.redact_patterns.iter().any(|p| p.trim().is_empty()) {
@@ -1555,10 +1570,15 @@ impl ActonAIDefaults {
 /// ```toml
 /// [sandbox]
 /// hardening = "besteffort"    # "off" | "besteffort" | "enforce"
+/// env_allowlist = ["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "UV_CACHE_DIR"]
 ///
 /// [sandbox.limits]
 /// max_execution_ms = 30000
 /// max_memory_mb = 256
+///
+/// [sandbox.paths]
+/// read_exec = ["~/.local/bin", "~/.local/share/uv"]
+/// read_write = ["~/.cache/uv"]
 /// ```
 ///
 /// Missing keys fall through to [`ProcessSandboxConfig::default`]. Unknown
@@ -1576,6 +1596,53 @@ pub struct SandboxFileConfig {
     /// Resource limits for sandbox execution.
     #[serde(default)]
     pub limits: Option<SandboxLimitsConfig>,
+
+    /// Environment variables forwarded into the sandbox child.
+    ///
+    /// **Replaces** the default list rather than adding to it, so name every
+    /// variable the child still needs: the default is
+    /// `["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR"]`, and a child without
+    /// `PATH` finds no binaries at all. An empty list is refused at
+    /// validation rather than producing a child that can see nothing.
+    #[serde(default)]
+    pub env_allowlist: Option<Vec<String>>,
+
+    /// Directories the hardened child may reach beyond the built-in system
+    /// paths. See [`SandboxPathsConfig`].
+    #[serde(default)]
+    pub paths: Option<SandboxPathsConfig>,
+}
+
+/// Directories the hardened sandbox child may reach.
+///
+/// The built-in landlock ruleset grants the system directories (`/usr`,
+/// `/bin`, `/etc`, …), `$TMPDIR` and the session root. Everything else is
+/// refused, which for a user-installed toolchain means a binary the shell
+/// finds on `PATH` and the kernel then declines to execute — reported as a
+/// bare `Permission denied`. These two lists are how a deployment widens
+/// that boundary, deliberately and in writing:
+///
+/// ```toml
+/// [sandbox.paths]
+/// # `uv` itself, and the interpreters it manages.
+/// read_exec = ["~/.local/bin", "~/.local/share/uv"]
+/// # The cache it must write to before it can run anything.
+/// read_write = ["~/.cache/uv"]
+/// ```
+///
+/// A leading `~/` expands against `HOME`. Every entry must be absolute once
+/// expanded; a relative path is refused rather than resolved against
+/// whatever directory the child happened to start in. Entries that do not
+/// exist are warned about and skipped, in every hardening mode.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct SandboxPathsConfig {
+    /// Directories the child may read from and execute binaries in.
+    #[serde(default)]
+    pub read_exec: Vec<PathBuf>,
+
+    /// Directories the child may read and write.
+    #[serde(default)]
+    pub read_write: Vec<PathBuf>,
 }
 
 impl SandboxFileConfig {
@@ -1620,6 +1687,16 @@ impl SandboxFileConfig {
                 let bytes = (memory_mb as u64).saturating_mul(1024 * 1024);
                 config = config.with_memory_limit(Some(bytes));
             }
+        }
+
+        if let Some(ref allowlist) = self.env_allowlist {
+            config = config.with_env_allowlist(allowlist.clone());
+        }
+
+        if let Some(ref paths) = self.paths {
+            config = config
+                .with_read_exec_paths(paths.read_exec.iter().map(|p| expand_home(p)))
+                .with_read_write_paths(paths.read_write.iter().map(|p| expand_home(p)));
         }
 
         config
@@ -2108,6 +2185,87 @@ tokens_per_minute = 1000000
     }
 
     #[test]
+    fn sandbox_paths_reach_the_process_config() {
+        let toml = r#"
+[sandbox]
+hardening = "enforce"
+
+[sandbox.paths]
+read_exec = ["/opt/tools", "/usr/local/bin"]
+read_write = ["/var/cache/uv"]
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("sandbox paths must parse");
+        let process = config
+            .sandbox
+            .expect("the section is present")
+            .to_process_config();
+
+        assert_eq!(
+            process.read_exec_paths,
+            vec![PathBuf::from("/opt/tools"), PathBuf::from("/usr/local/bin")],
+        );
+        assert_eq!(
+            process.read_write_paths,
+            vec![PathBuf::from("/var/cache/uv")]
+        );
+        assert!(
+            process.validate().is_ok(),
+            "absolute declared paths must validate"
+        );
+    }
+
+    #[test]
+    fn a_declared_path_expands_a_leading_tilde() {
+        // `~/.local/bin` is how an operator writes it, and a literal `~`
+        // directory is not what landlock would be handed.
+        let toml = r#"
+[sandbox.paths]
+read_exec = ["~/.local/bin"]
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("must parse");
+        let process = config.sandbox.expect("present").to_process_config();
+
+        let expected = std::env::var_os("HOME")
+            .map(|home| PathBuf::from(home).join(".local/bin"))
+            .unwrap_or_else(|| PathBuf::from("~/.local/bin"));
+        assert_eq!(process.read_exec_paths, vec![expected]);
+    }
+
+    #[test]
+    fn omitting_the_paths_section_leaves_the_boundary_alone() {
+        let toml = r#"
+[sandbox]
+hardening = "best-effort"
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("must parse");
+        let process = config.sandbox.expect("present").to_process_config();
+
+        assert!(process.read_exec_paths.is_empty());
+        assert!(process.read_write_paths.is_empty());
+    }
+
+    #[test]
+    fn a_configured_env_allowlist_replaces_the_default() {
+        // Replacing, not extending: the operator owns the whole list, which
+        // is why the docs insist they name PATH and HOME themselves.
+        let toml = r#"
+[sandbox]
+env_allowlist = ["PATH", "HOME", "UV_CACHE_DIR"]
+"#;
+        let config: ActonAIConfig = toml::from_str(toml).expect("must parse");
+        let process = config.sandbox.expect("present").to_process_config();
+
+        assert_eq!(
+            process.env_allowlist,
+            vec![
+                "PATH".to_string(),
+                "HOME".to_string(),
+                "UV_CACHE_DIR".to_string()
+            ],
+        );
+    }
+
+    #[test]
     fn sandbox_file_config_to_process_config_with_values() {
         let config = SandboxFileConfig {
             hardening: Some(HardeningMode::Enforce),
@@ -2115,6 +2273,7 @@ tokens_per_minute = 1000000
                 max_execution_ms: Some(60_000),
                 max_memory_mb: Some(128),
             }),
+            ..SandboxFileConfig::default()
         };
 
         let process_config = config.to_process_config();
@@ -2290,6 +2449,7 @@ max_execution_ms = 60000
                     max_execution_ms: Some(60_000),
                     max_memory_mb: Some(128),
                 }),
+                ..SandboxFileConfig::default()
             }),
             persistence: None,
             cli: None,

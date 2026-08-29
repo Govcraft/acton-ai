@@ -188,6 +188,7 @@ mod tests {
             timestamp: format!("2026-08-19T12:00:0{index}Z"),
             correlation_id: CorrelationId::new(),
             conversation_id: None,
+            user: None,
             turn_id: TurnId::new(),
             tool_call_id: format!("toolu_{index}"),
             tool_name: format!("tool_{index}"),
@@ -197,6 +198,7 @@ mod tests {
             },
             decision: AuditDecision::approved(Decider::NoPolicy),
             duration_ms: index,
+            response_size_bytes: Some(4),
             resumed: false,
         }
     }

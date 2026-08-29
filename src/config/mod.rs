@@ -37,15 +37,25 @@
 //! # Which provider to use when none specified
 //! default_provider = "ollama"
 //!
-//! # Sandbox configuration (optional)
+//! # Sandbox configuration (optional). Tool calls that write run in a
+//! # re-exec'd child of this binary, hardened with landlock and seccomp
+//! # where the kernel offers them.
 //! [sandbox]
-//! pool_warmup = 4
-//! pool_max_per_type = 32
-//! max_executions_before_recycle = 1000
+//! hardening = "best-effort"   # "off" | "best-effort" | "enforce"
+//! # Replaces the default list; name every variable the child still needs.
+//! env_allowlist = ["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "UV_CACHE_DIR"]
 //!
 //! [sandbox.limits]
 //! max_execution_ms = 30000
 //! max_memory_mb = 64
+//!
+//! # Directories the hardened child may reach beyond the system paths,
+//! # `$TMPDIR` and the session root. User-installed toolchains live here:
+//! # without an entry, a binary the shell finds on PATH is refused by the
+//! # kernel as a bare "Permission denied".
+//! [sandbox.paths]
+//! read_exec = ["~/.local/bin", "~/.local/share/uv"]
+//! read_write = ["~/.cache/uv"]
 //!
 //! # External MCP servers. Use `command` (stdio) or `url` (streamable HTTP),
 //! # never both. Their tools reach the LLM as `mcp__{server}__{tool}`.
@@ -85,6 +95,6 @@ pub use types::{
     CheckpointFileConfig, CircuitBreakerFileConfig, CliFileConfig, ContextFileConfig,
     IntrospectionFileConfig, JobConfig, McpServerConfig, NamedProviderConfig,
     PersistenceFileConfig, PricingFileConfig, RateLimitFileConfig, SandboxFileConfig,
-    SandboxLimitsConfig, SkillsFileConfig, TelemetryFileConfig, ToolPolicyFileConfig,
-    DEFAULT_MCP_TOOL_TIMEOUT_SECS,
+    SandboxLimitsConfig, SandboxPathsConfig, SkillsFileConfig, TelemetryFileConfig,
+    ToolPolicyFileConfig, DEFAULT_MCP_TOOL_TIMEOUT_SECS,
 };

@@ -17,6 +17,8 @@ pub struct AuditConfig {
     path: PathBuf,
     /// What gets redacted out of arguments before they are written.
     redactor: Redactor,
+    /// The principal on whose behalf tool calls run.
+    user: Option<String>,
 }
 
 impl AuditConfig {
@@ -26,6 +28,7 @@ impl AuditConfig {
         Self {
             path: path.into(),
             redactor: Redactor::with_defaults(),
+            user: None,
         }
     }
 
@@ -33,6 +36,13 @@ impl AuditConfig {
     #[must_use]
     pub fn with_redactor(mut self, redactor: Redactor) -> Self {
         self.redactor = redactor;
+        self
+    }
+
+    /// Stamps `user` onto every entry written by this audit session.
+    #[must_use]
+    pub fn with_user(mut self, user: impl Into<String>) -> Self {
+        self.user = Some(user.into());
         self
     }
 
@@ -46,6 +56,12 @@ impl AuditConfig {
     #[must_use]
     pub fn redactor(&self) -> &Redactor {
         &self.redactor
+    }
+
+    /// The principal stamped onto entries, when configured.
+    #[must_use]
+    pub fn user(&self) -> Option<&str> {
+        self.user.as_deref()
     }
 
     /// Makes sure the trail's directory exists.
@@ -142,6 +158,13 @@ mod tests {
         let config = AuditConfig::new("/tmp/audit.jsonl");
         assert!(config.redactor().matches_key("api_key"));
         assert_eq!(config.path(), Path::new("/tmp/audit.jsonl"));
+        assert_eq!(config.user(), None);
+    }
+
+    #[test]
+    fn a_config_can_name_the_acting_user() {
+        let config = AuditConfig::new("/tmp/audit.jsonl").with_user("acct:alice");
+        assert_eq!(config.user(), Some("acct:alice"));
     }
 
     #[test]

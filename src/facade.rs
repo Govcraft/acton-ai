@@ -2018,7 +2018,10 @@ impl ActonAIBuilder {
     /// ```rust,ignore
     /// let ai = ActonAI::builder()
     ///     .anthropic_from_env()
-    ///     .audit(AuditConfig::new("/var/log/acton-ai/audit.jsonl"))
+    ///     .audit(
+    ///         AuditConfig::new("/var/log/acton-ai/audit.jsonl")
+    ///             .with_user("acct:alice"),
+    ///     )
     ///     .launch()
     ///     .await?;
     /// ```

@@ -7,6 +7,7 @@
 //! matches the pattern already used in [`crate::config::types`] and avoids
 //! pulling in a new dependency solely for human-friendly durations.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
@@ -33,7 +34,11 @@ pub const DEFAULT_FSIZE_LIMIT: u64 = 128 * 1024 * 1024;
 /// Environment variables forwarded to the child process by default.
 ///
 /// Anything not in this list is stripped before `execve`, reducing the
-/// blast radius of leaked secrets.
+/// blast radius of leaked secrets. A deployment whose tools need more —
+/// `UV_CACHE_DIR`, `CARGO_HOME`, a proxy variable — replaces the whole list
+/// via [`ProcessSandboxConfig::with_env_allowlist`] or the `env_allowlist`
+/// key in the `[sandbox]` config section. Replacing means replacing: name
+/// every variable the child still needs, `PATH` and `HOME` included.
 pub const DEFAULT_ENV_ALLOWLIST: &[&str] = &["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR"];
 
 /// OS-hardening policy applied to the child process.
@@ -92,6 +97,30 @@ pub struct ProcessSandboxConfig {
 
     /// OS-hardening policy.
     pub hardening: HardeningMode,
+
+    /// Directories the hardened child may additionally read and execute
+    /// from, beyond the system paths the ruleset always grants.
+    ///
+    /// This is where user-installed toolchains go: `~/.local/bin`,
+    /// `~/.cargo/bin`, a pnpm or mise shim directory. Without an entry here
+    /// a binary on `PATH` but outside `/usr`, `/bin` or `/sbin` is visible
+    /// to the shell and refused by the kernel, which the tool reports as a
+    /// bare `Permission denied`.
+    ///
+    /// Empty by default: the boundary widens only where an operator says so.
+    /// Ignored when hardening is [`HardeningMode::Off`], and on platforms
+    /// without landlock.
+    pub read_exec_paths: Vec<PathBuf>,
+
+    /// Directories the hardened child may additionally read and write,
+    /// beyond `$TMPDIR` and the session root.
+    ///
+    /// Package-manager caches live here — `~/.cache/uv`, `~/.npm` — the
+    /// directories a tool must write to before it can do anything useful.
+    ///
+    /// Empty by default, and subject to the same caveats as
+    /// [`read_exec_paths`](Self::read_exec_paths).
+    pub read_write_paths: Vec<PathBuf>,
 }
 
 impl Default for ProcessSandboxConfig {
@@ -106,6 +135,8 @@ impl Default for ProcessSandboxConfig {
                 .map(|s| (*s).to_string())
                 .collect(),
             hardening: HardeningMode::default(),
+            read_exec_paths: Vec::new(),
+            read_write_paths: Vec::new(),
         }
     }
 }
@@ -163,6 +194,35 @@ impl ProcessSandboxConfig {
         self
     }
 
+    /// Sets the directories the hardened child may read and execute from.
+    ///
+    /// Paths must be absolute; [`validate`](Self::validate) refuses the rest
+    /// rather than letting them resolve against whatever directory the child
+    /// happened to land in.
+    #[must_use]
+    pub fn with_read_exec_paths<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.read_exec_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
+    /// Sets the directories the hardened child may read and write.
+    ///
+    /// Paths must be absolute, as for
+    /// [`with_read_exec_paths`](Self::with_read_exec_paths).
+    #[must_use]
+    pub fn with_read_write_paths<I, P>(mut self, paths: I) -> Self
+    where
+        I: IntoIterator<Item = P>,
+        P: Into<PathBuf>,
+    {
+        self.read_write_paths = paths.into_iter().map(Into::into).collect();
+        self
+    }
+
     /// Validates the configuration.
     ///
     /// # Errors
@@ -172,7 +232,10 @@ impl ProcessSandboxConfig {
     /// - `memory_limit` is `Some(0)`,
     /// - `cpu_limit_secs` is `Some(0)`,
     /// - `fsize_limit` is `Some(0)`,
-    /// - `env_allowlist` is empty.
+    /// - `env_allowlist` is empty,
+    /// - any declared sandbox path is relative, or contains the platform's
+    ///   `PATH` separator (which the parent uses to carry the list to the
+    ///   child, and so cannot appear inside one entry).
     pub fn validate(&self) -> Result<(), ToolError> {
         if self.timeout.is_zero() {
             return Err(ToolError::sandbox_error(
@@ -199,9 +262,40 @@ impl ProcessSandboxConfig {
                 "process sandbox env_allowlist must not be empty",
             ));
         }
+        validate_paths(&self.read_exec_paths, "read_exec_paths")?;
+        validate_paths(&self.read_write_paths, "read_write_paths")?;
         Ok(())
     }
 }
+
+/// Checks one declared path list.
+///
+/// Pure, and deliberately strict. A relative path would be resolved against
+/// whatever directory the child was started in — the session root, or a
+/// throwaway tempdir — which is never what an operator writing
+/// `~/.local/bin` meant, and would fail as an unexplained denial rather than
+/// as a configuration error.
+fn validate_paths(paths: &[PathBuf], field: &str) -> Result<(), ToolError> {
+    for path in paths {
+        if !path.is_absolute() {
+            return Err(ToolError::sandbox_error(format!(
+                "process sandbox {field} entry '{}' must be an absolute path",
+                path.display()
+            )));
+        }
+        if path.as_os_str().to_string_lossy().contains(SEPARATOR) {
+            return Err(ToolError::sandbox_error(format!(
+                "process sandbox {field} entry '{}' must not contain '{SEPARATOR}'",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The character [`std::env::join_paths`] uses to separate entries, and so
+/// the one character a declared path may not contain.
+const SEPARATOR: char = if cfg!(windows) { ';' } else { ':' };
 
 /// Serde adapter that represents a [`Duration`] as whole seconds (`u64`).
 mod duration_secs {
@@ -222,6 +316,65 @@ mod duration_secs {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declared_paths_are_empty_by_default() {
+        // The boundary widens only where an operator says so.
+        let cfg = ProcessSandboxConfig::default();
+        assert!(cfg.read_exec_paths.is_empty());
+        assert!(cfg.read_write_paths.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn declared_paths_round_trip_through_the_builders() {
+        let cfg = ProcessSandboxConfig::new()
+            .with_read_exec_paths(["/opt/tools", "/usr/local/bin"])
+            .with_read_write_paths(["/var/cache/uv"]);
+
+        assert_eq!(
+            cfg.read_exec_paths,
+            vec![PathBuf::from("/opt/tools"), PathBuf::from("/usr/local/bin")],
+        );
+        assert_eq!(cfg.read_write_paths, vec![PathBuf::from("/var/cache/uv")]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn a_relative_declared_path_is_refused() {
+        // It would resolve against whatever directory the child landed in,
+        // and fail later as an unexplained denial instead of a config error.
+        let err = ProcessSandboxConfig::new()
+            .with_read_exec_paths(["scripts/bin"])
+            .validate()
+            .expect_err("a relative path must not validate");
+
+        let message = err.to_string();
+        assert!(
+            message.contains("read_exec_paths") && message.contains("absolute"),
+            "the error must name the field and the reason, got: {message}"
+        );
+    }
+
+    #[test]
+    fn a_declared_path_containing_the_separator_is_refused() {
+        // The parent carries these to the child as one joined variable, so a
+        // separator inside an entry has no unambiguous reading.
+        let offending = if cfg!(windows) {
+            "C:\\tools;more"
+        } else {
+            "/opt/to:ols"
+        };
+        let err = ProcessSandboxConfig::new()
+            .with_read_write_paths([offending])
+            .validate()
+            .expect_err("an embedded separator must not validate");
+
+        assert!(
+            err.to_string().contains("read_write_paths"),
+            "the error must name the field, got: {err}"
+        );
+    }
 
     #[test]
     fn defaults_match_constants() {

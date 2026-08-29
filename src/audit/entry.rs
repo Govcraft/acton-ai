@@ -92,6 +92,7 @@ impl AuditDecision {
 /// [`AuditEntry`] by adding the sequence number and the previous hash, which
 /// are the two things only the single writer knows.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct InvocationRecord {
     /// When the invocation finished, RFC 3339 in UTC.
     pub timestamp: String,
@@ -99,6 +100,8 @@ pub struct InvocationRecord {
     pub correlation_id: CorrelationId,
     /// The conversation, when the call happened inside one.
     pub conversation_id: Option<ConversationId>,
+    /// The principal on whose behalf the call ran, when configured.
+    pub user: Option<String>,
     /// The turn the call belongs to.
     pub turn_id: TurnId,
     /// The provider's ID for this particular call.
@@ -118,6 +121,10 @@ pub struct InvocationRecord {
     pub decision: AuditDecision,
     /// How long the call took, in milliseconds. Zero for a refused call.
     pub duration_ms: u64,
+    /// Size in bytes of the complete serialized tool response.
+    ///
+    /// Absent when the tool produced no response, such as a refused call.
+    pub response_size_bytes: Option<u64>,
     /// Whether the call ran inside a turn resumed from a checkpoint.
     ///
     /// `false` for every first-run call. A restarted process finishing an
@@ -141,6 +148,9 @@ pub struct AuditEntry {
     /// The conversation, when the call happened inside one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub conversation_id: Option<ConversationId>,
+    /// The principal on whose behalf the call ran, when configured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
     /// The turn the call belongs to.
     pub turn_id: TurnId,
     /// The provider's ID for this particular call.
@@ -155,6 +165,9 @@ pub struct AuditEntry {
     pub decision: AuditDecision,
     /// How long the call took, in milliseconds.
     pub duration_ms: u64,
+    /// Size in bytes of the complete serialized tool response, when one exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_size_bytes: Option<u64>,
     /// Whether the call ran inside a turn resumed from a checkpoint.
     ///
     /// Serialized only when `true`, so entries written before this field
@@ -179,6 +192,8 @@ struct HashPreimage<'a> {
     timestamp: &'a str,
     correlation_id: &'a CorrelationId,
     conversation_id: Option<&'a ConversationId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    user: Option<&'a str>,
     turn_id: &'a TurnId,
     tool_call_id: &'a str,
     tool_name: &'a str,
@@ -186,6 +201,8 @@ struct HashPreimage<'a> {
     outcome: &'a AuditOutcome,
     decision: &'a AuditDecision,
     duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_size_bytes: Option<u64>,
     /// `Some(true)` only on a resumed call; skipped when absent. A field that
     /// serialized `false` on every pre-existing entry would change their
     /// pre-image bytes and break verification of every chain already written.
@@ -228,6 +245,7 @@ impl AuditEntry {
             timestamp,
             correlation_id,
             conversation_id,
+            user,
             turn_id,
             tool_call_id,
             tool_name,
@@ -235,6 +253,7 @@ impl AuditEntry {
             outcome,
             decision,
             duration_ms,
+            response_size_bytes,
             resumed,
         } = record;
 
@@ -243,6 +262,7 @@ impl AuditEntry {
             timestamp: &timestamp,
             correlation_id: &correlation_id,
             conversation_id: conversation_id.as_ref(),
+            user: user.as_deref(),
             turn_id: &turn_id,
             tool_call_id: &tool_call_id,
             tool_name: &tool_name,
@@ -250,6 +270,7 @@ impl AuditEntry {
             outcome: &outcome,
             decision: &decision,
             duration_ms,
+            response_size_bytes,
             resumed: resumed.then_some(true),
             prev_hash,
         });
@@ -259,6 +280,7 @@ impl AuditEntry {
             timestamp,
             correlation_id,
             conversation_id,
+            user,
             turn_id,
             tool_call_id,
             tool_name,
@@ -266,6 +288,7 @@ impl AuditEntry {
             outcome,
             decision,
             duration_ms,
+            response_size_bytes,
             resumed,
             prev_hash: prev_hash.to_string(),
             hash,
@@ -283,6 +306,7 @@ impl AuditEntry {
             timestamp: &self.timestamp,
             correlation_id: &self.correlation_id,
             conversation_id: self.conversation_id.as_ref(),
+            user: self.user.as_deref(),
             turn_id: &self.turn_id,
             tool_call_id: &self.tool_call_id,
             tool_name: &self.tool_name,
@@ -290,6 +314,7 @@ impl AuditEntry {
             outcome: &self.outcome,
             decision: &self.decision,
             duration_ms: self.duration_ms,
+            response_size_bytes: self.response_size_bytes,
             resumed: self.resumed.then_some(true),
             prev_hash: &self.prev_hash,
         })
@@ -317,6 +342,7 @@ mod tests {
             timestamp: "2026-08-19T12:00:00Z".to_string(),
             correlation_id: CorrelationId::new(),
             conversation_id: None,
+            user: None,
             turn_id: TurnId::new(),
             tool_call_id: "toolu_01".to_string(),
             tool_name: tool_name.to_string(),
@@ -326,6 +352,7 @@ mod tests {
             },
             decision: AuditDecision::approved(Decider::NoPolicy),
             duration_ms: 5,
+            response_size_bytes: Some(4),
             resumed: false,
         }
     }
@@ -367,6 +394,14 @@ mod tests {
         let mut reversed = entry.clone();
         reversed.decision = AuditDecision::refused(Decider::Denylist);
         assert_ne!(reversed.hash, reversed.recompute_hash());
+
+        let mut reattributed = entry.clone();
+        reattributed.user = Some("acct:mallory".to_string());
+        assert_ne!(reattributed.hash, reattributed.recompute_hash());
+
+        let mut resized = entry.clone();
+        resized.response_size_bytes = Some(999);
+        assert_ne!(resized.hash, resized.recompute_hash());
 
         // Repointing an entry at a different call would let one invocation's
         // recorded outcome be passed off as another's.
@@ -430,6 +465,14 @@ mod tests {
         let parsed: AuditEntry = serde_json::from_str(&line).unwrap();
         assert!(!parsed.resumed);
         assert_eq!(parsed.recompute_hash(), entry.hash);
+    }
+
+    #[test]
+    fn an_entry_written_by_v0_33_still_verifies() {
+        let line = r#"{"sequence":1,"timestamp":"2026-08-19T12:00:00Z","correlation_id":"corr_01h455vb4pex5vsknk084sn02q","turn_id":"turn_01h455vb4pex5vsknk084sn02q","tool_call_id":"toolu_01","tool_name":"bash","arguments":{"command":"ls"},"outcome":{"kind":"success","summary":"ok"},"decision":{"approved":true,"decided_by":"no_policy"},"duration_ms":3,"prev_hash":"0000000000000000000000000000000000000000000000000000000000000000","hash":"2de3ebea3a7de4cbcef1f69cdcf2c7ebfa2f77a961439609db1d6315d16d602b"}"#;
+        let entry: AuditEntry = serde_json::from_str(line).expect("the v0.33 fixture must parse");
+
+        assert_eq!(entry.recompute_hash(), entry.hash);
     }
 
     #[test]

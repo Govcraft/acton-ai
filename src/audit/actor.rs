@@ -221,6 +221,7 @@ mod tests {
             timestamp: "2026-08-19T12:00:00Z".to_string(),
             correlation_id: CorrelationId::new(),
             conversation_id: None,
+            user: None,
             turn_id: TurnId::new(),
             tool_call_id: "toolu_01".to_string(),
             tool_name: name.to_string(),
@@ -230,6 +231,7 @@ mod tests {
             },
             decision: AuditDecision::approved(Decider::NoPolicy),
             duration_ms: 1,
+            response_size_bytes: Some(4),
             resumed: false,
         }
     }

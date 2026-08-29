@@ -12,7 +12,9 @@
 //!   character devices (`/dev/null` and friends, without which no
 //!   subprocess can be spawned at all), plus read/write access on `$TMPDIR`
 //!   and the current working directory — which for a confined call is the
-//!   root the parent handed it, and otherwise a throwaway directory;
+//!   root the parent handed it, and otherwise a throwaway directory, plus
+//!   whatever [`ProcessSandboxConfig::read_exec_paths`] and
+//!   [`ProcessSandboxConfig::read_write_paths`] declare;
 //! - a **seccomp** filter that returns `EPERM` for a small set of dangerous
 //!   syscalls (`ptrace`, `keyctl`, `mount`, `umount2`, `reboot`,
 //!   `kexec_load`, `init_module`, `finit_module`, `delete_module`, `bpf`,
@@ -23,6 +25,14 @@
 //! [`HardeningMode::Enforce`] is in effect, any failure propagates as a
 //! `ToolError::sandbox_error`. [`HardeningMode::Off`] short-circuits the
 //! entire routine.
+//!
+//! Note what the built-in list does *not* cover: anything a user installed
+//! under their home directory. A `uv`, `cargo` or `pnpm` on `PATH` at
+//! `~/.local/bin` is found by the shell and then refused by the kernel,
+//! surfacing as a bare `Permission denied` with no hint of landlock in it.
+//! That is what the declared path lists are for, and why they are honest
+//! configuration rather than an inferred default: widening the boundary is
+//! the operator's call.
 //!
 //! This module is reachable only when `target_os = "linux"`: its parent
 //! declares it as `#[cfg(target_os = "linux")] pub mod hardening;`. On
@@ -96,17 +106,29 @@ fn apply_landlock(cfg: &ProcessSandboxConfig) -> Result<(), ToolError> {
     };
 
     for path in read_paths.iter().chain(proc_paths) {
-        if !Path::new(path).exists() {
+        let path = Path::new(path);
+        if !path.exists() {
             continue;
         }
         add_landlock_rule(cfg, &mut ruleset, path, read_access, "read")?;
     }
 
     for path in device_paths {
-        if !Path::new(path).exists() {
+        let path = Path::new(path);
+        if !path.exists() {
             continue;
         }
         add_landlock_rule(cfg, &mut ruleset, path, device_access, "device")?;
+    }
+
+    // Directories the operator declared. A read grant carries `Execute` with
+    // it under `AccessFs::from_read`, so one entry covers both finding a
+    // binary and running it.
+    for path in &cfg.read_exec_paths {
+        if !declared_path_exists(path, "read_exec_paths") {
+            continue;
+        }
+        add_landlock_rule(cfg, &mut ruleset, path, read_access, "read-exec")?;
     }
 
     let mut rw_paths: Vec<String> = Vec::new();
@@ -120,10 +142,18 @@ fn apply_landlock(cfg: &ProcessSandboxConfig) -> Result<(), ToolError> {
     }
 
     for path in &rw_paths {
-        if !Path::new(path).exists() {
+        let path = Path::new(path);
+        if !path.exists() {
             continue;
         }
         add_landlock_rule(cfg, &mut ruleset, path, rw_access, "rw")?;
+    }
+
+    for path in &cfg.read_write_paths {
+        if !declared_path_exists(path, "read_write_paths") {
+            continue;
+        }
+        add_landlock_rule(cfg, &mut ruleset, path, rw_access, "read-write")?;
     }
 
     match ruleset.restrict_self() {
@@ -140,11 +170,33 @@ fn apply_landlock(cfg: &ProcessSandboxConfig) -> Result<(), ToolError> {
     }
 }
 
+/// Whether a path an operator declared is actually there.
+///
+/// A missing entry is a typo or a tool that was never installed, not a
+/// hardening failure: the ruleset that results is *narrower* than asked for,
+/// so it cannot widen the boundary. It is warned about rather than skipped
+/// in silence, because an unexplained `Permission denied` later is exactly
+/// the failure this configuration exists to prevent — and it is warned about
+/// in every mode, so `enforce` does not abort a whole deployment over a
+/// directory that has not been created yet.
+#[cfg(feature = "sandbox-hardening")]
+fn declared_path_exists(path: &std::path::Path, field: &str) -> bool {
+    if path.exists() {
+        return true;
+    }
+    tracing::warn!(
+        target: "acton_ai::sandbox::process",
+        "landlock: {field} names '{}', which does not exist; skipping the rule",
+        path.display(),
+    );
+    false
+}
+
 #[cfg(feature = "sandbox-hardening")]
 fn add_landlock_rule<A>(
     cfg: &ProcessSandboxConfig,
     ruleset: &mut landlock::RulesetCreated,
-    path: &str,
+    path: &std::path::Path,
     access: A,
     label: &str,
 ) -> Result<(), ToolError>
@@ -153,17 +205,18 @@ where
 {
     use landlock::{PathBeneath, PathFd, RulesetCreatedAttr};
 
+    let display = path.display();
     match PathFd::new(path) {
         Ok(fd) => {
             if let Err(err) = ruleset.add_rule(PathBeneath::new(fd, access)) {
                 hardening_failure(
                     cfg,
-                    format!("landlock: failed to add {label} rule for {path}: {err}"),
+                    format!("landlock: failed to add {label} rule for {display}: {err}"),
                 )?;
             }
             Ok(())
         }
-        Err(err) => hardening_failure(cfg, format!("landlock: failed to open {path}: {err}")),
+        Err(err) => hardening_failure(cfg, format!("landlock: failed to open {display}: {err}")),
     }
 }
 

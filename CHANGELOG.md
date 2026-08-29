@@ -2,6 +2,42 @@
 
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## 0.34.0 - 2026-08-28
+
+### Added
+
+- **Audit attribution and response sizing.** `[audit] user` (or
+  `AuditConfig::with_user`) stamps the acting principal onto every tool entry,
+  and successful calls record the byte size of the complete serialized result
+  before its audit summary is bounded and redacted.
+- **Declared paths for the hardened sandbox.** The landlock ruleset granted
+  the system directories, `$TMPDIR` and the session root, and nothing else,
+  which left out every toolchain installed under a home directory. A `uv` at
+  `~/.local/bin` was found by the shell on `PATH` and then refused by the
+  kernel — reported as a bare `Permission denied`, exit code 126, with no
+  mention of landlock in it, and no configuration short of turning hardening
+  off entirely to resolve it. `[sandbox.paths]` now declares what the child
+  may additionally reach: `read_exec` for directories it may read and run
+  binaries from, `read_write` for the caches those binaries must write to. A
+  leading `~/` expands against `HOME`; the same lists exist on
+  `ProcessSandboxConfig` as `with_read_exec_paths` / `with_read_write_paths`.
+  Both are empty by default, so nothing widens unless a deployment says so.
+- **`env_allowlist` in `[sandbox]`.** The set of variables forwarded into the
+  sandbox child was reachable from Rust and not from a config file, so a tool
+  needing `UV_CACHE_DIR` or `CARGO_HOME` had no way to be given it. The key
+  replaces the default list rather than extending it — name every variable the
+  child still needs, `PATH` and `HOME` included.
+
+### Changed
+
+- **Declared sandbox paths are validated up front.** `validate()` refuses a
+  relative entry, which would otherwise resolve against whichever directory
+  the child happened to start in and fail later as an unexplained denial. An
+  entry that simply does not exist is warned about and skipped in every
+  hardening mode, `enforce` included: it narrows the ruleset rather than
+  widening it, and a cache directory a tool has not created yet must not abort
+  a deployment.
+
 ## 0.33.0 - 2026-08-20
 
 ### Added

@@ -174,7 +174,7 @@ async fn every_executed_tool_call_lands_in_the_trail() {
             server.base_url().to_string(),
             "mock-model",
         ))
-        .audit_to(&path)
+        .audit(AuditConfig::new(&path).with_user("acct:alice"))
         .launch()
         .await
         .expect("launching the runtime must succeed");
@@ -195,6 +195,12 @@ async fn every_executed_tool_call_lands_in_the_trail() {
     let entries = read_trail(&path);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].tool_name, "echo");
+    assert_eq!(entries[0].user.as_deref(), Some("acct:alice"));
+    assert_eq!(
+        entries[0].response_size_bytes,
+        Some(u64::try_from(serde_json::to_vec(&json!({"value": "hi"})).unwrap().len()).unwrap()),
+        "the size covers the complete serialized response"
+    );
 
     // The provider's own ID for the call, not one the loop invented. This is
     // the join key between the trail and the lifecycle events an observer
@@ -271,6 +277,7 @@ async fn a_denied_call_is_recorded_as_denied_with_the_rule_that_refused_it() {
     assert!(!entries[0].decision.approved);
     assert_eq!(entries[0].decision.decided_by, Decider::Denylist);
     assert!(matches!(entries[0].outcome, AuditOutcome::Denied { .. }));
+    assert_eq!(entries[0].response_size_bytes, None);
 
     // A refused call is identified exactly like one that ran. Anything else
     // would leave the one kind of entry an investigator most wants to trace
@@ -549,7 +556,7 @@ async fn a_toml_audit_section_arms_the_trail() {
     .await;
 
     let toml = format!(
-        "{}\n[audit]\npath = '{}'\n",
+        "{}\n[audit]\npath = '{}'\nuser = 'acct:bob'\n",
         mock_llm::provider_toml("mock", &server, "mock-model"),
         path.display()
     );
@@ -574,7 +581,9 @@ async fn a_toml_audit_section_arms_the_trail() {
 
     // The parent directory did not exist: resolution had to create it, or the
     // entry would have gone nowhere and nobody would have noticed.
-    assert_eq!(read_trail(&path).len(), 1);
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].user.as_deref(), Some("acct:bob"));
 
     ai.shutdown().await.expect("clean shutdown");
 }

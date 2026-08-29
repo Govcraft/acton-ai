@@ -57,6 +57,12 @@ pub mod env_vars {
     /// Absent means unconfined, which for the child amounts to the
     /// throwaway directory it was started in.
     pub const ROOT: &str = "ACTON_AI_SANDBOX_ROOT";
+    /// Extra directories the landlock ruleset grants read+execute on,
+    /// joined with the platform's `PATH` separator.
+    pub const READ_EXEC_PATHS: &str = "ACTON_AI_SANDBOX_READ_EXEC_PATHS";
+    /// Extra directories the landlock ruleset grants read+write on, joined
+    /// with the platform's `PATH` separator.
+    pub const READ_WRITE_PATHS: &str = "ACTON_AI_SANDBOX_READ_WRITE_PATHS";
 }
 
 /// Detours into the sandbox runner when this process was re-exec'd as a
@@ -234,7 +240,36 @@ fn load_config_from_env() -> ProcessSandboxConfig {
         .map(|s| (*s).to_string())
         .collect();
 
+    // These two, by contrast, the child *does* consume: hardening builds the
+    // landlock ruleset from them, and only the parent knows what the
+    // operator configured.
+    cfg.read_exec_paths = parse_path_list(env_vars::READ_EXEC_PATHS);
+    cfg.read_write_paths = parse_path_list(env_vars::READ_WRITE_PATHS);
+
     cfg
+}
+
+/// Reads one `PATH`-style list from the environment.
+///
+/// An unset variable yields no paths.
+fn parse_path_list(key: &str) -> Vec<PathBuf> {
+    std::env::var_os(key)
+        .as_deref()
+        .map(split_path_list)
+        .unwrap_or_default()
+}
+
+/// Splits one `PATH`-style list into paths.
+///
+/// Pure, so the contract is testable without touching process-global
+/// environment state. Empty entries — which [`std::env::split_paths`]
+/// happily produces from a trailing separator, or from an empty variable —
+/// are dropped rather than becoming a landlock rule for the current
+/// directory.
+fn split_path_list(raw: &std::ffi::OsStr) -> Vec<PathBuf> {
+    std::env::split_paths(raw)
+        .filter(|path| !path.as_os_str().is_empty())
+        .collect()
 }
 
 fn parse_u64(key: &str) -> Option<u64> {
@@ -325,6 +360,31 @@ fn exit_with_error(message: &str) -> ! {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn a_path_list_splits_on_the_platform_separator() {
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        let raw = format!("/opt/tools{sep}/home/dev/.local/bin");
+        assert_eq!(
+            split_path_list(std::ffi::OsStr::new(&raw)),
+            vec![
+                PathBuf::from("/opt/tools"),
+                PathBuf::from("/home/dev/.local/bin"),
+            ],
+        );
+    }
+
+    #[test]
+    fn an_empty_path_list_yields_no_rules() {
+        // A trailing separator, or a variable set to nothing at all, must
+        // not become a rule for the child's current directory.
+        let sep = if cfg!(windows) { ";" } else { ":" };
+        assert!(split_path_list(std::ffi::OsStr::new("")).is_empty());
+        assert_eq!(
+            split_path_list(std::ffi::OsStr::new(&format!("/opt/tools{sep}"))),
+            vec![PathBuf::from("/opt/tools")],
+        );
+    }
 
     #[test]
     fn dispatch_unknown_tool_returns_err() {

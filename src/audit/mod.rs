@@ -33,7 +33,10 @@
 //!
 //! let ai = ActonAI::builder()
 //!     .anthropic_from_env()
-//!     .audit(AuditConfig::new("/var/log/acton-ai/audit.jsonl"))
+//!     .audit(
+//!         AuditConfig::new("/var/log/acton-ai/audit.jsonl")
+//!             .with_user("acct:alice"),
+//!     )
 //!     .launch()
 //!     .await?;
 //!
@@ -113,6 +116,7 @@ mod tests {
                 timestamp: "2026-08-19T12:00:00Z".to_string(),
                 correlation_id: CorrelationId::new(),
                 conversation_id: None,
+                user: None,
                 turn_id: TurnId::new(),
                 tool_call_id: "toolu_01".to_string(),
                 tool_name: "bash".to_string(),
@@ -122,6 +126,7 @@ mod tests {
                 },
                 decision: AuditDecision::approved(Decider::NoPolicy),
                 duration_ms: 3,
+                response_size_bytes: Some(4),
                 resumed: false,
             },
             sequence,

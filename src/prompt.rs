@@ -3465,6 +3465,7 @@ impl ToolStep<'_> {
                 reason: reason.to_string(),
             },
             crate::audit::AuditDecision::refused(decided_by),
+            None,
             started,
         )
         .await;
@@ -3547,11 +3548,16 @@ impl ToolStep<'_> {
             // words about its own failure.
             (Err(_), _) => crate::audit::AuditOutcome::Error { message: summary },
         };
+        let response_size_bytes = result
+            .as_ref()
+            .ok()
+            .map(|value| u64::try_from(value.to_string().len()).unwrap_or(u64::MAX));
         self.record(
             tool_call,
             recorded_arguments.as_ref().unwrap_or(&tool_call.arguments),
             audit_outcome,
             crate::audit::AuditDecision::approved(decided_by),
+            response_size_bytes,
             started,
         )
         .await;
@@ -3590,6 +3596,7 @@ impl ToolStep<'_> {
                 message: feedback.to_string(),
             },
             crate::audit::AuditDecision::refused(crate::policy::Decider::Settlement),
+            None,
             std::time::Instant::now(),
         )
         .await;
@@ -3607,6 +3614,7 @@ impl ToolStep<'_> {
         arguments: &serde_json::Value,
         outcome: crate::audit::AuditOutcome,
         decision: crate::audit::AuditDecision,
+        response_size_bytes: Option<u64>,
         started: std::time::Instant,
     ) {
         let Some((handle, config)) = self.audit else {
@@ -3617,6 +3625,7 @@ impl ToolStep<'_> {
             timestamp: chrono::Utc::now().to_rfc3339(),
             correlation_id: self.correlation_id.clone(),
             conversation_id: self.conversation_id.cloned(),
+            user: config.user().map(str::to_owned),
             turn_id: self.turn_id.clone(),
             tool_call_id: tool_call.id.clone(),
             tool_name: tool_call.name.clone(),
@@ -3626,6 +3635,7 @@ impl ToolStep<'_> {
             outcome,
             decision,
             duration_ms: u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            response_size_bytes,
             resumed: self.resumed,
         };
 

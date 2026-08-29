@@ -74,6 +74,8 @@ let response = runtime
 | `fsize_limit` | 128 MB | `RLIMIT_FSIZE` ceiling |
 | `env_allowlist` | `PATH`, `LANG`, `LC_ALL`, `HOME`, `TMPDIR` | Env vars forwarded to the child |
 | `hardening` | `BestEffort` | Landlock + seccomp policy |
+| `read_exec_paths` | empty | Extra directories the child may read and execute from |
+| `read_write_paths` | empty | Extra directories the child may read and write |
 
 ### Custom configuration
 
@@ -96,6 +98,35 @@ let runtime = ActonAI::builder()
     .launch()
     .await?;
 ```
+
+### Reaching a user-installed toolchain
+
+The hardened child's landlock ruleset grants the system directories (`/usr`, `/bin`, `/lib`, `/etc`, `/proc`), a handful of character devices, `$TMPDIR`, and the session root. Nothing else.
+
+That leaves out everything installed under a home directory. A `uv` at `~/.local/bin`, a rustup shim, a pnpm store: the shell finds them on `PATH` and the kernel then refuses the `execve`, which the bash tool reports as a bare `Permission denied` with exit code 126 and no mention of landlock in it.
+
+Declare the directories those tools need and the ruleset grants them:
+
+```rust
+let config = ProcessSandboxConfig::new()
+    .with_hardening(HardeningMode::BestEffort)
+    // `uv` itself, and the interpreters it manages.
+    .with_read_exec_paths(["/home/dev/.local/bin", "/home/dev/.local/share/uv"])
+    // The cache it must write to before it can run anything.
+    .with_read_write_paths(["/home/dev/.cache/uv"]);
+```
+
+A read grant carries execute permission with it, so one `read_exec_paths` entry covers both finding a binary and running it. Some tools also need an environment variable that the default allowlist strips — `UV_CACHE_DIR`, `CARGO_HOME`, a proxy setting — which means replacing the allowlist:
+
+```rust
+let config = config.with_env_allowlist(["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "UV_CACHE_DIR"]);
+```
+
+{% callout type="warning" title="The allowlist replaces, it does not extend" %}
+`with_env_allowlist` sets the whole list. Name every variable the child still needs; a child without `PATH` finds no binaries at all.
+{% /callout %}
+
+Both lists are empty by default and stay that way unless a deployment says otherwise: widening the boundary is a decision, not an inference. Entries must be absolute paths — `validate()` refuses relative ones rather than resolving them against whatever directory the child landed in — and an entry that does not exist is logged as a warning and skipped, in every hardening mode.
 
 ### Validation
 
@@ -124,10 +155,18 @@ base_url = "http://localhost:11434/v1"
 
 [sandbox]
 hardening = "besteffort"    # "off" | "besteffort" | "enforce"
+# Replaces the default list; name every variable the child still needs.
+env_allowlist = ["PATH", "LANG", "LC_ALL", "HOME", "TMPDIR", "UV_CACHE_DIR"]
 
 [sandbox.limits]
 max_execution_ms = 30000
 max_memory_mb = 256
+
+# Directories the hardened child may reach beyond the system paths,
+# `$TMPDIR` and the session root. A leading `~/` expands against HOME.
+[sandbox.paths]
+read_exec = ["~/.local/bin", "~/.local/share/uv"]
+read_write = ["~/.cache/uv"]
 ```
 
 {% callout type="note" title="Old TOMLs still parse" %}
@@ -163,6 +202,59 @@ match result {
     Ok(value) => { /* success */ }
 }
 ```
+
+---
+
+## Tamper-evident audit trail
+
+The audit trail records every proposed tool invocation, including calls that
+policy refused and calls that returned an error. Entries are appended as JSONL
+and linked with BLAKE3 hashes, so `acton-ai audit verify` detects changes to a
+record or to its position in the chain.
+
+For a multi-user service, configure the principal whose requests this process
+is serving:
+
+```toml
+[audit]
+path = "/var/log/acton-ai/audit.jsonl"
+user = "acct:alice"
+redact_patterns = ["password", "token", "api_key", "authorization"]
+```
+
+The equivalent builder configuration is:
+
+```rust
+let audit = AuditConfig::new("/var/log/acton-ai/audit.jsonl")
+    .with_user("acct:alice");
+
+let runtime = ActonAI::builder()
+    .app_name("audited-app")
+    .from_config()?
+    .audit(audit)
+    .launch()
+    .await?;
+```
+
+The `user` value is optional and is stamped onto every entry produced by that
+runtime. A successful entry also includes `response_size_bytes`, measured from
+the complete serialized tool result before the bounded, redacted summary is
+built. Refused and uncertain calls have no response size.
+
+Both fields are covered by the entry hash. When absent they are omitted from
+the hash preimage as well as the JSONL record, so trails created before these
+fields existed continue to verify.
+
+```bash
+acton-ai audit verify
+acton-ai audit verify --file /var/log/acton-ai/audit.jsonl
+acton-ai audit verify --json
+```
+
+{% callout type="warning" title="Response size is metadata, not retained output" %}
+The trail keeps only a bounded and redacted result summary. The byte count
+describes the original serialized result but cannot reconstruct it.
+{% /callout %}
 
 ---
 
