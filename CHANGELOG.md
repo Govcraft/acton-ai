@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## Unreleased
+
+### Added
+
+- **One writer per audit trail, enforced.** `AuditLog::spawn` now claims the
+  trail with an exclusive advisory lock (`std::fs::File::try_lock`) before it
+  reads the chain head, and holds it for the actor's lifetime; the kernel
+  releases it on shutdown or on `SIGKILL`, so there is no pid file to go
+  stale. A second process opening the same trail fails to launch with a
+  configuration error instead of forking the chain. The claim is exposed as
+  `audit::claim_trail` and its typed refusal as `audit::TrailClaimError`,
+  whose `Busy` variant names the holder's pid where the platform can tell
+  (`/proc/locks` on Linux). Read-only verification of a live trail is
+  unaffected (Govcraft/acton-ai#14).
+
 ## 0.34.0 - 2026-08-28
 
 ### Added

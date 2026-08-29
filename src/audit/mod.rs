@@ -12,6 +12,13 @@
 //! secrets redacted, a bounded result summary, the approval decision and who
 //! made it, and how long the call took. See [`AuditEntry`].
 //!
+//! # One writer per file
+//!
+//! The trail is claimed with an exclusive advisory lock when the audit actor
+//! spawns, and the lock is held until it stops. A second process opening the
+//! same trail fails to launch with a configuration error naming the holder,
+//! instead of forking the chain. See [`claim_trail`] and [`TrailClaimError`].
+//!
 //! # Off by default
 //!
 //! No `[audit]` section and no `.audit(..)` call means no actor is spawned and
@@ -54,7 +61,7 @@ pub mod config;
 pub mod entry;
 pub mod redact;
 
-pub use actor::{AuditLog, GetChainHead, RecordInvocation};
+pub use actor::{claim_trail, AuditLog, GetChainHead, RecordInvocation, TrailClaimError};
 pub use chain::{verify_chain, ChainBreak, ChainBreakKind, ChainHead};
 pub use config::{default_audit_path, AuditConfig, DEFAULT_AUDIT_FILE};
 pub use entry::{AuditDecision, AuditEntry, AuditOutcome, InvocationRecord, GENESIS_HASH};
