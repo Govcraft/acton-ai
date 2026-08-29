@@ -2069,9 +2069,11 @@ mod tests {
     }
 
     #[test]
-    fn expand_home_rewrites_only_the_bare_tilde() {
-        let home = std::env::var_os("HOME").expect("tests run with HOME set");
-        let expected = PathBuf::from(&home).join("keys/anthropic");
+    fn expand_home_rewrites_only_the_bare_tilde_when_home_is_available() {
+        let expected = std::env::var_os("HOME").map_or_else(
+            || PathBuf::from("~/keys/anthropic"),
+            |home| PathBuf::from(home).join("keys/anthropic"),
+        );
 
         assert_eq!(
             expand_home(std::path::Path::new("~/keys/anthropic")),
@@ -2186,28 +2188,28 @@ tokens_per_minute = 1000000
 
     #[test]
     fn sandbox_paths_reach_the_process_config() {
-        let toml = r#"
+        let read_exec = std::env::temp_dir().join("acton-ai-tools");
+        let read_write = std::env::temp_dir().join("acton-ai-cache");
+        let toml = format!(
+            r#"
 [sandbox]
 hardening = "enforce"
 
 [sandbox.paths]
-read_exec = ["/opt/tools", "/usr/local/bin"]
-read_write = ["/var/cache/uv"]
-"#;
-        let config: ActonAIConfig = toml::from_str(toml).expect("sandbox paths must parse");
+read_exec = ['{}']
+read_write = ['{}']
+"#,
+            read_exec.display(),
+            read_write.display(),
+        );
+        let config: ActonAIConfig = toml::from_str(&toml).expect("sandbox paths must parse");
         let process = config
             .sandbox
             .expect("the section is present")
             .to_process_config();
 
-        assert_eq!(
-            process.read_exec_paths,
-            vec![PathBuf::from("/opt/tools"), PathBuf::from("/usr/local/bin")],
-        );
-        assert_eq!(
-            process.read_write_paths,
-            vec![PathBuf::from("/var/cache/uv")]
-        );
+        assert_eq!(process.read_exec_paths, vec![read_exec],);
+        assert_eq!(process.read_write_paths, vec![read_write]);
         assert!(
             process.validate().is_ok(),
             "absolute declared paths must validate"

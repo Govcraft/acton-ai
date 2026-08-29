@@ -328,15 +328,14 @@ mod tests {
 
     #[test]
     fn declared_paths_round_trip_through_the_builders() {
+        let read_exec = std::env::temp_dir().join("acton-ai-tools");
+        let read_write = std::env::temp_dir().join("acton-ai-cache");
         let cfg = ProcessSandboxConfig::new()
-            .with_read_exec_paths(["/opt/tools", "/usr/local/bin"])
-            .with_read_write_paths(["/var/cache/uv"]);
+            .with_read_exec_paths([read_exec.clone()])
+            .with_read_write_paths([read_write.clone()]);
 
-        assert_eq!(
-            cfg.read_exec_paths,
-            vec![PathBuf::from("/opt/tools"), PathBuf::from("/usr/local/bin")],
-        );
-        assert_eq!(cfg.read_write_paths, vec![PathBuf::from("/var/cache/uv")]);
+        assert_eq!(cfg.read_exec_paths, vec![read_exec]);
+        assert_eq!(cfg.read_write_paths, vec![read_write]);
         assert!(cfg.validate().is_ok());
     }
 
