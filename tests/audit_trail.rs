@@ -740,3 +740,246 @@ fn an_unreadable_file_is_not_reported_as_tampering() {
     );
     assert_ne!(verdict.exit_code, 0, "it is still an error");
 }
+
+// =============================================================================
+// 6. Durability and writer health
+// =============================================================================
+
+/// A tool declared idempotent, which the strict guard leaves alone.
+fn idempotent_tool_definition(name: &str) -> ToolDefinition {
+    ToolDefinition {
+        idempotent: true,
+        ..tool_definition(name)
+    }
+}
+
+/// Makes the trail unappendable from under a running writer.
+///
+/// The writer holds the trail's lock on an open descriptor and appends by
+/// *path*, so replacing the file with a directory of the same name is exactly
+/// the failure a disk yanked out mid-session produces: the next open fails,
+/// the lock is untouched. This is the same simulation
+/// `ensure_trail_exists_reports_an_unwritable_destination` uses, and it needs
+/// no privileges — unlike `chattr +i` or a full tmpfs.
+fn make_unappendable(path: &Path) {
+    if path.is_file() {
+        std::fs::remove_file(path).expect("the trail can be removed");
+        std::fs::create_dir(path).expect("a directory can take its place");
+    }
+}
+
+/// Launches a runtime auditing to `path` with the given durability.
+async fn runtime_with_durability(
+    app_name: &str,
+    server: &MockServer,
+    path: &Path,
+    durability: AuditDurability,
+) -> ActonAI {
+    ActonAI::builder()
+        .app_name(app_name)
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit(AuditConfig::new(path).with_durability(durability))
+        .launch()
+        .await
+        .expect("launching the runtime must succeed")
+}
+
+/// Three rounds: a mutating call that breaks the trail as it runs, a second
+/// mutating call, then a read-only call.
+fn rounds_around_a_failure() -> Vec<Round> {
+    vec![
+        Round::tool_call("call_1", "write_thing", json!({"value": "first"})),
+        Round::tool_call("call_2", "write_thing", json!({"value": "second"})),
+        Round::tool_call("call_3", "read_thing", json!({"value": "third"})),
+        Round::text("done"),
+    ]
+}
+
+/// Drives [`rounds_around_a_failure`] through `ai`, breaking the trail from
+/// inside the first tool call.
+async fn drive_around_a_failure(ai: &ActonAI, path: &Path) -> CollectedResponse {
+    let trail = path.to_path_buf();
+    ai.prompt("write then read")
+        .with_tool(tool_definition("write_thing"), move |args| {
+            let trail = trail.clone();
+            async move {
+                make_unappendable(&trail);
+                Ok(args)
+            }
+        })
+        .with_tool(idempotent_tool_definition("read_thing"), |args| async move {
+            Ok(args)
+        })
+        .collect()
+        .await
+        .expect("the turn must complete")
+}
+
+#[tokio::test]
+async fn strict_mode_refuses_mutating_calls_after_an_append_failure() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(rounds_around_a_failure()).await;
+    let ai = runtime_with_durability("audit-strict", &server, &path, AuditDurability::Strict).await;
+
+    let response = drive_around_a_failure(&ai, &path).await;
+
+    assert_eq!(server.request_count(), 4, "every round was served");
+    let calls = &response.tool_calls;
+    assert_eq!(calls.len(), 3);
+    assert!(calls[0].result.is_ok(), "the first call ran: {:?}", calls[0]);
+
+    // The second mutating call is refused: its record could not be made.
+    let refusal = calls[1]
+        .result
+        .as_ref()
+        .expect_err("a mutating call after an append failure must be refused");
+    assert!(refusal.contains("audit trail is degraded"), "{refusal}");
+    assert!(refusal.contains("denied by policy"), "{refusal}");
+
+    // The read-only call still ran: refusing a read protects nothing.
+    assert!(calls[2].result.is_ok(), "an idempotent call runs: {:?}", calls[2]);
+
+    let health = ai.audit_health().await.expect("health is reported");
+    assert!(health.is_degraded());
+    assert_eq!(health.state, AuditHealthState::Degraded);
+    assert_eq!(health.durability, AuditDurability::Strict);
+    assert_eq!(
+        health.first_failed_sequence,
+        Some(1),
+        "the first call's own entry is the one that never landed"
+    );
+    assert_eq!(health.appended, 0);
+    assert!(health.failures >= 1, "{health:?}");
+    assert!(health.last_error.is_some());
+    assert!(health.degraded_since.is_some());
+
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn best_effort_mode_continues_after_an_append_failure() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(rounds_around_a_failure()).await;
+    let ai = runtime_with_durability(
+        "audit-best-effort",
+        &server,
+        &path,
+        AuditDurability::BestEffort,
+    )
+    .await;
+
+    let response = drive_around_a_failure(&ai, &path).await;
+
+    assert_eq!(server.request_count(), 4);
+    assert!(
+        response.tool_calls.iter().all(|call| call.result.is_ok()),
+        "best effort never refuses a call over the trail: {:?}",
+        response.tool_calls
+    );
+
+    // The failure is still visible — it is a state, not just a log line.
+    let health = ai.audit_health().await.expect("health is reported");
+    assert!(health.is_degraded());
+    assert_eq!(health.durability, AuditDurability::BestEffort);
+    assert_eq!(health.first_failed_sequence, Some(1));
+    assert_eq!(health.failures, 3, "every call's entry failed to land");
+
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn strict_mode_acknowledges_each_entry_before_the_next_call() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(vec![
+        Round::tool_call("call_1", "echo", json!({"value": "one"})),
+        Round::tool_call("call_2", "echo", json!({"value": "two"})),
+        Round::text("done"),
+    ])
+    .await;
+    let ai = runtime_with_durability("audit-strict-ack", &server, &path, AuditDurability::Strict)
+        .await;
+
+    ai.prompt("echo twice")
+        .with_tool(tool_definition("echo"), |args| async move { Ok(args) })
+        .collect()
+        .await
+        .expect("the turn must complete");
+
+    // No `audit_head()` barrier on purpose: under strict durability the loop
+    // does not move past a call until its entry is acknowledged, so by the
+    // time `collect()` returns the file already holds every entry.
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].tool_call_id, "call_1");
+    assert_eq!(entries[1].tool_call_id, "call_2");
+    verify_chain(&entries).expect("the chain verifies");
+
+    let health = ai.audit_health().await.expect("health is reported");
+    assert_eq!(health.state, AuditHealthState::Healthy);
+    assert_eq!(health.appended, 2);
+    assert_eq!(health.failures, 0);
+    assert_eq!(health.head.sequence, 2);
+
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn audit_health_reports_healthy_before_any_write_and_disabled_without_a_trail() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(vec![Round::text("hello")]).await;
+
+    let armed = runtime_with_durability("audit-armed", &server, &path, AuditDurability::Strict).await;
+    let health = armed.audit_health().await.expect("health is reported");
+    assert_eq!(health.state, AuditHealthState::Healthy);
+    assert_eq!(health.appended, 0);
+    assert_eq!(health.failures, 0);
+    assert_eq!(health.head.hash, GENESIS_HASH);
+    assert_eq!(armed.audit_durability(), Some(AuditDurability::Strict));
+    armed.shutdown().await.expect("clean shutdown");
+
+    let unaudited = ActonAI::builder()
+        .app_name("audit-none")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+    let health = unaudited.audit_health().await.expect("disabled is an answer");
+    assert_eq!(health.state, AuditHealthState::Disabled);
+    assert!(!health.is_degraded());
+    assert_eq!(unaudited.audit_durability(), None);
+    unaudited.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_toml_durability_key_makes_the_trail_strict() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(vec![Round::text("hello")]).await;
+
+    let toml = format!(
+        "{}\n[audit]\npath = '{}'\ndurability = 'strict'\n",
+        mock_llm::provider_toml("mock", &server, "mock-model"),
+        path.display()
+    );
+    let config = acton_ai::config::from_str(&toml).expect("the config must parse");
+    let ai = ActonAI::builder()
+        .app_name("audit-toml-strict")
+        .apply_config(config)
+        .expect("the config must apply")
+        .launch()
+        .await
+        .expect("launching the runtime must succeed");
+
+    assert_eq!(ai.audit_durability(), Some(AuditDurability::Strict));
+    ai.shutdown().await.expect("clean shutdown");
+}

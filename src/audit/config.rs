@@ -5,10 +5,52 @@
 
 use crate::audit::redact::Redactor;
 use crate::error::ActonAIError;
+use serde::{Deserialize, Serialize};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
 /// The audit trail's file name under the data directory, when no path is set.
 pub const DEFAULT_AUDIT_FILE: &str = "audit.jsonl";
+
+/// What an append promises before the turn moves on.
+///
+/// The choice is between two failure stories. Under `BestEffort` a tool that
+/// ran is a tool that ran, and a trail that could not record it is an error
+/// to log. Under `Strict` the trail is the authority: an entry is synced to
+/// disk and acknowledged before the loop continues, and once one append has
+/// failed, every tool that could change the world is refused until the
+/// process is restarted over a repaired trail. Tools declared idempotent keep
+/// running either way — refusing a read protects nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum AuditDurability {
+    /// Append and flush; a failed append is logged and the turn continues.
+    #[default]
+    BestEffort,
+    /// Append, fsync, and acknowledge; a failed append degrades the writer
+    /// and non-idempotent tool calls are refused for the rest of the process.
+    Strict,
+}
+
+impl AuditDurability {
+    /// Whether every append must be acknowledged and mutations are refused
+    /// once one has failed.
+    #[must_use]
+    pub fn is_strict(self) -> bool {
+        matches!(self, Self::Strict)
+    }
+}
+
+impl fmt::Display for AuditDurability {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let name = match self {
+            Self::BestEffort => "best_effort",
+            Self::Strict => "strict",
+        };
+        f.write_str(name)
+    }
+}
 
 /// Audit settings in force.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +61,8 @@ pub struct AuditConfig {
     redactor: Redactor,
     /// The principal on whose behalf tool calls run.
     user: Option<String>,
+    /// What an append promises.
+    durability: AuditDurability,
 }
 
 impl AuditConfig {
@@ -29,7 +73,28 @@ impl AuditConfig {
             path: path.into(),
             redactor: Redactor::with_defaults(),
             user: None,
+            durability: AuditDurability::default(),
         }
+    }
+
+    /// Sets what an append promises. Best effort unless this is called.
+    #[must_use]
+    pub fn with_durability(mut self, durability: AuditDurability) -> Self {
+        self.durability = durability;
+        self
+    }
+
+    /// What an append promises.
+    #[must_use]
+    pub fn durability(&self) -> AuditDurability {
+        self.durability
+    }
+
+    /// Whether the trail is strict: appends are acknowledged, and a failed
+    /// one refuses every later non-idempotent tool call.
+    #[must_use]
+    pub fn is_strict(&self) -> bool {
+        self.durability.is_strict()
     }
 
     /// Replaces the redaction patterns.
@@ -159,6 +224,29 @@ mod tests {
         assert!(config.redactor().matches_key("api_key"));
         assert_eq!(config.path(), Path::new("/tmp/audit.jsonl"));
         assert_eq!(config.user(), None);
+        assert_eq!(config.durability(), AuditDurability::BestEffort);
+        assert!(!config.is_strict());
+    }
+
+    #[test]
+    fn a_config_can_be_made_strict() {
+        let config = AuditConfig::new("/tmp/audit.jsonl").with_durability(AuditDurability::Strict);
+        assert!(config.is_strict());
+        assert_eq!(config.durability(), AuditDurability::Strict);
+    }
+
+    #[test]
+    fn durability_reads_and_writes_as_snake_case() {
+        assert_eq!(
+            serde_json::from_str::<AuditDurability>("\"strict\"").expect("parses"),
+            AuditDurability::Strict
+        );
+        assert_eq!(
+            serde_json::to_string(&AuditDurability::BestEffort).expect("serializes"),
+            "\"best_effort\""
+        );
+        assert_eq!(AuditDurability::Strict.to_string(), "strict");
+        assert_eq!(AuditDurability::default(), AuditDurability::BestEffort);
     }
 
     #[test]

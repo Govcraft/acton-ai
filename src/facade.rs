@@ -627,6 +627,53 @@ impl ActonAI {
         })
     }
 
+    /// How the audit writer is doing.
+    ///
+    /// Unlike [`audit_head`](Self::audit_head), an unconfigured trail is an
+    /// answer rather than an error — [`AuditHealth::disabled`] — because a
+    /// status surface needs to render "not recording" alongside "healthy"
+    /// and "degraded" from one call, and the three must never read alike.
+    ///
+    /// A barrier like `audit_head`, and a stronger one: the reply reflects
+    /// the outcome of every invocation recorded before this call, not just
+    /// its sealing. The actor learns an append's outcome from a note it sends
+    /// itself once the write finishes, so a plain health ask queued behind a
+    /// best-effort record could be served before that note; this asks for the
+    /// head first — which cannot answer until the write has finished and the
+    /// note is queued — and only then for the health.
+    ///
+    /// # Errors
+    ///
+    /// Returns a provider error if the audit actor cannot be reached.
+    ///
+    /// [`AuditHealth::disabled`]: crate::audit::AuditHealth::disabled
+    pub async fn audit_health(&self) -> Result<crate::audit::AuditHealth, ActonAIError> {
+        let Some(audit) = self.inner.audit.as_ref() else {
+            return Ok(crate::audit::AuditHealth::disabled());
+        };
+
+        let unreachable =
+            |e| ActonAIError::provider_error(format!("could not reach the audit log: {e}"));
+
+        audit
+            .ask(crate::audit::GetChainHead)
+            .await
+            .map_err(unreachable)?;
+        audit
+            .ask(crate::audit::GetAuditHealth)
+            .await
+            .map_err(unreachable)
+    }
+
+    /// What an audit append promises, or `None` when no trail is configured.
+    #[must_use]
+    pub fn audit_durability(&self) -> Option<crate::audit::AuditDurability> {
+        self.inner
+            .audit_config
+            .as_ref()
+            .map(crate::audit::AuditConfig::durability)
+    }
+
     /// Whether this runtime checkpoints its turns.
     #[must_use]
     pub fn is_checkpointing(&self) -> bool {

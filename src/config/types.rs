@@ -342,12 +342,17 @@ impl ToolPolicyFileConfig {
 /// enabled = true                              # optional, default true
 /// path = "/var/log/acton-ai/audit.jsonl"      # optional, defaults under the data dir
 /// user = "acct:alice"                         # optional acting principal
+/// durability = "strict"                       # optional, default "best_effort"
 /// redact_patterns = ["password", "ssn"]       # optional, replaces the defaults
 /// ```
 ///
 /// The section's **presence** arms the trail; `enabled = false` is there so a
 /// deployment can turn recording off without losing the settings it will want
 /// back. With no section at all, no actor is spawned and nothing is written.
+///
+/// `durability = "strict"` makes every append fsync and acknowledge before
+/// the turn continues, and refuses every non-idempotent tool call once an
+/// append has failed; see [`AuditDurability`](crate::audit::AuditDurability).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuditFileConfig {
     /// Whether to record at all. Defaults to true — writing the section is a
@@ -365,6 +370,10 @@ pub struct AuditFileConfig {
     /// The principal on whose behalf this process invokes tools.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// What an append promises: `best_effort` (the default) or `strict`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub durability: Option<crate::audit::AuditDurability>,
 
     /// Argument key fragments whose values are redacted before writing.
     ///
@@ -399,6 +408,11 @@ impl AuditFileConfig {
     ///     toml::from_str("path = '/tmp/audit.jsonl'").unwrap();
     /// let audit = section.to_audit().unwrap();
     /// assert!(audit.path().ends_with("audit.jsonl"));
+    /// assert!(!audit.is_strict(), "best effort unless asked");
+    ///
+    /// let strict: AuditFileConfig =
+    ///     toml::from_str("path = '/tmp/audit.jsonl'\ndurability = 'strict'").unwrap();
+    /// assert!(strict.to_audit().unwrap().is_strict());
     ///
     /// let bad: AuditFileConfig = toml::from_str("redact_patterns = ['']").unwrap();
     /// assert!(bad.to_audit().is_err());
@@ -440,6 +454,10 @@ impl AuditFileConfig {
                 ));
             }
             config = config.with_redactor(crate::audit::Redactor::new(&self.redact_patterns));
+        }
+
+        if let Some(durability) = self.durability {
+            config = config.with_durability(durability);
         }
 
         Ok(config)

@@ -16,6 +16,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   whose `Busy` variant names the holder's pid where the platform can tell
   (`/proc/locks` on Linux). Read-only verification of a live trail is
   unaffected (Govcraft/acton-ai#14).
+- **Audit durability and writer health.** `[audit] durability = "strict"`
+  (or `AuditConfig::with_durability(AuditDurability::Strict)`) makes every
+  entry fsync and be acknowledged before the prompt loop considers the next
+  tool call, and once an append has failed the loop refuses every tool not
+  declared idempotent — through the ordinary refusal path, so the attempt is
+  recorded as denied by the new `Decider::AuditGuard` with
+  `DenialReason::AuditDegraded`, and the model is told mutating tools stay
+  refused for the session. An audit actor that does not answer the guard is
+  refused the same way (`DenialReason::AuditUnreachable`): the guard fails
+  closed. The default stays `best_effort`, so nothing changes for an
+  existing embedder. The writer's state is readable as `AuditHealth`
+  (`healthy`, `degraded`, or `disabled`; appended and failed counts; the
+  first failed sequence; the last error; when it degraded) through
+  `ActonAI::audit_health()` and the `GetAuditHealth` request, and the
+  healthy-to-degraded transition is broadcast once as `AuditHealthChanged`.
+  `RecordInvocationDurably` is the acknowledged form of `RecordInvocation`,
+  answering with an `AppendReceipt`; `ActonAI::audit_durability()` reports
+  what the trail promises.
 
 ## 0.34.0 - 2026-08-28
 

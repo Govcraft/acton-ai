@@ -44,6 +44,24 @@ pub enum DenialReason {
         /// The reason the hook gave.
         reason: String,
     },
+    /// The audit trail is strict and its writer is degraded: an earlier
+    /// entry never reached the disk, so a call that could change the world
+    /// is refused rather than run unrecorded.
+    AuditDegraded {
+        /// How many appends have failed in this process.
+        failures: u64,
+        /// What the operating system said about the most recent one.
+        last_error: Option<String>,
+    },
+    /// The audit trail is strict and its writer could not be asked at all.
+    ///
+    /// Distinct from degraded because nothing is known about the trail: the
+    /// actor is gone, or did not answer in time. The guard fails closed
+    /// either way.
+    AuditUnreachable {
+        /// Why the writer could not be consulted.
+        error: String,
+    },
 }
 
 impl fmt::Display for DenialReason {
@@ -67,6 +85,28 @@ impl fmt::Display for DenialReason {
             Self::Callback { reason } => {
                 write!(f, "the approval hook refused this call: {reason}")
             }
+            Self::AuditDegraded {
+                failures,
+                last_error,
+            } => {
+                write!(
+                    f,
+                    "the audit trail is degraded ({failures} append failure(s)"
+                )?;
+                if let Some(error) = last_error {
+                    write!(f, ", last error: {error}")?;
+                }
+                write!(
+                    f,
+                    "); mutating tools are refused until the trail is repaired and the agent \
+                     restarted"
+                )
+            }
+            Self::AuditUnreachable { error } => write!(
+                f,
+                "the audit trail is strict and its writer could not be consulted ({error}); \
+                 mutating tools are refused until it answers"
+            ),
         }
     }
 }
@@ -102,6 +142,11 @@ pub enum Decider {
     /// than through the gate — the gate already admitted it once, on the
     /// attempt that died.
     Settlement,
+    /// The strict audit trail's guard refused it.
+    ///
+    /// The writer was degraded or unreachable and the tool is not declared
+    /// idempotent, so the call was refused before any policy looked at it.
+    AuditGuard,
 }
 
 impl fmt::Display for Decider {
@@ -114,6 +159,7 @@ impl fmt::Display for Decider {
             Self::PerTurnCap => "per_turn_cap",
             Self::Callback => "callback",
             Self::Settlement => "settlement",
+            Self::AuditGuard => "audit_guard",
         };
         f.write_str(name)
     }
@@ -382,5 +428,45 @@ mod tests {
         let rendered = reason.to_string();
         assert!(rendered.contains("bash"), "names the tool: {rendered}");
         assert!(rendered.contains('2'), "names the limit: {rendered}");
+    }
+
+    #[test]
+    fn an_audit_refusal_says_the_trail_is_degraded_and_for_how_long() {
+        let with_error = DenialReason::AuditDegraded {
+            failures: 3,
+            last_error: Some("No space left on device".to_string()),
+        }
+        .to_string();
+        assert!(with_error.contains("audit trail is degraded"), "{with_error}");
+        assert!(with_error.contains("3 append failure"), "{with_error}");
+        assert!(with_error.contains("No space left on device"), "{with_error}");
+        assert!(with_error.contains("restarted"), "{with_error}");
+
+        let without_error = DenialReason::AuditDegraded {
+            failures: 1,
+            last_error: None,
+        }
+        .to_string();
+        assert!(!without_error.contains("last error"), "{without_error}");
+
+        let unreachable = DenialReason::AuditUnreachable {
+            error: "timed out".to_string(),
+        }
+        .to_string();
+        assert!(unreachable.contains("could not be consulted"), "{unreachable}");
+        assert!(unreachable.contains("timed out"), "{unreachable}");
+    }
+
+    #[test]
+    fn the_audit_guard_is_a_decider_in_its_own_right() {
+        assert_eq!(Decider::AuditGuard.to_string(), "audit_guard");
+        assert_eq!(
+            serde_json::to_string(&Decider::AuditGuard).expect("serializes"),
+            "\"audit_guard\""
+        );
+        assert_eq!(
+            serde_json::from_str::<Decider>("\"audit_guard\"").expect("parses"),
+            Decider::AuditGuard
+        );
     }
 }

@@ -1719,9 +1719,7 @@ impl PromptBuilder {
             let settle_correlation_id = CorrelationId::new();
             let mut results: Vec<String> = Vec::with_capacity(calls.len());
             for entry in &calls {
-                let idempotent = tools.iter().any(|spec| {
-                    spec.definition.name == entry.call.name && spec.definition.idempotent
-                });
+                let idempotent = tool_is_idempotent(&tools, &entry.call.name);
                 match resolve_pending_call(&entry.state, &entry.call.name, idempotent) {
                     PendingCallAction::UseStored { result } => results.push(result),
                     PendingCallAction::Uncertain { feedback } => {
@@ -3331,6 +3329,15 @@ impl ToolStep<'_> {
         // call was proposed, and something had to decide about it.
         self.start_tool(tool_call).await;
 
+        // The strict trail's guard comes before the policy: a call the trail
+        // cannot record is refused whatever the policy would have said, and
+        // the refusal itself goes through the same recording path so the
+        // attempt is in the trail — or, if the trail is what failed, in the
+        // failure count.
+        if let Some((reason, decided_by)) = self.audit_guard(tools, tool_call).await {
+            return self.refuse(tool_call, &reason, decided_by, started).await;
+        }
+
         let gate = self.decide(tool_call, counts).await;
 
         let (arguments, decided_by) = match gate {
@@ -3407,6 +3414,44 @@ impl ToolStep<'_> {
                 summary,
             })
             .await;
+    }
+
+    /// The strict trail's guard: refuses a mutating call the trail can no
+    /// longer vouch for.
+    ///
+    /// `None` — no opinion — unless the trail is configured strict *and* the
+    /// tool is not declared idempotent. A tool the loop cannot find is
+    /// treated as non-idempotent: not knowing what a call does is no reason
+    /// to let it run unrecorded. Otherwise the audit actor is asked for its
+    /// health, and both a degraded answer and no answer at all are refusals.
+    /// Fail closed: an unreachable writer is exactly the case a strict trail
+    /// exists to be strict about.
+    ///
+    /// This is race-free against the previous call's append because under
+    /// strict durability that append was acknowledged — and its outcome
+    /// folded into the health — before this call was considered.
+    async fn audit_guard(
+        &self,
+        tools: &[ToolSpec],
+        tool_call: &ToolCall,
+    ) -> Option<(crate::policy::DenialReason, crate::policy::Decider)> {
+        let (handle, config) = self.audit?;
+        if !config.is_strict() || tool_is_idempotent(tools, &tool_call.name) {
+            return None;
+        }
+
+        let reason = match handle.ask(crate::audit::GetAuditHealth).await {
+            Ok(health) if health.is_degraded() => crate::policy::DenialReason::AuditDegraded {
+                failures: health.failures,
+                last_error: health.last_error,
+            },
+            Ok(_) => return None,
+            Err(error) => crate::policy::DenialReason::AuditUnreachable {
+                error: error.to_string(),
+            },
+        };
+
+        Some((reason, crate::policy::Decider::AuditGuard))
     }
 
     /// Applies the policy, or admits everything when there is none.
@@ -3604,10 +3649,13 @@ impl ToolStep<'_> {
 
     /// Appends one entry to the trail, if a trail is configured.
     ///
-    /// Fire-and-forget by design: the entry is `send`, not `ask`, so the turn
-    /// is never blocked waiting on a disk. Ordering still holds — the audit
-    /// actor's mailbox is FIFO and its handler is sequential — which is what
-    /// the hash chain needs and all it needs.
+    /// Best effort is fire-and-forget by design: the entry is `send`, not
+    /// `ask`, so the turn is never blocked waiting on a disk. Ordering still
+    /// holds — the audit actor's mailbox is FIFO and its handler is
+    /// sequential — which is what the hash chain needs and all it needs.
+    ///
+    /// Strict is an `ask`: the loop waits for the entry's receipt, so the
+    /// record of one call is durable before the next call is considered.
     async fn record(
         &self,
         tool_call: &ToolCall,
@@ -3639,10 +3687,51 @@ impl ToolStep<'_> {
             resumed: self.resumed,
         };
 
-        handle
-            .send(crate::audit::RecordInvocation::new(record))
-            .await;
+        if !config.is_strict() {
+            handle
+                .send(crate::audit::RecordInvocation::new(record))
+                .await;
+            return;
+        }
+
+        // Strict: wait for the receipt. The entry is on disk — or known not
+        // to be — before the loop considers the next call, which is what
+        // lets `audit_guard` read the health without racing this append.
+        // Enforcement is the guard's job on the next call; here a failure
+        // is only logged, because the tool already ran.
+        match handle
+            .ask(crate::audit::RecordInvocationDurably::new(record))
+            .await
+        {
+            Ok(crate::audit::AppendReceipt::Failed { sequence, error }) => {
+                tracing::error!(
+                    tool = %tool_call.name,
+                    sequence,
+                    %error,
+                    "the audit entry for this call did not reach the disk",
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(
+                    tool = %tool_call.name,
+                    %error,
+                    "the audit log did not acknowledge this call's entry",
+                );
+            }
+        }
     }
+}
+
+/// Whether `tool_name` is declared idempotent by the tools offered this
+/// round.
+///
+/// A name the round does not know is *not* idempotent: the loop cannot vouch
+/// for what it does not have a definition for.
+fn tool_is_idempotent(tools: &[ToolSpec], tool_name: &str) -> bool {
+    tools
+        .iter()
+        .any(|spec| spec.definition.name == tool_name && spec.definition.idempotent)
 }
 
 /// Executes a single tool call and invokes the result callback if present.

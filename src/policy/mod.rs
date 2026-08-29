@@ -347,11 +347,21 @@ pub(crate) enum GateOutcome {
 /// well-formed and the turn continues.
 #[must_use]
 pub(crate) fn denial_feedback(reason: &DenialReason) -> String {
-    format!(
-        "This tool call was not executed: {reason}. Do not retry it. \
-         Continue using the tools that remain available to you, or tell the \
-         user what you could not do."
-    )
+    match reason {
+        // The guard's verdict does not change for the rest of the session,
+        // so the model is told that plainly rather than left to probe.
+        DenialReason::AuditDegraded { .. } | DenialReason::AuditUnreachable { .. } => format!(
+            "This tool call was not executed: {reason}. Do not retry it, and do not \
+             attempt other tools that modify anything: they will be refused for the \
+             rest of this session. Read-only tools remain available. Tell the user \
+             what you could not do."
+        ),
+        _ => format!(
+            "This tool call was not executed: {reason}. Do not retry it. \
+             Continue using the tools that remain available to you, or tell the \
+             user what you could not do."
+        ),
+    }
 }
 
 #[cfg(test)]

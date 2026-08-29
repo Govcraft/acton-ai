@@ -24,6 +24,24 @@
 //! No `[audit]` section and no `.audit(..)` call means no actor is spawned and
 //! nothing is written.
 //!
+//! # Durability and health
+//!
+//! By default an append is best effort: a failed write is logged and the
+//! turn continues, because the tool already ran. `[audit] durability =
+//! "strict"` (or [`AuditConfig::with_durability`]) makes the trail the
+//! authority instead. Every entry is fsynced and acknowledged before the
+//! prompt loop considers the next tool call, and once one append has failed
+//! the loop refuses every non-idempotent tool call — through the ordinary
+//! policy path, recorded as denied, with the reason fed back to the model —
+//! until the process is restarted over a repaired trail. Tools declared
+//! idempotent keep running. An audit actor that cannot answer is treated the
+//! same as a degraded one: the guard fails closed.
+//!
+//! Either way the writer's state is readable as [`AuditHealth`] through
+//! [`ActonAI::audit_health`](crate::ActonAI::audit_health) or the
+//! [`GetAuditHealth`] request, and the first failure is broadcast once as
+//! [`AuditHealthChanged`].
+//!
 //! # Verifying
 //!
 //! ```text
@@ -59,11 +77,16 @@ pub mod actor;
 pub mod chain;
 pub mod config;
 pub mod entry;
+pub mod health;
 pub mod redact;
 
-pub use actor::{claim_trail, AuditLog, GetChainHead, RecordInvocation, TrailClaimError};
+pub use actor::{
+    claim_trail, AppendReceipt, AuditHealthChanged, AuditLog, GetAuditHealth, GetChainHead,
+    RecordInvocation, RecordInvocationDurably, TrailClaimError,
+};
 pub use chain::{verify_chain, ChainBreak, ChainBreakKind, ChainHead};
-pub use config::{default_audit_path, AuditConfig, DEFAULT_AUDIT_FILE};
+pub use config::{default_audit_path, AuditConfig, AuditDurability, DEFAULT_AUDIT_FILE};
+pub use health::{AuditHealth, AuditHealthState};
 pub use entry::{AuditDecision, AuditEntry, AuditOutcome, InvocationRecord, GENESIS_HASH};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS, REDACTED};
 

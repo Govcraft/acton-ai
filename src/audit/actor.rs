@@ -22,10 +22,26 @@
 //!
 //! The lock conflicts only with other lock takers. The actor's own appends and
 //! read-only verification of a live trail are unaffected.
+//!
+//! # Health, and how it stays truthful
+//!
+//! The actor also owns the writer's [`AuditHealth`]: how many appends reached
+//! the disk, how many did not, and the first sequence that is missing. A
+//! `mutate_on` handler cannot touch the model after its future has awaited
+//! the disk, so each append future ends by sending the actor a private
+//! [`NoteAppendOutcome`], and the health is folded when that note is
+//! processed. For a durable append the note is sent *before* the receipt is
+//! delivered, and mailboxes are FIFO, so any [`GetAuditHealth`] a caller
+//! sends after receiving the receipt is served after the failure has been
+//! folded. That ordering is what makes the strict-mode guard race-free: the
+//! prompt loop asks about health only after the previous append has been
+//! acknowledged. The healthy-to-degraded transition is broadcast once as
+//! [`AuditHealthChanged`].
 
 use crate::audit::chain::ChainHead;
-use crate::audit::config::AuditConfig;
+use crate::audit::config::{AuditConfig, AuditDurability};
 use crate::audit::entry::{AuditEntry, InvocationRecord};
+use crate::audit::health::AuditHealth;
 use acton_reactive::prelude::tokio::io::AsyncWriteExt;
 use acton_reactive::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -222,6 +238,97 @@ impl RecordInvocation {
     }
 }
 
+/// One tool invocation to append to the trail, acknowledged once it is on
+/// disk.
+///
+/// The `ask` form of [`RecordInvocation`]: the reply is an [`AppendReceipt`]
+/// that arrives only after the entry has been written and synced — or after
+/// the write failed, in which case the receipt says so. The prompt loop uses
+/// this under strict durability so a tool's record is durable before the next
+/// tool is considered.
+#[acton_message]
+pub struct RecordInvocationDurably {
+    /// Everything about the invocation except its place in the chain.
+    pub record: InvocationRecord,
+}
+
+impl RecordInvocationDurably {
+    /// Wraps a record for asking.
+    #[must_use]
+    pub fn new(record: InvocationRecord) -> Self {
+        Self { record }
+    }
+}
+
+impl Request for RecordInvocationDurably {
+    type Response = AppendReceipt;
+}
+
+/// What became of one durable append.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "outcome")]
+#[non_exhaustive]
+pub enum AppendReceipt {
+    /// The entry is on disk and synced.
+    Durable {
+        /// The entry's place in the chain.
+        sequence: u64,
+        /// The entry's hash — the new chain head.
+        hash: String,
+    },
+    /// The entry was sealed but never reached the disk.
+    Failed {
+        /// The sequence the entry was sealed at; the chain has a gap there.
+        sequence: u64,
+        /// What the operating system said.
+        error: String,
+    },
+}
+
+impl AppendReceipt {
+    /// Whether the entry reached the disk.
+    #[must_use]
+    pub fn is_durable(&self) -> bool {
+        matches!(self, Self::Durable { .. })
+    }
+}
+
+/// Asks the audit log how its writer is doing.
+///
+/// A read, like [`GetChainHead`], and the same barrier: a reply proves every
+/// append outcome noted before it has been folded into the health.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct GetAuditHealth;
+
+impl Request for GetAuditHealth {
+    type Response = AuditHealth;
+}
+
+/// Broadcast once, on the healthy-to-degraded transition.
+///
+/// Later failures change the counters, which [`GetAuditHealth`] reports, but
+/// they are not a new event: the writer was already degraded.
+#[acton_message]
+#[derive(Serialize, Deserialize)]
+pub struct AuditHealthChanged {
+    /// The health as of the first failure.
+    pub health: AuditHealth,
+}
+
+/// Sent by the actor to itself from an append future.
+///
+/// A `mutate_on` handler's future cannot touch the model after it has awaited
+/// the disk, so the outcome comes back as a message and is folded in order
+/// with everything else.
+#[acton_message]
+struct NoteAppendOutcome {
+    /// The head after the entry this note is about.
+    head: ChainHead,
+    /// What went wrong, if anything.
+    error: Option<String>,
+}
+
 /// State owned by the audit log.
 ///
 /// `#[acton_actor]` derives `Default`, which would leave `prev_hash` as the
@@ -236,6 +343,11 @@ pub struct AuditLog {
     prev_hash: String,
     /// How many entries have been written.
     sequence: u64,
+    /// What an append promises before it is acknowledged.
+    durability: AuditDurability,
+    /// How the writer is doing. Defaults to disabled, which is a lie for a
+    /// running actor; [`AuditLog::spawn`] always arms it before starting.
+    health: AuditHealth,
     /// The exclusive lock on the trail. Held, not used: its presence in the
     /// model ties the lock's lifetime to the actor's, so it is released when
     /// the actor stops and never before. `None` only in unit tests that
@@ -271,13 +383,43 @@ impl AuditLog {
         // Installed on the idle builder rather than sent as a message, so the
         // chain head is in place before the actor can receive anything.
         builder.model.path = config.path().to_path_buf();
-        builder.model.prev_hash = head.hash;
+        builder.model.prev_hash = head.hash.clone();
         builder.model.sequence = head.sequence;
+        builder.model.durability = config.durability();
+        builder.model.health = AuditHealth::armed(head, config.durability());
         builder.model.lock = Some(lock);
 
         configure_handlers(&mut builder);
 
         Ok(builder.start().await)
+    }
+
+    /// Seals the next entry and hands back what an append future needs.
+    fn prepare_append(&mut self, record: InvocationRecord) -> PreparedAppend {
+        let entry = self.seal_next(record);
+        PreparedAppend {
+            path: self.path.clone(),
+            head: self.head(),
+            durability: self.durability,
+            entry,
+        }
+    }
+
+    /// Folds one append outcome into the health. Returns the transition
+    /// event, if this was the first failure.
+    fn note_outcome(&mut self, note: &NoteAppendOutcome, now: &str) -> Option<AuditHealthChanged> {
+        match &note.error {
+            None => {
+                self.health.note_success(note.head.clone());
+                None
+            }
+            Some(error) => self
+                .health
+                .note_failure(note.head.clone(), error, now)
+                .then(|| AuditHealthChanged {
+                    health: self.health.clone(),
+                }),
+        }
     }
 
     /// Seals the next entry and advances the head. Pure bookkeeping.
@@ -301,44 +443,140 @@ impl AuditLog {
     }
 }
 
-/// Wires the audit log's two handlers.
+/// Everything an append future needs, cloned out of the model before the
+/// async block: the handler closure is `Fn` and cannot hold a borrow of the
+/// model across the await.
+struct PreparedAppend {
+    path: PathBuf,
+    head: ChainHead,
+    durability: AuditDurability,
+    entry: AuditEntry,
+}
+
+impl PreparedAppend {
+    /// Writes the entry and reports back to the actor.
+    ///
+    /// The self-note is sent before this returns, so a caller that goes on
+    /// to ask [`GetAuditHealth`] after a reply from this append is served
+    /// after the outcome has been folded.
+    async fn perform(self, self_handle: &ActorHandle) -> Result<(), String> {
+        let result = append_entry(&self.path, &self.entry, self.durability)
+            .await
+            .map_err(|error| error.to_string());
+
+        if let Err(error) = &result {
+            // A failed append must not fail the turn — the tool already ran,
+            // and refusing to continue would not un-run it. It is logged at
+            // error level because a compliance deployment needs to notice,
+            // and the chain head still advances so the gap is visible to
+            // `audit verify` rather than silently healed. What a strict trail
+            // does about the *next* call is the prompt loop's decision, made
+            // on the health this note feeds.
+            tracing::error!(
+                path = %self.path.display(),
+                sequence = self.entry.sequence,
+                %error,
+                "could not append to the audit trail",
+            );
+        }
+
+        self_handle
+            .send(NoteAppendOutcome {
+                head: self.head,
+                error: result.clone().err(),
+            })
+            .await;
+
+        result
+    }
+
+    /// The receipt a durable append answers with.
+    fn receipt(sequence: u64, hash: String, result: Result<(), String>) -> AppendReceipt {
+        match result {
+            Ok(()) => AppendReceipt::Durable { sequence, hash },
+            Err(error) => AppendReceipt::Failed { sequence, error },
+        }
+    }
+}
+
+/// Wires the audit log's handlers.
 fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
+    // The actor's own address, captured by the append futures so they can
+    // report their outcome back as a message.
+    let self_handle = builder.handle().clone();
+
     // `mutate_on`, and the write lives in the returned future deliberately.
     // A mutable handler's future is awaited inline before the actor takes its
     // next message, so appends happen in exactly the order the entries were
     // sealed. For a hash chain that serialization is the requirement, not a
     // cost: two concurrent appends would interleave lines that claim to
     // follow each other.
-    builder.mutate_on::<RecordInvocation>(|actor, envelope| {
-        let entry = actor.model.seal_next(envelope.message().record.clone());
-        // Cloned out of the model before the async block: the closure is `Fn`
-        // and cannot hold a borrow of the model across the await.
-        let path = actor.model.path.clone();
+    let handle = self_handle.clone();
+    builder.mutate_on::<RecordInvocation>(move |actor, envelope| {
+        let prepared = actor.model.prepare_append(envelope.message().record.clone());
+        let handle = handle.clone();
 
         Reply::pending(async move {
-            if let Err(error) = append_entry(&path, &entry).await {
-                // A failed append must not fail the turn — the tool already
-                // ran, and refusing to continue would not un-run it. It is
-                // logged at error level because a compliance deployment needs
-                // to notice, and the chain head still advances so the gap is
-                // visible to `audit verify` rather than silently healed.
-                tracing::error!(
-                    path = %path.display(),
-                    sequence = entry.sequence,
-                    %error,
-                    "could not append to the audit trail",
-                );
-            }
+            // The outcome is already logged and noted; a fire-and-forget
+            // sender has nobody to hand it to.
+            let _ = prepared.perform(&handle).await;
         })
     });
 
-    // A read, so several asks can be served at once and none of them blocks
+    // Same write, but the sender is waiting for the receipt. The note to self
+    // goes out before the reply does — see the module docs for why that
+    // ordering is what makes the strict-mode guard race-free.
+    let handle = self_handle.clone();
+    builder.mutate_on::<RecordInvocationDurably>(move |actor, envelope| {
+        let prepared = actor.model.prepare_append(envelope.message().record.clone());
+        let reply = envelope.reply_envelope();
+        let handle = handle.clone();
+
+        Reply::pending(async move {
+            let sequence = prepared.entry.sequence;
+            let hash = prepared.entry.hash.clone();
+            let result = prepared.perform(&handle).await;
+            reply
+                .send(PreparedAppend::receipt(sequence, hash, result))
+                .await;
+        })
+    });
+
+    // Folding an outcome is bookkeeping; the one asynchronous thing it can
+    // produce is the transition broadcast, which is a send.
+    builder.mutate_on::<NoteAppendOutcome>(|actor, envelope| {
+        let now = chrono::Utc::now().to_rfc3339();
+        let Some(event) = actor.model.note_outcome(envelope.message(), &now) else {
+            return Reply::ready();
+        };
+
+        tracing::warn!(
+            failures = event.health.failures,
+            first_failed_sequence = ?event.health.first_failed_sequence,
+            durability = %event.health.durability,
+            "the audit writer is degraded",
+        );
+        let broker = actor.broker().clone();
+        Reply::pending(async move {
+            broker.broadcast(event).await;
+        })
+    });
+
+    // Reads, so several asks can be served at once and none of them blocks
     // the appends queued ahead of them.
     builder.act_on::<GetChainHead>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let head = actor.model.head();
         Reply::pending(async move {
             reply.send(head).await;
+        })
+    });
+
+    builder.act_on::<GetAuditHealth>(|actor, envelope| {
+        let reply = envelope.reply_envelope();
+        let health = actor.model.health.clone();
+        Reply::pending(async move {
+            reply.send(health).await;
         })
     });
 }
@@ -349,7 +587,14 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
 /// the file is for: nothing this process holds can rewind or overwrite what is
 /// already on disk, and a crash between entries leaves a shorter valid chain
 /// rather than a corrupt one.
-async fn append_entry(path: &Path, entry: &AuditEntry) -> Result<(), std::io::Error> {
+///
+/// Under strict durability the data is synced to the device before this
+/// returns, so an acknowledged entry survives a power cut, not just a crash.
+async fn append_entry(
+    path: &Path,
+    entry: &AuditEntry,
+    durability: AuditDurability,
+) -> Result<(), std::io::Error> {
     let mut line = entry
         .to_jsonl()
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
@@ -362,7 +607,11 @@ async fn append_entry(path: &Path, entry: &AuditEntry) -> Result<(), std::io::Er
         .await?;
 
     file.write_all(line.as_bytes()).await?;
-    file.flush().await
+    file.flush().await?;
+    if durability.is_strict() {
+        file.sync_data().await?;
+    }
+    Ok(())
 }
 
 /// Reads an existing trail and returns where its chain ends.
@@ -432,6 +681,8 @@ mod tests {
             path: PathBuf::from("/dev/null"),
             prev_hash: GENESIS_HASH.to_string(),
             sequence: 0,
+            durability: AuditDurability::BestEffort,
+            health: AuditHealth::armed(ChainHead::empty(), AuditDurability::BestEffort),
             lock: None,
         };
 
@@ -562,6 +813,194 @@ mod tests {
         AuditLog::spawn(&mut runtime, &config)
             .await
             .expect("a stopped log releases the trail for the next opener");
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    /// Replaces the trail with a directory of the same name, from under the
+    /// running writer: the lock stays on the old inode, the next open by
+    /// path fails.
+    fn make_unappendable(path: &Path) {
+        std::fs::remove_file(path).unwrap();
+        std::fs::create_dir(path).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_fresh_log_is_healthy_with_nothing_counted() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir)).with_durability(AuditDurability::Strict);
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+
+        let health = log.ask(GetAuditHealth).await.unwrap();
+
+        assert_eq!(health.state, crate::audit::AuditHealthState::Healthy);
+        assert_eq!(health.durability, AuditDurability::Strict);
+        assert_eq!(health.appended, 0);
+        assert_eq!(health.failures, 0);
+        assert_eq!(health.head, ChainHead::empty());
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_durable_append_is_acknowledged_with_the_new_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir)).with_durability(AuditDurability::Strict);
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+
+        let receipt = log
+            .ask(RecordInvocationDurably::new(record("a")))
+            .await
+            .unwrap();
+
+        let AppendReceipt::Durable { sequence, hash } = receipt else {
+            panic!("a healthy trail acknowledges durably, got {receipt:?}");
+        };
+        assert_eq!(sequence, 1);
+
+        // The receipt was sent after the self-note, so this ask lands after
+        // the outcome has been folded.
+        let health = log.ask(GetAuditHealth).await.unwrap();
+        assert_eq!(health.appended, 1);
+        assert_eq!(health.failures, 0);
+        assert_eq!(health.head.hash, hash);
+        assert_eq!(health.head.sequence, 1);
+
+        let entries = crate::audit::read_entries(config.path()).await.unwrap();
+        assert_eq!(entries.len(), 1, "the entry is on disk before the receipt");
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_durable_append_degrades_the_writer_and_says_so() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir)).with_durability(AuditDurability::Strict);
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+        log.ask(RecordInvocationDurably::new(record("a")))
+            .await
+            .unwrap();
+
+        make_unappendable(config.path());
+
+        let receipt = log
+            .ask(RecordInvocationDurably::new(record("b")))
+            .await
+            .unwrap();
+        let AppendReceipt::Failed { sequence, error } = receipt else {
+            panic!("an unappendable trail must report failure, got {receipt:?}");
+        };
+        assert_eq!(sequence, 2);
+        assert!(!error.is_empty());
+
+        let health = log.ask(GetAuditHealth).await.unwrap();
+        assert!(health.is_degraded());
+        assert_eq!(health.appended, 1);
+        assert_eq!(health.failures, 1);
+        assert_eq!(health.first_failed_sequence, Some(2));
+        assert_eq!(health.last_error.as_deref(), Some(error.as_str()));
+        assert!(health.degraded_since.is_some());
+        assert_eq!(
+            health.head.sequence, 2,
+            "the head advances past the gap so `audit verify` can see it"
+        );
+
+        // A second failure counts; the first failed sequence does not move.
+        let receipt = log
+            .ask(RecordInvocationDurably::new(record("c")))
+            .await
+            .unwrap();
+        assert!(!receipt.is_durable());
+        let health = log.ask(GetAuditHealth).await.unwrap();
+        assert_eq!(health.failures, 2);
+        assert_eq!(health.first_failed_sequence, Some(2));
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_best_effort_failure_is_visible_through_health_after_the_head_barrier() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir));
+        let mut runtime = ActonApp::launch_async().await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+
+        make_unappendable(config.path());
+        log.send(RecordInvocation::new(record("a"))).await;
+
+        // The head ask cannot answer until the append future has finished,
+        // and that future queues the outcome note before it finishes; so a
+        // health ask sent after the head reply is served after the note.
+        let head = log.ask(GetChainHead).await.unwrap();
+        assert_eq!(head.sequence, 1);
+        let health = log.ask(GetAuditHealth).await.unwrap();
+
+        assert!(health.is_degraded());
+        assert_eq!(health.durability, AuditDurability::BestEffort);
+        assert_eq!(health.failures, 1);
+        assert_eq!(health.first_failed_sequence, Some(1));
+        runtime.shutdown_all().await.unwrap();
+    }
+
+    #[acton_actor]
+    struct HealthSpy {
+        seen: Vec<AuditHealth>,
+    }
+
+    #[acton_message]
+    struct GetSeen;
+
+    #[acton_message]
+    struct Seen {
+        events: Vec<AuditHealth>,
+    }
+
+    impl Request for GetSeen {
+        type Response = Seen;
+    }
+
+    async fn spawn_health_spy(runtime: &mut ActorRuntime) -> ActorHandle {
+        let mut builder = runtime.new_actor::<HealthSpy>();
+        builder.mutate_on::<AuditHealthChanged>(|actor, envelope| {
+            actor.model.seen.push(envelope.message().health.clone());
+            Reply::ready()
+        });
+        builder.act_on::<GetSeen>(|actor, envelope| {
+            let reply = envelope.reply_envelope();
+            let events = actor.model.seen.clone();
+            Reply::pending(async move {
+                reply.send(Seen { events }).await;
+            })
+        });
+        builder.handle().subscribe::<AuditHealthChanged>().await;
+        builder.start().await
+    }
+
+    #[tokio::test]
+    async fn the_first_failure_is_broadcast_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = AuditConfig::new(trail_in(&dir)).with_durability(AuditDurability::Strict);
+        let mut runtime = ActonApp::launch_async().await;
+        let spy = spawn_health_spy(&mut runtime).await;
+        let log = AuditLog::spawn(&mut runtime, &config).await.unwrap();
+
+        make_unappendable(config.path());
+        for name in ["a", "b", "c"] {
+            let receipt = log
+                .ask(RecordInvocationDurably::new(record(name)))
+                .await
+                .unwrap();
+            assert!(!receipt.is_durable());
+        }
+        // Both notes are folded once the health answers, so both broadcasts
+        // — if there were two — have been handed to the broker by now.
+        log.ask(GetAuditHealth).await.unwrap();
+        runtime.broker().ask(FlushBroadcasts).await.unwrap();
+
+        let seen = spy.ask(GetSeen).await.unwrap().events;
+        assert_eq!(seen.len(), 1, "one transition, one event: {seen:?}");
+        assert_eq!(seen[0].failures, 1);
+        assert_eq!(seen[0].first_failed_sequence, Some(1));
+        assert!(seen[0].is_degraded());
         runtime.shutdown_all().await.unwrap();
     }
 }
