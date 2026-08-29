@@ -4,7 +4,7 @@
 //! fields (pool warmup, guest binary source) and adds OS hardening knobs.
 //!
 //! Duration fields are serialized as whole seconds (`u64`) on disk. This
-//! matches the pattern already used in [`crate::config::types`] and avoids
+//! matches the pattern already used in `crate::config::types` and avoids
 //! pulling in a new dependency solely for human-friendly durations.
 
 use std::path::PathBuf;

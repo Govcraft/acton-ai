@@ -31,7 +31,7 @@
 //! — and gain an identity on the next spawn. A sidecar that names a different
 //! trail than the chain is sealed under refuses the spawn: one of the two
 //! files was moved or copied from somewhere else. [`ChainHead::trail_id`]
-//! reports the identity through [`ActonAI::audit_head`](crate::ActonAI::audit_head)
+//! reports the identity through [`ActonAI::audit_head`](crate::facade::ActonAI::audit_head)
 //! and `audit verify`.
 //!
 //! # Off by default
@@ -53,7 +53,7 @@
 //! same as a degraded one: the guard fails closed.
 //!
 //! Either way the writer's state is readable as [`AuditHealth`] through
-//! [`ActonAI::audit_health`](crate::ActonAI::audit_health) or the
+//! [`ActonAI::audit_health`](crate::facade::ActonAI::audit_health) or the
 //! [`GetAuditHealth`] request, and the first failure is broadcast once as
 //! [`AuditHealthChanged`].
 //!

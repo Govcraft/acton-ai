@@ -12,7 +12,7 @@
 //! [`install_crypto_provider`] runs has already picked a backend, and no later
 //! call can take it back. So it runs at the top of `main`, before the CLI
 //! parses its own arguments, and again — idempotently — from
-//! [`ActonAIBuilder::launch`](crate::ActonAIBuilder::launch) for embedders who
+//! [`ActonAIBuilder::launch`](crate::facade::ActonAIBuilder::launch) for embedders who
 //! never go through this crate's `main`.
 //!
 //! # Without the feature

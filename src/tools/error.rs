@@ -9,7 +9,7 @@ use std::time::Duration;
 
 /// Errors that can occur in tool operations.
 ///
-/// This type uses Box<ToolErrorKind> to keep the error size small,
+/// This type uses `Box<ToolErrorKind>` to keep the error size small,
 /// enabling efficient use in Result types.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolError {

@@ -615,7 +615,7 @@ pub fn summarization_messages(plan: &CompactionPlan) -> Vec<Message> {
 
 /// Renders messages as a plain-text transcript for the summarization request.
 ///
-/// Deterministic, and bounded per message by [`TRANSCRIPT_MESSAGE_CAP`] so one
+/// Deterministic, and bounded per message by `TRANSCRIPT_MESSAGE_CAP` so one
 /// enormous tool result cannot make the summarization request bigger than the
 /// history it is trying to shrink. Truncation counts characters, not bytes, so
 /// it can never split a multi-byte scalar and produce text a provider rejects.

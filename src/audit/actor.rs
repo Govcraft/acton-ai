@@ -29,7 +29,7 @@
 //! the disk, how many did not, and the first sequence that is missing. A
 //! `mutate_on` handler cannot touch the model after its future has awaited
 //! the disk, so each append future ends by sending the actor a private
-//! [`NoteAppendOutcome`], and the health is folded when that note is
+//! `NoteAppendOutcome`, and the health is folded when that note is
 //! processed. For a durable append the note is sent *before* the receipt is
 //! delivered, and mailboxes are FIFO, so any [`GetAuditHealth`] a caller
 //! sends after receiving the receipt is served after the failure has been

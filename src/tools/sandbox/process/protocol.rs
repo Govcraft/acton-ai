@@ -42,7 +42,7 @@ enum ResponseBody {
 /// A tool invocation response returned from the child process to the parent.
 ///
 /// The public API exposes the result as a [`Result<Value, String>`], but the
-/// wire format uses an explicit two-variant enum (see [`ResponseBody`]).
+/// wire format uses an explicit two-variant enum (see `ResponseBody`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Response {
     /// Either the tool output value or a stringified error.

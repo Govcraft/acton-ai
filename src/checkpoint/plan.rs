@@ -129,7 +129,7 @@ pub fn plan_resume(
 /// Decides what a run may do with a record it holds on its own authority.
 ///
 /// This is [`plan_resume`] without the fingerprint check. It exists for the
-/// operator-driven path — [`ActonAI::resume_turn`](crate::ActonAI::resume_turn) hands
+/// operator-driven path — [`ActonAI::resume_turn`](crate::facade::ActonAI::resume_turn) hands
 /// the loop a record it just listed, and the record's own messages *are* the
 /// turn, so there are no separate inputs to fingerprint against. Everything
 /// else still applies: the version, the status, the round budget, and the

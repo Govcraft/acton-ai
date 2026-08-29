@@ -50,7 +50,7 @@
 //! pause/resume/drain.
 //!
 //! Configuring `[introspection]` in a build without `ipc` **fails the launch**
-//! naming the missing feature — see [`unsupported_error`]. An operator whose
+//! naming the missing feature — see `unsupported_error`. An operator whose
 //! socket was silently never created would debug the wrong thing entirely.
 //!
 //! # It is off unless asked for

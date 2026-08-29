@@ -27,7 +27,7 @@
 //!
 //! Metrics come from two places: durations are recorded inline at the site
 //! that measures them, and token/request counters are folded by a
-//! [`TelemetryActor`] subscribed to the same
+//! `TelemetryActor` subscribed to the same
 //! [`UsageReport`](crate::messages::UsageReport) broadcast the cost
 //! accountant reads. One broadcast, two independent subscribers.
 //!
@@ -49,7 +49,7 @@
 //! Everything here except [`TelemetryConfig`] and its validation sits behind
 //! the `otel` feature, which is on by default. A build without it still
 //! parses `[telemetry]` from a config file and then **fails the launch**
-//! naming the missing feature — see [`unsupported_error`]. An operator whose
+//! naming the missing feature — see `unsupported_error`. An operator whose
 //! telemetry config was silently ignored would go looking for a broken
 //! collector; this way they are told the truth immediately.
 

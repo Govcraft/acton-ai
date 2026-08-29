@@ -3,7 +3,7 @@
 //! This module provides the [`Conversation`] type which handles automatic history
 //! management, reducing boilerplate in multi-turn conversation scenarios.
 //!
-//! `Conversation` is an actor-based wrapper: a [`ConversationActor`] owns the history,
+//! `Conversation` is an actor-based wrapper: a `ConversationActor` owns the history,
 //! the mailbox serializes sends, and the public [`Conversation`] handle is
 //! `Clone + Send + 'static` with all methods taking `&self`.
 //!
@@ -80,7 +80,7 @@ Call `exit_conversation` with a short friendly farewell when the user clearly wa
 /// so a custom tool holding it would silently intercept the model's exit
 /// call and the chat could never end through the tool. Both
 /// [`ConversationBuilder`] registration and
-/// [`ActonAIBuilder::launch`](crate::ActonAIBuilder::launch) therefore
+/// [`ActonAIBuilder::launch`](crate::facade::ActonAIBuilder::launch) therefore
 /// refuse the name outright.
 pub const EXIT_CONVERSATION_TOOL: &str = "exit_conversation";
 
@@ -629,7 +629,7 @@ impl Conversation {
     /// 3. Adds the assistant's response to history
     /// 4. Returns the collected response
     ///
-    /// If builtins were configured with [`with_builtins`](crate::ActonAIBuilder::with_builtins),
+    /// If builtins were configured with [`with_builtins`](crate::facade::ActonAIBuilder::with_builtins),
     /// they are automatically available to the LLM.
     ///
     /// # Errors
@@ -1349,7 +1349,7 @@ impl ConversationBuilder {
         }
     }
 
-    /// Builds the conversation by spawning a [`ConversationActor`].
+    /// Builds the conversation by spawning a `ConversationActor`.
     ///
     /// After calling this, you can use [`Conversation::send`] to interact
     /// with the LLM. The returned `Conversation` is `Clone + Send + 'static`.

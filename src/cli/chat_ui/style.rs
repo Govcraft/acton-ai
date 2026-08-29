@@ -21,7 +21,7 @@ const DIM: &str = "\x1b[2m";
 pub struct Theme {
     /// "Assistant: " printed before a streamed response.
     pub assistant_label: String,
-    /// "You" reedline prompt segment (used in [`DefaultPromptSegment::Basic`]).
+    /// "You" reedline prompt segment (used in `DefaultPromptSegment::Basic`).
     pub user_prompt_label: String,
     /// Opening escape for dim-gray inline accents. Empty when colours are off.
     pub dim_open: &'static str,

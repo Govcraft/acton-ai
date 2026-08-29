@@ -1,6 +1,6 @@
 //! Typed structured output: schema generation and answer validation.
 //!
-//! This module holds the pure, IO-free half of [`PromptBuilder::extract`]
+//! This module holds the pure, IO-free half of [`PromptBuilder::extract`](crate::prompt::PromptBuilder::extract)
 //! (see [`crate::prompt`]): turning a Rust type into a JSON Schema the model
 //! can be pointed at, and turning the model's answer back into a checked
 //! [`serde_json::Value`].
@@ -44,7 +44,7 @@ use std::sync::Arc;
 /// Name of the synthetic tool the model calls to record its final answer.
 ///
 /// A prompt may not register a tool of its own under this name — see
-/// [`ensure_name_is_available`].
+/// `ensure_name_is_available`.
 pub const STRUCTURED_OUTPUT_TOOL: &str = "structured_output";
 
 /// Description attached to the synthetic tool.

@@ -19,7 +19,7 @@
 //! [`PricingTable`](crate::accounting::PricingTable) at the same snapshot time.
 //! Dollars (`f64`) exist only where a human types them — the builder and the
 //! `[budget]` TOML section — and are converted exactly once by
-//! [`dollars_to_microusd`](crate::accounting::dollars_to_microusd).
+//! [`crate::accounting::dollars_to_microusd`].
 //!
 //! # Unpriced usage fails closed
 //!

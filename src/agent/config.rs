@@ -30,7 +30,7 @@ pub struct AgentConfig {
     /// **Note:** This field records a per-agent preference but is not
     /// auto-loaded by any runtime today. For runtime-wide skills shared
     /// across every prompt, use
-    /// [`ActonAIBuilder::with_skill_paths`](crate::ActonAI::builder) — that
+    /// [`ActonAIBuilder::with_skill_paths`](crate::facade::ActonAIBuilder::with_skill_paths) — that
     /// path loads a shared registry at launch and auto-registers the
     /// `list_skills` / `activate_skill` tools on every prompt the facade
     /// hands out.

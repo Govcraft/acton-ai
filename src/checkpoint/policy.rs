@@ -18,9 +18,9 @@ pub enum ResumePolicy {
     /// money without a fresh request.
     ResumeAuto,
     /// Leave interrupted turns where they are. The operator lists them with
-    /// [`ActonAI::interrupted_turns`](crate::ActonAI::interrupted_turns) and
+    /// [`ActonAI::interrupted_turns`](crate::facade::ActonAI::interrupted_turns) and
     /// picks the ones worth finishing via
-    /// [`ActonAI::resume_turn`](crate::ActonAI::resume_turn).
+    /// [`ActonAI::resume_turn`](crate::facade::ActonAI::resume_turn).
     ResumeOnRequest,
     /// Mark every interrupted turn abandoned. The records are kept as
     /// evidence of the outcome; nothing runs, nothing is deleted. The
@@ -43,7 +43,7 @@ pub struct CheckpointConfig {
     pub db_path: String,
     /// What launch does about interrupted turns it finds there.
     pub policy: ResumePolicy,
-    /// How many failed attempts [`ActonAI::resume_interrupted`](crate::ActonAI::resume_interrupted)
+    /// How many failed attempts [`ActonAI::resume_interrupted`](crate::facade::ActonAI::resume_interrupted)
     /// grants a turn before abandoning it instead of resuming it again.
     ///
     /// This is what bounds the unattended paths — the `resume_auto`
@@ -53,7 +53,7 @@ pub struct CheckpointConfig {
     /// Once a `Failed` record's counted attempts reach this ceiling, the
     /// sweep marks it `Abandoned` — a recorded outcome an operator can list —
     /// rather than running it. A deliberate, per-turn
-    /// [`resume_turn`](crate::ActonAI::resume_turn) is never subject to the
+    /// [`resume_turn`](crate::facade::ActonAI::resume_turn) is never subject to the
     /// ceiling: an operator who picked one specific record out is asking for
     /// exactly one more attempt.
     ///

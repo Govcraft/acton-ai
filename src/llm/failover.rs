@@ -295,7 +295,7 @@ impl FailoverEvent {
     ///
     /// A fixed vocabulary rather than a rendered message, because it becomes
     /// a metric attribute — see
-    /// [`record_failover_event`](crate::telemetry::metrics::record_failover_event).
+    /// `record_failover_event`.
     ///
     /// ```rust
     /// use acton_ai::prelude::FailoverEvent;

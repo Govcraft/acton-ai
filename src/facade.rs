@@ -553,7 +553,7 @@ impl ActonAI {
     ///
     /// When true, every provider dispatch is preceded by a budget check and
     /// can fail with
-    /// [`ActonAIErrorKind::BudgetExceeded`](crate::error::ActonAIErrorKind::BudgetExceeded).
+    /// [`crate::error::ActonAIErrorKind::BudgetExceeded`].
     #[must_use]
     pub fn is_budget_enforced(&self) -> bool {
         self.inner.budget.is_some()

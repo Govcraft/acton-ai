@@ -184,7 +184,7 @@ impl ToolPolicy {
     /// This exists for embedders that render policy state *before* a call is
     /// made — "this tool will run unprompted", "this one will ask", "this one
     /// is blocked" — without reimplementing the rules. It is not a parallel
-    /// implementation of the gate: [`decide`](Self::decide), the function the
+    /// implementation of the gate: `decide`, the function the
     /// prompt loop enforces with, is built on this exact classification, so
     /// the two cannot drift apart.
     ///

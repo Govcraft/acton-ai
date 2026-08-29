@@ -475,7 +475,7 @@ pub struct PromptBuilder {
     /// The conversation this turn belongs to, when it belongs to one.
     ///
     /// Carried for the audit trail: a one-shot `prompt()` has no conversation
-    /// to name, while a turn driven by [`Conversation`](crate::Conversation)
+    /// to name, while a turn driven by [`Conversation`](crate::conversation::Conversation)
     /// does, and an auditor reading the trail needs to be able to tell which
     /// calls belonged to the same exchange.
     conversation_id: Option<crate::types::ConversationId>,
@@ -485,7 +485,7 @@ pub struct PromptBuilder {
     /// on an empty sink is a no-op — a prompt that did not ask for
     /// checkpointing pays nothing for the feature existing.
     checkpoint: CheckpointSink,
-    /// A record handed over by [`ActonAI::resume_turn`](crate::ActonAI::resume_turn),
+    /// A record handed over by [`ActonAI::resume_turn`](crate::facade::ActonAI::resume_turn),
     /// which the loop trusts in place of a fingerprint-checked lookup.
     ///
     /// The operator path holds only the record — the original inputs were
@@ -778,9 +778,9 @@ impl PromptBuilder {
         self
     }
 
-    /// Registers a value implementing the [`Tool`] trait.
+    /// Registers a value implementing the [`Tool`](crate::tools::Tool) trait.
     ///
-    /// [`Tool`] bundles the name, description, schema, and executor that
+    /// [`Tool`](crate::tools::Tool) bundles the name, description, schema, and executor that
     /// [`tool`](Self::tool) takes as four separate arguments, so a tool can be
     /// defined once and registered anywhere. The usual way to get one is the
     /// [`#[tool]`](macro@crate::tool) attribute, which generates the
@@ -1031,7 +1031,7 @@ impl PromptBuilder {
     ///
     /// Recorded on every audit entry the turn produces, so a reader of the
     /// trail can group the tool calls of one exchange. Set automatically by
-    /// [`Conversation`](crate::Conversation); a one-shot prompt has no
+    /// [`Conversation`](crate::conversation::Conversation); a one-shot prompt has no
     /// conversation and leaves it unset.
     #[must_use]
     pub fn conversation_id(mut self, id: crate::types::ConversationId) -> Self {
@@ -1057,10 +1057,10 @@ impl PromptBuilder {
     ///
     /// # Which builders carry a sink
     ///
-    /// [`ActonAI::prompt`](crate::ActonAI::prompt) attaches a sink under a
+    /// [`ActonAI::prompt`](crate::facade::ActonAI::prompt) attaches a sink under a
     /// fresh ID whenever the runtime was launched with a `[checkpoint]`
     /// section; calling this afterwards replaces it with the caller's ID.
-    /// [`ActonAI::continue_with`](crate::ActonAI::continue_with) never
+    /// [`ActonAI::continue_with`](crate::facade::ActonAI::continue_with) never
     /// attaches one: a turn driven from a caller-owned history belongs to a
     /// session the caller is already keeping, so the caller chooses the ID
     /// — and calls this method — itself. The sink composes with
@@ -1100,7 +1100,7 @@ impl PromptBuilder {
 
     /// Seeds this turn from a record the caller vouches for.
     ///
-    /// Used by [`ActonAI::resume_turn`](crate::ActonAI::resume_turn): the record's own
+    /// Used by [`ActonAI::resume_turn`](crate::facade::ActonAI::resume_turn): the record's own
     /// messages are the turn, so the loop skips the fingerprint check and
     /// picks up exactly where the record says the turn stopped. Progress
     /// keeps being written under the record's own ID.
@@ -1156,8 +1156,8 @@ impl PromptBuilder {
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
-    /// [`with_builtins`](crate::ActonAIBuilder::with_builtins) or
-    /// [`with_builtin_tools`](crate::ActonAIBuilder::with_builtin_tools)
+    /// [`with_builtins`](crate::facade::ActonAIBuilder::with_builtins) or
+    /// [`with_builtin_tools`](crate::facade::ActonAIBuilder::with_builtin_tools)
     /// to this prompt, making them available to the LLM.
     ///
     /// # Example
@@ -1228,7 +1228,7 @@ impl PromptBuilder {
     /// arguments of that call become your `T`. If they don't deserialize,
     /// the serde error is handed back to the model as a tool result and it
     /// is asked to correct itself, up to
-    /// [`MAX_VALIDATION_REPAIRS`](crate::extract::MAX_VALIDATION_REPAIRS)
+    /// [`crate::extract::MAX_VALIDATION_REPAIRS`]
     /// times.
     ///
     /// Real tools still work: anything registered via [`Self::tool`],

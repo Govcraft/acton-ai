@@ -10,7 +10,7 @@
 //!
 //! # Parenting
 //!
-//! Nesting is explicit. A [`TurnSpan`] owns a [`Context`] holding its span,
+//! Nesting is explicit. A `TurnSpan` owns a [`Context`] holding its span,
 //! and children are started with `start_with_context` against that value —
 //! never against an ambient thread-local current context, which does not
 //! survive the `await` points and actor hops this loop is made of.

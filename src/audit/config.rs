@@ -165,7 +165,7 @@ impl AuditConfig {
     /// meaningful. Without it, "the file is not there" is ambiguous between
     /// an armed runtime that has simply not recorded anything yet and a trail
     /// somebody deleted — and the two readers of the chain disagree about
-    /// which: [`ActonAI::audit_head`](crate::ActonAI::audit_head) answers with
+    /// which: [`ActonAI::audit_head`](crate::facade::ActonAI::audit_head) answers with
     /// the genesis head while `acton-ai audit verify` cannot find a file to
     /// read. Creating it up front collapses that ambiguity: an armed but idle
     /// trail is an empty file that verifies as genesis, and a missing file
