@@ -3,6 +3,23 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.36.0 - 2026-08-30
+
+### Added
+
+- **Hierarchical `AGENTS.md` discovery.** `AgentInstructions::discover`
+  finds the nearest checkout boundary, walks from that workspace root to the
+  session working directory, and loads each exact-name `AGENTS.md` in
+  increasing precedence order. A nested checkout is its own boundary and
+  never inherits instructions from an outer checkout. The canonical
+  user-level `~/.agents/AGENTS.md` is layered last. Hosts that already own
+  workspace and trust boundaries can use `discover_with_root`, including an
+  explicit user file or no user layer at all. The structured result exposes
+  every `InstructionLayer` with its scope, source path, content, and
+  precedence for auditing or filtering; `context_fragment()` renders the
+  approved stack for injection at turn start. Vendor-specific and similarly
+  named files are intentionally ignored.
+
 ## 0.35.0 - 2026-08-29
 
 The embedder release: everything an agent host needs to run one governed

@@ -31,6 +31,7 @@ Five lines to an interactive chat with file access and command execution.
 - **Streaming responses** — Token-by-token callbacks for real-time output
 - **Built-in tools** — File operations, bash, grep, glob, web fetch, and calculations
 - **MCP client** — Consume tools from external Model Context Protocol servers (stdio or streamable HTTP) under supervised, self-reconnecting connections
+- **Project instructions** — Discover and hierarchically layer cross-vendor `AGENTS.md` files with auditable structured sources
 - **Tool execution loop** — Automatic tool calling and result handling until completion
 - **Derived tools** — `#[tool]` turns an `async fn` into a tool: name, description, and JSON Schema all come from the signature and doc comment
 - **Typed structured output** — `extract::<T>()` returns a schema-validated Rust value, with automatic repair rounds when the model gets the shape wrong
@@ -155,6 +156,30 @@ runtime
     .collect()
     .await?;
 ```
+
+### Discovering Project Instructions
+
+Hosts can discover the instruction stack for a session and either inject its
+rendered context or inspect each source before deciding what to trust:
+
+```rust
+use acton_ai::prelude::*;
+
+let instructions = AgentInstructions::discover("./packages/api")?;
+
+for layer in instructions.layers() {
+    println!("{:?}: {}", layer.scope, layer.path.display());
+}
+
+let turn_start_context = instructions.context_fragment();
+# Ok::<(), InstructionsError>(())
+```
+
+Discovery walks from the nearest checkout root to the working directory and
+loads only files named exactly `AGENTS.md`. Deeper files appear later, and the
+user-level `~/.agents/AGENTS.md` is last. Use
+`AgentInstructions::discover_with_root` when the host supplies its own
+workspace or trust boundary.
 
 ### Custom Tools
 

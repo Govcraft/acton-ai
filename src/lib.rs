@@ -72,6 +72,7 @@ pub mod error;
 pub mod extract;
 pub mod facade;
 pub mod fips;
+pub mod instructions;
 pub mod introspection;
 pub mod llm;
 pub mod logging;
@@ -150,6 +151,9 @@ pub mod prelude {
     pub use crate::extract::STRUCTURED_OUTPUT_TOOL;
     pub use crate::facade::{ActonAI, ActonAIBuilder, DEFAULT_PROVIDER_NAME};
     pub use crate::fips::{install_crypto_provider, is_fips_build};
+    pub use crate::instructions::{
+        AgentInstructions, InstructionLayer, InstructionScope, InstructionsError,
+    };
     pub use crate::introspection::{AdmissionGate, AdmissionState, IntrospectionConfig};
     pub use crate::mcp::{McpError, McpErrorKind, McpTools};
     pub use crate::policy::{
