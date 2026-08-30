@@ -135,19 +135,21 @@ impl From<TrailClaimError> for crate::error::ActonAIError {
 /// Takes the exclusive advisory lock on the trail.
 ///
 /// The returned handle *is* the lock: dropping it, or the process dying,
-/// releases it. Opened in append mode so the claim can never truncate what is
-/// already on disk, and created if missing so a first run claims the trail it
-/// is about to start.
+/// releases it. Unix locks the trail itself. Windows locks a sibling
+/// `<trail>.lock` file because an exclusive lock on the trail prevents the
+/// writer from opening its own second append handle there. Both are opened in
+/// append mode, so claiming can never truncate existing data.
 ///
 /// # Errors
 ///
 /// [`TrailClaimError::Busy`] if another process already holds the lock;
 /// [`TrailClaimError::Io`] if the file cannot be opened or locked.
 pub fn claim_trail(path: &Path) -> Result<File, TrailClaimError> {
+    let target = claim_target(path);
     let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .open(path)
+        .open(target)
         .map_err(|source| TrailClaimError::Io {
             path: path.to_path_buf(),
             source,
@@ -164,6 +166,18 @@ pub fn claim_trail(path: &Path) -> Result<File, TrailClaimError> {
             source,
         }),
     }
+}
+
+#[cfg(windows)]
+fn claim_target(path: &Path) -> PathBuf {
+    let mut target = path.as_os_str().to_os_string();
+    target.push(".lock");
+    PathBuf::from(target)
+}
+
+#[cfg(not(windows))]
+fn claim_target(path: &Path) -> PathBuf {
+    path.to_path_buf()
 }
 
 /// Best-effort: which process holds the lock on this file.
