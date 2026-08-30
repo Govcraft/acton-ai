@@ -146,6 +146,7 @@ impl From<TrailClaimError> for crate::error::ActonAIError {
 /// [`TrailClaimError::Busy`] if another process already holds the lock;
 /// [`TrailClaimError::Io`] if the file cannot be opened or locked.
 pub fn claim_trail(path: &Path) -> Result<File, TrailClaimError> {
+    ensure_trail_exists_for_claim(path)?;
     let target = claim_target(path);
     let file = std::fs::OpenOptions::new()
         .create(true)
@@ -169,6 +170,24 @@ pub fn claim_trail(path: &Path) -> Result<File, TrailClaimError> {
             source,
         }),
     }
+}
+
+#[cfg(windows)]
+fn ensure_trail_exists_for_claim(path: &Path) -> Result<(), TrailClaimError> {
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .map(drop)
+        .map_err(|source| TrailClaimError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(windows))]
+fn ensure_trail_exists_for_claim(_path: &Path) -> Result<(), TrailClaimError> {
+    Ok(())
 }
 
 #[cfg(windows)]
