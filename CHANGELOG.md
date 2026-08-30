@@ -26,8 +26,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **The single-writer audit claim works on Windows.** Windows now locks a
   sibling `<trail>.lock` file because locking the trail itself prevents the
   writer from reopening that file for appends on that platform. The lock is
-  still kernel-released on shutdown or process death, and Unix continues to
-  lock the trail directly.
+  acquired through a non-truncating read/write handle because Windows rejects
+  append-only handles for locking. It is still kernel-released on shutdown or
+  process death, and Unix continues to lock the trail directly.
 
 ## 0.36.0 - 2026-08-30
 

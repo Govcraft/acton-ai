@@ -138,7 +138,8 @@ impl From<TrailClaimError> for crate::error::ActonAIError {
 /// releases it. Unix locks the trail itself. Windows locks a sibling
 /// `<trail>.lock` file because an exclusive lock on the trail prevents the
 /// writer from opening its own second append handle there. Both are opened in
-/// append mode, so claiming can never truncate existing data.
+/// read/write mode without truncation; Windows' `LockFileEx` rejects an
+/// append-only handle, while read/write still leaves existing data untouched.
 ///
 /// # Errors
 ///
@@ -148,7 +149,9 @@ pub fn claim_trail(path: &Path) -> Result<File, TrailClaimError> {
     let target = claim_target(path);
     let file = std::fs::OpenOptions::new()
         .create(true)
-        .append(true)
+        .read(true)
+        .write(true)
+        .truncate(false)
         .open(target)
         .map_err(|source| TrailClaimError::Io {
             path: path.to_path_buf(),
