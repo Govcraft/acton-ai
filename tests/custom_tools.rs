@@ -264,14 +264,17 @@ async fn a_denied_custom_tool_records_a_policy_outcome() {
     let entries = read_trail(&path);
     assert_eq!(
         entries.len(),
-        1,
-        "the refused call must still be one audit entry"
+        2,
+        "the refused call and completed turn must both be audit entries"
     );
-    assert_eq!(entries[0].tool_name, "wipe_disk");
-    assert!(!entries[0].decision.approved);
-    assert_eq!(entries[0].decision.decided_by, Decider::Denylist);
+    assert_eq!(entries[0].tool_name.as_deref(), Some("wipe_disk"));
+    assert!(!entries[0].decision.as_ref().unwrap().approved);
+    assert_eq!(
+        entries[0].decision.as_ref().unwrap().decided_by,
+        Decider::Denylist
+    );
     assert!(
-        matches!(entries[0].outcome, AuditOutcome::Denied { .. }),
+        matches!(entries[0].outcome, Some(AuditOutcome::Denied { .. })),
         "a custom tool must record the same policy outcome a builtin would"
     );
 

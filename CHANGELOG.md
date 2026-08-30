@@ -7,6 +7,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Every attempted turn reaches the audit chain.** An armed audit trail now
+  appends one metadata-only terminal entry for completed, failed, interrupted,
+  and admission-refused turns, including turns where the model answered with
+  text and called no tool. Turn entries carry the existing user/timestamp and
+  correlation/conversation/turn identities plus prompt and response byte
+  counts, configured provider/model, and aggregate input/output tokens. They
+  deliberately contain no prompt or response content. `TurnRefused` now
+  carries the attempted `TurnId` and rendered reason. Strict durability waits
+  for the terminal entry before returning; the existing finish guard records
+  cancellation from its `Drop` path. `AuditEntryKind`, `TurnRecord`, and
+  `TurnAuditOutcome` expose the structured form. Existing invocation JSON and
+  hash preimages remain byte-identical: their discriminator and turn-only
+  fields are absent, and legacy v0.33 fixtures still verify.
+
 - **Hierarchical `AGENTS.md` discovery.** `AgentInstructions::discover`
   finds the nearest checkout boundary, walks from that workspace root to the
   session working directory, and loads each exact-name `AGENTS.md` in

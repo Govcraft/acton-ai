@@ -728,7 +728,13 @@ pub enum TurnLifecycle {
     /// Published *instead of* the [`Self::TurnStarted`]/[`Self::TurnFinished`]
     /// pair, never alongside it: a refused turn never ran, so counting it as
     /// in-flight even momentarily would make a drain look unfinished.
-    TurnRefused,
+    #[non_exhaustive]
+    TurnRefused {
+        /// The caller-supplied or newly minted identity of the attempt.
+        turn_id: TurnId,
+        /// The rendered admission refusal.
+        reason: String,
+    },
     /// A tool call was dispatched inside a turn.
     ///
     /// Published *before* the approval gate runs, so a call the gate goes on

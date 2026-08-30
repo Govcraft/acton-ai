@@ -5,6 +5,7 @@
 //! an edit anywhere in the file detectable: changing one entry changes its
 //! hash, and every hash after it was computed from the old value.
 
+use crate::messages::Usage;
 use crate::policy::Decider;
 use crate::types::{ConversationId, CorrelationId, TrailId, TurnId};
 use serde::{Deserialize, Serialize};
@@ -133,7 +134,78 @@ pub struct InvocationRecord {
     pub resumed: bool,
 }
 
-/// One sealed, chained record of a tool invocation.
+/// How an attempted model turn ended.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+#[non_exhaustive]
+pub enum TurnAuditOutcome {
+    /// The model produced a final answer.
+    Completed,
+    /// The turn ended with an error.
+    Failed,
+    /// The caller dropped the turn future before it finished.
+    Interrupted,
+    /// Admission control refused the turn before any provider request.
+    Refused {
+        /// The stable admission state (`paused` or `draining`).
+        decision: String,
+        /// The rendered refusal handed to the caller.
+        reason: String,
+    },
+}
+
+/// Metadata for one attempted model turn, excluding its chain position.
+///
+/// Prompt and response content are deliberately absent. Their byte counts
+/// make activity and response length auditable without copying user data into
+/// a long-lived SIEM trail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct TurnRecord {
+    /// When the turn ended, RFC 3339 in UTC.
+    pub timestamp: String,
+    /// Correlation identity for this turn-level event.
+    pub correlation_id: CorrelationId,
+    /// The conversation, when the turn happened inside one.
+    pub conversation_id: Option<ConversationId>,
+    /// The principal on whose behalf the turn ran, when configured.
+    pub user: Option<String>,
+    /// The attempted turn.
+    pub turn_id: TurnId,
+    /// How the turn ended.
+    pub outcome: TurnAuditOutcome,
+    /// Size in bytes of the user's prompt for this turn.
+    pub prompt_size_bytes: u64,
+    /// Size in bytes of the final response; zero when none was produced.
+    pub response_size_bytes: u64,
+    /// Configured provider name billed for the turn.
+    pub provider: String,
+    /// Configured model name.
+    pub model: String,
+    /// Usage summed across all provider rounds.
+    pub usage: Usage,
+}
+
+/// An unsealed event accepted by the audit writer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum AuditRecord {
+    /// A tool invocation.
+    Invocation(InvocationRecord),
+    /// A model turn.
+    Turn(TurnRecord),
+}
+
+/// The kind of event represented by an [`AuditEntry`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AuditEntryKind {
+    /// One tool invocation. Omitted on disk for backward compatibility.
+    Invocation,
+    /// One attempted model turn.
+    Turn,
+}
+
+/// One sealed, chained record of a model turn or tool invocation.
 ///
 /// Serialized as a single JSON object per line (JSONL), which is what makes
 /// the file both append-only and directly ingestible by a SIEM.
@@ -153,21 +225,48 @@ pub struct AuditEntry {
     pub user: Option<String>,
     /// The turn the call belongs to.
     pub turn_id: TurnId,
+    /// Entry discriminator. Absent on legacy invocation entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry_kind: Option<AuditEntryKind>,
     /// The provider's ID for this particular call.
-    pub tool_call_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
     /// The tool name as the model saw it.
-    pub tool_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
     /// The arguments, already redacted.
-    pub arguments: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<serde_json::Value>,
     /// How it ended.
-    pub outcome: AuditOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<AuditOutcome>,
     /// What the gate decided.
-    pub decision: AuditDecision,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decision: Option<AuditDecision>,
     /// How long the call took, in milliseconds.
-    pub duration_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
     /// Size in bytes of the complete serialized tool response, when one exists.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub response_size_bytes: Option<u64>,
+    /// How a turn ended. Present only on turn entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_outcome: Option<TurnAuditOutcome>,
+    /// User prompt length. Present only on turn entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt_size_bytes: Option<u64>,
+    /// Configured provider. Present only on turn entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    /// Configured model. Present only on turn entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Input tokens summed across the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    /// Output tokens summed across the turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
     /// Whether the call ran inside a turn resumed from a checkpoint.
     ///
     /// Serialized only when `true`, so entries written before this field
@@ -203,14 +302,34 @@ struct HashPreimage<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     user: Option<&'a str>,
     turn_id: &'a TurnId,
-    tool_call_id: &'a str,
-    tool_name: &'a str,
-    arguments: &'a serde_json::Value,
-    outcome: &'a AuditOutcome,
-    decision: &'a AuditDecision,
-    duration_ms: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    entry_kind: Option<AuditEntryKind>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_name: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arguments: Option<&'a serde_json::Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<&'a AuditOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    decision: Option<&'a AuditDecision>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    duration_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    turn_outcome: Option<&'a TurnAuditOutcome>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_size_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    input_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_tokens: Option<u64>,
     /// `Some(true)` only on a resumed call; skipped when absent. A field that
     /// serialized `false` on every pre-existing entry would change their
     /// pre-image bytes and break verification of every chain already written.
@@ -284,13 +403,20 @@ impl AuditEntry {
             conversation_id: conversation_id.as_ref(),
             user: user.as_deref(),
             turn_id: &turn_id,
-            tool_call_id: &tool_call_id,
-            tool_name: &tool_name,
-            arguments: &arguments,
-            outcome: &outcome,
-            decision: &decision,
-            duration_ms,
+            entry_kind: None,
+            tool_call_id: Some(&tool_call_id),
+            tool_name: Some(&tool_name),
+            arguments: Some(&arguments),
+            outcome: Some(&outcome),
+            decision: Some(&decision),
+            duration_ms: Some(duration_ms),
             response_size_bytes,
+            turn_outcome: None,
+            prompt_size_bytes: None,
+            provider: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
             resumed: resumed.then_some(true),
             trail_id,
             prev_hash,
@@ -303,18 +429,117 @@ impl AuditEntry {
             conversation_id,
             user,
             turn_id,
-            tool_call_id,
-            tool_name,
-            arguments,
-            outcome,
-            decision,
-            duration_ms,
+            entry_kind: None,
+            tool_call_id: Some(tool_call_id),
+            tool_name: Some(tool_name),
+            arguments: Some(arguments),
+            outcome: Some(outcome),
+            decision: Some(decision),
+            duration_ms: Some(duration_ms),
             response_size_bytes,
+            turn_outcome: None,
+            prompt_size_bytes: None,
+            provider: None,
+            model: None,
+            input_tokens: None,
+            output_tokens: None,
             resumed,
             trail_id: trail_id.cloned(),
             prev_hash: prev_hash.to_string(),
             hash,
         }
+    }
+
+    /// Seals a turn-level metadata record into the chain.
+    #[must_use]
+    pub fn seal_turn(
+        record: TurnRecord,
+        sequence: u64,
+        prev_hash: &str,
+        trail_id: Option<&TrailId>,
+    ) -> Self {
+        let TurnRecord {
+            timestamp,
+            correlation_id,
+            conversation_id,
+            user,
+            turn_id,
+            outcome,
+            prompt_size_bytes,
+            response_size_bytes,
+            provider,
+            model,
+            usage,
+        } = record;
+        let kind = AuditEntryKind::Turn;
+        let hash = hash_preimage(&HashPreimage {
+            sequence,
+            timestamp: &timestamp,
+            correlation_id: &correlation_id,
+            conversation_id: conversation_id.as_ref(),
+            user: user.as_deref(),
+            turn_id: &turn_id,
+            entry_kind: Some(kind),
+            tool_call_id: None,
+            tool_name: None,
+            arguments: None,
+            outcome: None,
+            decision: None,
+            duration_ms: None,
+            response_size_bytes: Some(response_size_bytes),
+            turn_outcome: Some(&outcome),
+            prompt_size_bytes: Some(prompt_size_bytes),
+            provider: Some(&provider),
+            model: Some(&model),
+            input_tokens: Some(
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_tokens)
+                    .saturating_add(usage.cache_creation_tokens),
+            ),
+            output_tokens: Some(usage.output_tokens),
+            resumed: None,
+            trail_id,
+            prev_hash,
+        });
+        Self {
+            sequence,
+            timestamp,
+            correlation_id,
+            conversation_id,
+            user,
+            turn_id,
+            entry_kind: Some(kind),
+            tool_call_id: None,
+            tool_name: None,
+            arguments: None,
+            outcome: None,
+            decision: None,
+            duration_ms: None,
+            response_size_bytes: Some(response_size_bytes),
+            turn_outcome: Some(outcome),
+            prompt_size_bytes: Some(prompt_size_bytes),
+            provider: Some(provider),
+            model: Some(model),
+            input_tokens: Some(
+                usage
+                    .input_tokens
+                    .saturating_add(usage.cache_read_tokens)
+                    .saturating_add(usage.cache_creation_tokens),
+            ),
+            output_tokens: Some(usage.output_tokens),
+            resumed: false,
+            trail_id: trail_id.cloned(),
+            prev_hash: prev_hash.to_string(),
+            hash,
+        }
+    }
+
+    /// Returns the logical entry kind, treating an absent discriminator as a
+    /// legacy invocation.
+    #[must_use]
+    pub fn kind(&self) -> AuditEntryKind {
+        self.entry_kind.unwrap_or(AuditEntryKind::Invocation)
     }
 
     /// Recomputes what this entry's hash should be from its own contents.
@@ -330,13 +555,20 @@ impl AuditEntry {
             conversation_id: self.conversation_id.as_ref(),
             user: self.user.as_deref(),
             turn_id: &self.turn_id,
-            tool_call_id: &self.tool_call_id,
-            tool_name: &self.tool_name,
-            arguments: &self.arguments,
-            outcome: &self.outcome,
-            decision: &self.decision,
+            entry_kind: self.entry_kind,
+            tool_call_id: self.tool_call_id.as_deref(),
+            tool_name: self.tool_name.as_deref(),
+            arguments: self.arguments.as_ref(),
+            outcome: self.outcome.as_ref(),
+            decision: self.decision.as_ref(),
             duration_ms: self.duration_ms,
             response_size_bytes: self.response_size_bytes,
+            turn_outcome: self.turn_outcome.as_ref(),
+            prompt_size_bytes: self.prompt_size_bytes,
+            provider: self.provider.as_deref(),
+            model: self.model.as_deref(),
+            input_tokens: self.input_tokens,
+            output_tokens: self.output_tokens,
             resumed: self.resumed.then_some(true),
             trail_id: self.trail_id.as_ref(),
             prev_hash: &self.prev_hash,
@@ -408,15 +640,15 @@ mod tests {
         let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
 
         let mut tampered = entry.clone();
-        tampered.arguments = json!({"value": 2});
+        tampered.arguments = Some(json!({"value": 2}));
         assert_ne!(tampered.hash, tampered.recompute_hash());
 
         let mut renamed = entry.clone();
-        renamed.tool_name = "read_file".to_string();
+        renamed.tool_name = Some("read_file".to_string());
         assert_ne!(renamed.hash, renamed.recompute_hash());
 
         let mut reversed = entry.clone();
-        reversed.decision = AuditDecision::refused(Decider::Denylist);
+        reversed.decision = Some(AuditDecision::refused(Decider::Denylist));
         assert_ne!(reversed.hash, reversed.recompute_hash());
 
         let mut reattributed = entry.clone();
@@ -430,19 +662,19 @@ mod tests {
         // Repointing an entry at a different call would let one invocation's
         // recorded outcome be passed off as another's.
         let mut recalled = entry;
-        recalled.tool_call_id = "toolu_02".to_string();
+        recalled.tool_call_id = Some("toolu_02".to_string());
         assert_ne!(recalled.hash, recalled.recompute_hash());
     }
 
     #[test]
     fn the_tool_call_id_survives_a_seal_and_verify_round_trip() {
         let entry = AuditEntry::seal(record("bash"), 1, GENESIS_HASH, None);
-        assert_eq!(entry.tool_call_id, "toolu_01");
+        assert_eq!(entry.tool_call_id.as_deref(), Some("toolu_01"));
 
         let line = entry.to_jsonl().expect("an entry must serialize");
         let parsed: AuditEntry = serde_json::from_str(&line).expect("an entry must parse back");
 
-        assert_eq!(parsed.tool_call_id, "toolu_01");
+        assert_eq!(parsed.tool_call_id.as_deref(), Some("toolu_01"));
         assert_eq!(parsed.recompute_hash(), entry.hash);
     }
 
@@ -539,8 +771,11 @@ mod tests {
         };
         let entry = AuditEntry::seal(denied, 1, GENESIS_HASH, None);
 
-        assert!(!entry.decision.approved);
-        assert_eq!(entry.decision.decided_by, Decider::Denylist);
+        assert!(!entry.decision.as_ref().unwrap().approved);
+        assert_eq!(
+            entry.decision.as_ref().unwrap().decided_by,
+            Decider::Denylist
+        );
         assert_eq!(entry.hash, entry.recompute_hash());
     }
 

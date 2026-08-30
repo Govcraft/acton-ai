@@ -43,7 +43,7 @@ Five lines to an interactive chat with file access and command execution.
 - **OpenTelemetry export** — Traces spanning each prompt loop (turn → rounds → tools) plus token, latency, and reliability metrics, over OTLP to any collector
 - **Failover & circuit breaking** — Named provider chains tried in order, a per-provider circuit breaker with half-open recovery, and model degradation when a vendor throttles instead of dies
 - **Tool-approval policy** — Allowlists, denylists, and per-turn invocation caps over every tool the model can reach, plus an async approval hook for a human in the loop; a refusal is fed back to the model and the turn carries on
-- **Tamper-evident audit trail** — Every tool invocation appended to a BLAKE3 hash-chained JSONL log with secrets redacted, verified by `acton-ai audit verify`; the trail carries its own identity and admits exactly one writer
+- **Tamper-evident audit trail** — Every model turn and tool invocation appended to a BLAKE3 hash-chained JSONL log; turn records are metadata-only, tool secrets are redacted, and `acton-ai audit verify` checks the trail’s identity and single-writer chain
 - **Durable audit and writer health** — `durability = "strict"` acknowledges every entry before the next tool runs, and a trail that has started failing refuses mutating tools through the ordinary refusal path instead of quietly losing evidence; the writer's state is readable as `AuditHealth`
 - **Persistent sessions** — Named sessions with their messages, an opaque metadata column for the embedder's own per-session state, and checkpoint recovery that lists the turns a crash interrupted
 - **FIPS mode** — An optional `fips` build routes every TLS connection through the FIPS 140-3 validated AWS-LC module

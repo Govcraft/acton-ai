@@ -204,7 +204,7 @@ impl IntrospectionActor {
                         .in_flight_tools
                         .remove(&scoped_tool_id(turn_id, tool_call_id));
                 }
-                TurnLifecycle::TurnRefused => {
+                TurnLifecycle::TurnRefused { .. } => {
                     actor.model.turns_refused = actor.model.turns_refused.saturating_add(1);
                 }
                 TurnLifecycle::ContextCompacted { .. } => {

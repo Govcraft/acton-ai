@@ -619,7 +619,18 @@ async fn a_turn_dropped_on_a_non_tokio_thread_still_publishes_its_finish() {
     // `TurnFinished`, or the introspection actor counts the turn in-flight
     // forever and `acton-ai drain --wait` wedges.
     let server = MockServer::start(vec![Round::text("never read")]).await;
-    let mut ai = runtime_pointed_at(&server, "turn-drop-off-runtime").await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let audit_path = dir.path().join("audit.jsonl");
+    let mut ai = ActonAI::builder()
+        .app_name("turn-drop-off-runtime")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(&audit_path)
+        .launch()
+        .await
+        .expect("runtime launches");
     let recorder = spawn_recorder(ai.runtime_mut()).await;
 
     // Drive the future by hand so it can be abandoned mid-turn: poll until
@@ -676,6 +687,15 @@ async fn a_turn_dropped_on_a_non_tokio_thread_still_publishes_its_finish() {
         finished,
         "a turn dropped on a non-Tokio thread must still balance its start"
     );
+
+    ai.audit_head()
+        .await
+        .expect("the interrupted turn reaches the audit trail");
+    let contents = std::fs::read_to_string(&audit_path).expect("trail exists");
+    let entries = acton_ai::audit::parse_entries(&contents).expect("trail parses");
+    assert!(entries
+        .iter()
+        .any(|entry| matches!(entry.turn_outcome, Some(TurnAuditOutcome::Interrupted))));
 
     ai.shutdown().await.expect("clean shutdown");
 }
@@ -941,7 +961,10 @@ async fn the_audit_entry_carries_the_call_id_the_events_carried() {
     // The audit-side barrier: the head cannot answer before both entries are
     // sealed and written.
     let head = ai.audit_head().await.expect("the trail must report a head");
-    assert_eq!(head.entries, 2, "one denied and one executed call");
+    assert_eq!(
+        head.entries, 3,
+        "one denied call, one executed call, and their turn"
+    );
 
     let events = recorded(&ai, &recorder).await;
     let contents = std::fs::read_to_string(&path).expect("the trail must exist");
@@ -949,7 +972,10 @@ async fn the_audit_entry_carries_the_call_id_the_events_carried() {
 
     // Each entry names the call the live events named for that tool, in the
     // turn the caller supplied.
-    for entry in &entries {
+    for entry in entries
+        .iter()
+        .filter(|entry| entry.kind() == AuditEntryKind::Invocation)
+    {
         let event_call_id = events
             .iter()
             .find_map(|event| match event {
@@ -957,12 +983,15 @@ async fn the_audit_entry_carries_the_call_id_the_events_carried() {
                     tool_call_id,
                     tool_name,
                     ..
-                } if *tool_name == entry.tool_name => Some(tool_call_id.clone()),
+                } if Some(tool_name.as_str()) == entry.tool_name.as_deref() => {
+                    Some(tool_call_id.clone())
+                }
                 _ => None,
             })
             .expect("every audited tool was announced");
         assert_eq!(
-            entry.tool_call_id, event_call_id,
+            entry.tool_call_id.as_deref(),
+            Some(event_call_id.as_str()),
             "the trail and the events must name the same call"
         );
         assert_eq!(
@@ -973,10 +1002,10 @@ async fn the_audit_entry_carries_the_call_id_the_events_carried() {
 
     let denied = entries
         .iter()
-        .find(|entry| entry.tool_name == "bash")
+        .find(|entry| entry.tool_name.as_deref() == Some("bash"))
         .expect("the denied call is recorded");
-    assert_eq!(denied.tool_call_id, "call_deny");
-    assert!(matches!(denied.outcome, AuditOutcome::Denied { .. }));
+    assert_eq!(denied.tool_call_id.as_deref(), Some("call_deny"));
+    assert!(matches!(denied.outcome, Some(AuditOutcome::Denied { .. })));
 
     ai.shutdown().await.expect("shutdown");
 }

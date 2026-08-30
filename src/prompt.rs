@@ -39,6 +39,7 @@
 //! ```
 
 use crate::accounting::{BudgetDecision, CheckBudget};
+use crate::audit::{RecordTurn, RecordTurnDurably, TurnAuditOutcome, TurnRecord};
 use crate::checkpoint::{
     plan_from_record, resolve_pending_call, CheckpointRecord, CheckpointSink, FinalAnswer,
     PendingCallAction, PendingCallState, PendingRound, PendingToolCall, ResumePlan, RoundProgress,
@@ -1410,14 +1411,51 @@ impl PromptBuilder {
             .clone()
             .unwrap_or_else(|| self.runtime.default_provider_name().to_string());
 
+        let turn_id = self.turn_id.clone().unwrap_or_default();
+        let turn_audit = TurnAuditContext {
+            audit: self
+                .runtime
+                .audit()
+                .map(|(handle, config)| (handle.clone(), config.clone())),
+            correlation_id: CorrelationId::new(),
+            conversation_id: self.conversation_id.clone(),
+            turn_id: turn_id.clone(),
+            prompt_size_bytes: byte_count(turn_user_content(
+                self.conversation_history.as_deref(),
+                &self.user_content,
+            )),
+            provider: billed_provider.clone(),
+            model: self
+                .runtime
+                .provider_model(&billed_provider)
+                .unwrap_or_default()
+                .to_string(),
+            usage: Arc::new(std::sync::Mutex::new(Usage::default())),
+        };
+
         // Admission is checked exactly here: before the span opens, before a
         // provider is resolved, before anything is sent. A refusal must cost
         // nothing, or `pause` would be a way to spend money slowly.
         let broker = self.runtime.runtime().broker();
         let admission = self.runtime.admission_state();
         if !admission.admits() {
-            broker.broadcast(TurnLifecycle::TurnRefused).await;
-            return Err(ActonAIError::turns_not_admitted(admission));
+            let error = ActonAIError::turns_not_admitted(admission);
+            turn_audit
+                .record(
+                    TurnAuditOutcome::Refused {
+                        decision: admission.as_str().to_string(),
+                        reason: error.to_string(),
+                    },
+                    0,
+                )
+                .await;
+            broker
+                .broadcast(TurnLifecycle::TurnRefused {
+                    turn_id,
+                    reason: error.to_string(),
+                })
+                .await;
+            return Err(error);
         }
 
         // From here the turn is admitted, and every exit path below must
@@ -1430,13 +1468,12 @@ impl PromptBuilder {
         // The caller's id when one was supplied, so an embedder that
         // announced the turn to its own client before calling `collect` sees
         // that exact id on every event; minted here otherwise.
-        let turn_id = self.turn_id.clone().unwrap_or_default();
         broker
             .broadcast(TurnLifecycle::TurnStarted {
                 turn_id: turn_id.clone(),
             })
             .await;
-        let guard = TurnFinishedGuard::new(broker, turn_id.clone());
+        let guard = TurnFinishedGuard::new(broker, turn_audit.clone());
 
         let turn =
             crate::telemetry::spans::TurnSpan::start(&billed_provider, self.structured.is_some());
@@ -1446,7 +1483,7 @@ impl PromptBuilder {
         // clone costs nothing and is empty when no checkpoint was configured.
         let checkpoint = self.checkpoint.clone();
 
-        let mut stats = TurnStats::default();
+        let mut stats = TurnStats::with_audit(turn_audit.clone());
         // The claim is the turn's exclusivity: a checkpoint ID has exactly
         // one live owner per process. It is taken before the loop reads the
         // record, so two loops aiming at the same ID — a live turn and an
@@ -1485,11 +1522,15 @@ impl PromptBuilder {
             Err(error) => Err(error),
         };
 
+        let (lifecycle_outcome, audit_outcome) = match &result {
+            Ok(_) => (TurnOutcome::Completed, TurnAuditOutcome::Completed),
+            Err(_) => (TurnOutcome::Failed, TurnAuditOutcome::Failed),
+        };
+        let response_size_bytes = result
+            .as_ref()
+            .map_or(0, |(response, _)| byte_count(&response.text));
         guard
-            .finish(match &result {
-                Ok(_) => TurnOutcome::Completed,
-                Err(_) => TurnOutcome::Failed,
-            })
+            .finish(lifecycle_outcome, audit_outcome, response_size_bytes)
             .await;
 
         let outcome = match &result {
@@ -1728,6 +1769,7 @@ impl PromptBuilder {
                 executed_tool_calls = tool_calls;
                 total_token_count = token_count;
                 stats.usage = usage;
+                stats.sync_audit();
                 turn_resumed = true;
                 turn_resume_attempts = resume_attempts;
                 pending_settlement = pending_round;
@@ -2139,6 +2181,7 @@ impl PromptBuilder {
                         // spent whether or not the answer was usable.
                         total_token_count += round.token_count;
                         stats.usage += round.usage;
+                        stats.sync_audit();
 
                         if round.stop_reason == StopReason::Error {
                             // A transient failure — a dropped stream, a 5xx, an
@@ -2670,9 +2713,81 @@ impl Drop for ClaimGuard {
     }
 }
 
+#[derive(Debug, Clone)]
+struct TurnAuditContext {
+    audit: Option<(ActorHandle, crate::audit::AuditConfig)>,
+    correlation_id: CorrelationId,
+    conversation_id: Option<crate::types::ConversationId>,
+    turn_id: TurnId,
+    prompt_size_bytes: u64,
+    provider: String,
+    model: String,
+    usage: Arc<std::sync::Mutex<Usage>>,
+}
+
+impl TurnAuditContext {
+    fn build_record(
+        &self,
+        outcome: TurnAuditOutcome,
+        response_size_bytes: u64,
+    ) -> Option<TurnRecord> {
+        let (_, config) = self.audit.as_ref()?;
+        let usage = self
+            .usage
+            .lock()
+            .map_or_else(|poisoned| *poisoned.into_inner(), |usage| *usage);
+        Some(TurnRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            correlation_id: self.correlation_id.clone(),
+            conversation_id: self.conversation_id.clone(),
+            user: config.user().map(str::to_string),
+            turn_id: self.turn_id.clone(),
+            outcome,
+            prompt_size_bytes: self.prompt_size_bytes,
+            response_size_bytes,
+            provider: self.provider.clone(),
+            model: self.model.clone(),
+            usage,
+        })
+    }
+
+    async fn record(&self, outcome: TurnAuditOutcome, response_size_bytes: u64) {
+        let Some((handle, config)) = self.audit.as_ref() else {
+            return;
+        };
+        let Some(record) = self.build_record(outcome, response_size_bytes) else {
+            return;
+        };
+        if config.is_strict() {
+            match handle.ask(RecordTurnDurably::new(record)).await {
+                Ok(crate::audit::AppendReceipt::Failed { sequence, error }) => {
+                    tracing::error!(sequence, %error, "the turn audit entry did not reach the disk");
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::error!(%error, "audit writer did not acknowledge the turn record");
+                }
+            }
+        } else {
+            handle.send(RecordTurn::new(record)).await;
+        }
+    }
+
+    fn set_usage(&self, usage: Usage) {
+        match self.usage.lock() {
+            Ok(mut current) => *current = usage,
+            Err(poisoned) => *poisoned.into_inner() = usage,
+        }
+    }
+}
+
+fn byte_count(value: &str) -> u64 {
+    u64::try_from(value.len()).unwrap_or(u64::MAX)
+}
+
 struct TurnFinishedGuard {
     broker: BrokerRef,
-    turn_id: TurnId,
+    audit: TurnAuditContext,
     /// Where `Drop` spawns the balancing broadcast. See the type-level note
     /// on why this is captured at construction instead of looked up at drop.
     handle: Option<tokio::runtime::Handle>,
@@ -2681,10 +2796,10 @@ struct TurnFinishedGuard {
 
 impl TurnFinishedGuard {
     /// Arms the guard for `turn_id`. Call immediately after `TurnStarted`.
-    fn new(broker: BrokerRef, turn_id: TurnId) -> Self {
+    fn new(broker: BrokerRef, audit: TurnAuditContext) -> Self {
         Self {
             broker,
-            turn_id,
+            audit,
             // Effectively always `Some`: `new` runs inside the prompt loop's
             // async context. `try_current` rather than `current` so a guard
             // built anywhere stranger degrades instead of panicking.
@@ -2696,10 +2811,16 @@ impl TurnFinishedGuard {
     /// Publishes the balancing `TurnFinished` with how the turn ended.
     ///
     /// Consumes the guard: after this, its `Drop` is a no-op.
-    async fn finish(mut self, outcome: TurnOutcome) {
+    async fn finish(
+        mut self,
+        outcome: TurnOutcome,
+        audit_outcome: TurnAuditOutcome,
+        response_size_bytes: u64,
+    ) {
+        self.audit.record(audit_outcome, response_size_bytes).await;
         self.broker
             .broadcast(TurnLifecycle::TurnFinished {
-                turn_id: self.turn_id.clone(),
+                turn_id: self.audit.turn_id.clone(),
                 outcome,
             })
             .await;
@@ -2713,16 +2834,17 @@ impl Drop for TurnFinishedGuard {
             return;
         }
         let broker = self.broker.clone();
-        let turn_id = self.turn_id.clone();
+        let audit = self.audit.clone();
         let handle = self
             .handle
             .take()
             .or_else(|| tokio::runtime::Handle::try_current().ok());
         if let Some(handle) = handle {
             handle.spawn(async move {
+                audit.record(TurnAuditOutcome::Interrupted, 0).await;
                 broker
                     .broadcast(TurnLifecycle::TurnFinished {
-                        turn_id,
+                        turn_id: audit.turn_id,
                         outcome: TurnOutcome::Interrupted,
                     })
                     .await;
@@ -2743,6 +2865,22 @@ pub(crate) struct TurnStats {
     /// drive several provider requests, and the caller is billed for all of
     /// them.
     usage: Usage,
+    audit: Option<TurnAuditContext>,
+}
+
+impl TurnStats {
+    fn with_audit(audit: TurnAuditContext) -> Self {
+        Self {
+            audit: Some(audit),
+            ..Self::default()
+        }
+    }
+
+    fn sync_audit(&self) {
+        if let Some(audit) = &self.audit {
+            audit.set_usage(self.usage);
+        }
+    }
 }
 
 /// The auto-compaction step of the prompt loop.
@@ -2879,6 +3017,7 @@ impl CompactionGate {
         // Spent whether or not the summary is usable.
         *total_token_count += round.token_count;
         stats.usage += round.usage;
+        stats.sync_audit();
 
         let summary = round.text.trim().to_string();
         if round.stop_reason == StopReason::Error || summary.is_empty() {

@@ -1,16 +1,19 @@
-//! Tamper-evident audit trail for tool invocations.
+//! Tamper-evident audit trail for model turns and tool invocations.
 //!
-//! Every tool call the prompt loop dispatches — allowed, refused, or failed —
-//! is appended to a JSONL file as one hash-chained entry. Each entry carries
+//! Every attempted turn and every tool call the prompt loop dispatches —
+//! allowed, refused, or failed — is appended to a JSONL file as one
+//! hash-chained entry. Each entry carries
 //! the hash of the entry before it, so editing any entry invalidates it, and
 //! reselaing that entry invalidates the one after. One writer owns the chain,
 //! which is why it is an actor rather than a shared handle.
 //!
 //! # What an entry records
 //!
-//! Timestamp, correlation / conversation / turn IDs, tool name, arguments with
-//! secrets redacted, a bounded result summary, the approval decision and who
-//! made it, and how long the call took. See [`AuditEntry`].
+//! All entries carry timestamp, correlation / conversation / turn IDs and the
+//! configured user. Invocation entries add the tool name, redacted arguments,
+//! bounded result summary, approval decision, and duration. Turn entries add
+//! terminal outcome, prompt/response byte counts, provider/model, and token
+//! counts. They never contain prompt or response text. See [`AuditEntry`].
 //!
 //! # One writer per file
 //!
@@ -97,14 +100,17 @@ pub mod redact;
 
 pub use actor::{
     claim_trail, AppendReceipt, AuditHealthChanged, AuditLog, GetAuditHealth, GetChainHead,
-    RecordInvocation, RecordInvocationDurably, TrailClaimError,
+    RecordInvocation, RecordInvocationDurably, RecordTurn, RecordTurnDurably, TrailClaimError,
 };
 pub use chain::{verify_chain, verify_next, ChainBreak, ChainBreakKind, ChainHead};
 pub use config::{
     default_audit_path, read_trail_id, resolve_trail_id, write_trail_id, AuditConfig,
     AuditDurability, TrailIdConflict, DEFAULT_AUDIT_FILE, TRAIL_ID_SUFFIX,
 };
-pub use entry::{AuditDecision, AuditEntry, AuditOutcome, InvocationRecord, GENESIS_HASH};
+pub use entry::{
+    AuditDecision, AuditEntry, AuditEntryKind, AuditOutcome, InvocationRecord, TurnAuditOutcome,
+    TurnRecord, GENESIS_HASH,
+};
 pub use health::{AuditHealth, AuditHealthState};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS, REDACTED};
 

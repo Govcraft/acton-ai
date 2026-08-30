@@ -187,14 +187,14 @@ async fn every_executed_tool_call_lands_in_the_trail() {
 
     // The barrier: this cannot answer until the entry is written.
     let head = ai.audit_head().await.expect("the trail must report a head");
-    assert_eq!(head.entries, 1);
-    assert_eq!(head.sequence, 1);
+    assert_eq!(head.entries, 2);
+    assert_eq!(head.sequence, 2);
 
     assert_eq!(server.request_count(), 2, "the tool round and the answer");
 
     let entries = read_trail(&path);
-    assert_eq!(entries.len(), 1);
-    assert_eq!(entries[0].tool_name, "echo");
+    assert_eq!(entries.len(), 2);
+    assert_eq!(entries[0].tool_name.as_deref(), Some("echo"));
     assert_eq!(entries[0].user.as_deref(), Some("acct:alice"));
     assert_eq!(
         entries[0].response_size_bytes,
@@ -206,7 +206,7 @@ async fn every_executed_tool_call_lands_in_the_trail() {
     // the join key between the trail and the lifecycle events an observer
     // saw live, so a value that only the audit path knows would make the two
     // records impossible to line up.
-    assert_eq!(entries[0].tool_call_id, "call_1");
+    assert_eq!(entries[0].tool_call_id.as_deref(), Some("call_1"));
 
     // The name in the trail must be the name the model was offered. An
     // auditor matching entries against a tool inventory has only the name to
@@ -220,8 +220,11 @@ async fn every_executed_tool_call_lands_in_the_trail() {
         "tool schemas must be self-contained on the wire: {offered}"
     );
     assert_eq!(entries[0].prev_hash, GENESIS_HASH);
-    assert!(entries[0].decision.approved);
-    assert!(matches!(entries[0].outcome, AuditOutcome::Success { .. }));
+    assert!(entries[0].decision.as_ref().unwrap().approved);
+    assert!(matches!(
+        entries[0].outcome,
+        Some(AuditOutcome::Success { .. })
+    ));
     assert_eq!(
         verify_chain(&entries)
             .expect("a fresh trail must verify")
@@ -230,6 +233,124 @@ async fn every_executed_tool_call_lands_in_the_trail() {
         "the head on disk and the head in the actor must agree"
     );
 
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_text_only_turn_records_metadata_without_prompt_or_response_content() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(vec![Round::text("private answer")]).await;
+    let ai = ActonAI::builder()
+        .app_name("audit-text-turn")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit(AuditConfig::new(&path).with_user("acct:alice"))
+        .launch()
+        .await
+        .expect("runtime launches");
+
+    ai.prompt("private question")
+        .collect()
+        .await
+        .expect("turn completes");
+    ai.audit_head()
+        .await
+        .expect("turn record reaches the trail");
+
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 1);
+    let turn = &entries[0];
+    assert_eq!(turn.kind(), AuditEntryKind::Turn);
+    assert!(matches!(
+        turn.turn_outcome,
+        Some(TurnAuditOutcome::Completed)
+    ));
+    assert_eq!(turn.prompt_size_bytes, Some(16));
+    assert_eq!(turn.response_size_bytes, Some(14));
+    assert_eq!(turn.provider.as_deref(), Some("default"));
+    assert_eq!(turn.model.as_deref(), Some("mock-model"));
+    assert!(turn.tool_name.is_none());
+    assert!(turn.arguments.is_none());
+    let json = turn.to_jsonl().expect("turn serializes");
+    assert!(!json.contains("private question"));
+    assert!(!json.contains("private answer"));
+    verify_chain(&entries).expect("turn-only trail verifies");
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn admission_refusal_records_the_attempt_without_calling_the_provider() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(Vec::new()).await;
+    let ai = ActonAI::builder()
+        .app_name("audit-refused-turn")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(&path)
+        .launch()
+        .await
+        .expect("runtime launches");
+    ai.pause();
+
+    let error = ai
+        .prompt("must not run")
+        .collect()
+        .await
+        .expect_err("paused runtime refuses the turn");
+    assert!(error.is_turns_not_admitted());
+    ai.audit_head().await.expect("refusal reaches the trail");
+
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(
+        entries[0].turn_outcome,
+        Some(TurnAuditOutcome::Refused { ref decision, .. }) if decision == "paused"
+    ));
+    assert_eq!(entries[0].response_size_bytes, Some(0));
+    assert_eq!(server.request_count(), 0);
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn a_failed_text_turn_is_still_recorded() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(vec![
+        Round::server_error(),
+        Round::server_error(),
+        Round::server_error(),
+    ])
+    .await;
+    let ai = ActonAI::builder()
+        .app_name("audit-failed-turn")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(&path)
+        .launch()
+        .await
+        .expect("runtime launches");
+
+    ai.prompt("this fails")
+        .collect()
+        .await
+        .expect_err("provider failure ends the turn");
+    ai.audit_head().await.expect("failure reaches the trail");
+
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 1);
+    assert!(matches!(
+        entries[0].turn_outcome,
+        Some(TurnAuditOutcome::Failed)
+    ));
+    assert_eq!(entries[0].response_size_bytes, Some(0));
     ai.shutdown().await.expect("clean shutdown");
 }
 
@@ -271,18 +392,24 @@ async fn a_denied_call_is_recorded_as_denied_with_the_rule_that_refused_it() {
     let entries = read_trail(&path);
     assert_eq!(
         entries.len(),
-        1,
-        "a call that never ran is still a call that was made"
+        2,
+        "the denied call and its completed turn are both recorded"
     );
-    assert!(!entries[0].decision.approved);
-    assert_eq!(entries[0].decision.decided_by, Decider::Denylist);
-    assert!(matches!(entries[0].outcome, AuditOutcome::Denied { .. }));
+    assert!(!entries[0].decision.as_ref().unwrap().approved);
+    assert_eq!(
+        entries[0].decision.as_ref().unwrap().decided_by,
+        Decider::Denylist
+    );
+    assert!(matches!(
+        entries[0].outcome,
+        Some(AuditOutcome::Denied { .. })
+    ));
     assert_eq!(entries[0].response_size_bytes, None);
 
     // A refused call is identified exactly like one that ran. Anything else
     // would leave the one kind of entry an investigator most wants to trace
     // as the one kind that cannot be traced.
-    assert_eq!(entries[0].tool_call_id, "call_1");
+    assert_eq!(entries[0].tool_call_id.as_deref(), Some("call_1"));
 
     ai.shutdown().await.expect("clean shutdown");
 }
@@ -332,9 +459,12 @@ async fn secret_bearing_arguments_never_reach_the_file() {
     );
 
     let entries = read_trail(&path);
-    assert_eq!(entries[0].arguments["api_key"], json!("[redacted]"));
     assert_eq!(
-        entries[0].arguments["value"],
+        entries[0].arguments.as_ref().unwrap()["api_key"],
+        json!("[redacted]")
+    );
+    assert_eq!(
+        entries[0].arguments.as_ref().unwrap()["value"],
         json!("safe"),
         "redaction must be surgical, not wholesale"
     );
@@ -382,10 +512,13 @@ async fn a_hook_rewrite_is_what_the_trail_records() {
     let entries = read_trail(&path);
     assert_eq!(
         entries[0].arguments,
-        json!({"value": "rewritten"}),
+        Some(json!({"value": "rewritten"})),
         "the trail must describe what ran, not what was asked for"
     );
-    assert_eq!(entries[0].decision.decided_by, Decider::Callback);
+    assert_eq!(
+        entries[0].decision.as_ref().unwrap().decided_by,
+        Decider::Callback
+    );
 
     ai.shutdown().await.expect("clean shutdown");
 }
@@ -428,7 +561,7 @@ async fn editing_an_entry_in_the_middle_breaks_the_chain_at_that_entry() {
     ai.shutdown().await.expect("clean shutdown");
 
     let entries = read_trail(&path);
-    assert_eq!(entries.len(), 3, "the test needs a middle entry to edit");
+    assert_eq!(entries.len(), 4, "the test needs a middle entry to edit");
     assert!(
         verify_chain(&entries).is_ok(),
         "the trail must start intact"
@@ -437,7 +570,7 @@ async fn editing_an_entry_in_the_middle_breaks_the_chain_at_that_entry() {
     // Rewrite the middle entry the way somebody covering their tracks would:
     // change what the tool was, leave everything else alone.
     let mut tampered = entries.clone();
-    tampered[1].tool_name = "something_harmless".to_string();
+    tampered[1].tool_name = Some("something_harmless".to_string());
 
     let broken = verify_chain(&tampered).expect_err("an edited entry must be caught");
     assert_eq!(
@@ -499,10 +632,10 @@ async fn a_second_run_appends_to_the_chain_the_first_one_left() {
     }
 
     let entries = read_trail(&path);
-    assert_eq!(entries.len(), 2, "the second run must append, not truncate");
-    assert_eq!(entries[1].sequence, 2);
+    assert_eq!(entries.len(), 4, "the second run must append, not truncate");
+    assert_eq!(entries[2].sequence, 3);
     assert_eq!(
-        entries[1].prev_hash, entries[0].hash,
+        entries[2].prev_hash, entries[1].hash,
         "the resumed chain must link back to the first run's last entry"
     );
     verify_chain(&entries).expect("a resumed chain must still verify");
@@ -582,7 +715,7 @@ async fn a_toml_audit_section_arms_the_trail() {
     // The parent directory did not exist: resolution had to create it, or the
     // entry would have gone nowhere and nobody would have noticed.
     let entries = read_trail(&path);
-    assert_eq!(entries.len(), 1);
+    assert_eq!(entries.len(), 2);
     assert_eq!(entries[0].user.as_deref(), Some("acct:bob"));
 
     ai.shutdown().await.expect("clean shutdown");
@@ -608,7 +741,7 @@ async fn the_cli_reports_the_same_head_the_runtime_does() {
     let path = dir.path().join("audit.jsonl");
 
     let head = record_trail("audit-parity", &path, 3).await;
-    assert_eq!(head.entries, 3, "the test needs a chain to compare");
+    assert_eq!(head.entries, 4, "the test needs a chain to compare");
 
     let verdict = run_audit_verify(&path);
 
@@ -665,7 +798,7 @@ async fn a_tampered_trail_fails_the_cli_where_the_library_says_it_should() {
     let path = dir.path().join("audit.jsonl");
 
     let head = record_trail("audit-parity-tamper", &path, 3).await;
-    assert_eq!(head.entries, 3, "the test needs a middle entry to edit");
+    assert_eq!(head.entries, 4, "the test needs a middle entry to edit");
 
     // The trail must start clean, or the tamper proves nothing.
     let clean = run_audit_verify(&path);
@@ -674,7 +807,7 @@ async fn a_tampered_trail_fails_the_cli_where_the_library_says_it_should() {
     // Rewrite the middle entry the way somebody covering their tracks would:
     // change what the tool was, leave everything else alone.
     let mut entries = read_trail(&path);
-    entries[1].tool_name = "something_harmless".to_string();
+    entries[1].tool_name = Some("something_harmless".to_string());
     write_trail(&path, &entries);
 
     // What the library says about it, in this process.
@@ -910,7 +1043,10 @@ async fn best_effort_mode_continues_after_an_append_failure() {
     assert!(health.is_degraded());
     assert_eq!(health.durability, AuditDurability::BestEffort);
     assert_eq!(health.first_failed_sequence, Some(1));
-    assert_eq!(health.failures, 3, "every call's entry failed to land");
+    assert_eq!(
+        health.failures, 4,
+        "every call and turn entry failed to land"
+    );
 
     ai.shutdown().await.expect("clean shutdown");
 }
@@ -938,16 +1074,16 @@ async fn strict_mode_acknowledges_each_entry_before_the_next_call() {
     // does not move past a call until its entry is acknowledged, so by the
     // time `collect()` returns the file already holds every entry.
     let entries = read_trail(&path);
-    assert_eq!(entries.len(), 2);
-    assert_eq!(entries[0].tool_call_id, "call_1");
-    assert_eq!(entries[1].tool_call_id, "call_2");
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].tool_call_id.as_deref(), Some("call_1"));
+    assert_eq!(entries[1].tool_call_id.as_deref(), Some("call_2"));
     verify_chain(&entries).expect("the chain verifies");
 
     let health = ai.audit_health().await.expect("health is reported");
     assert_eq!(health.state, AuditHealthState::Healthy);
-    assert_eq!(health.appended, 2);
+    assert_eq!(health.appended, 3);
     assert_eq!(health.failures, 0);
-    assert_eq!(health.head.sequence, 2);
+    assert_eq!(health.head.sequence, 3);
 
     ai.shutdown().await.expect("clean shutdown");
 }

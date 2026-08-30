@@ -518,31 +518,36 @@ async fn the_audit_trail_marks_resumed_executions_and_the_chain_verifies() {
 
     // The barrier: the head cannot answer until both entries are written.
     let head = ai.audit_head().await.expect("the trail must report a head");
-    assert_eq!(head.entries, 2);
+    assert_eq!(head.entries, 4);
 
     let entries = read_trail(&audit_path);
-    assert_eq!(entries.len(), 2);
+    assert_eq!(entries.len(), 4);
+    let invocations = entries
+        .iter()
+        .filter(|entry| entry.kind() == AuditEntryKind::Invocation)
+        .collect::<Vec<_>>();
     assert!(
-        entries[0].resumed,
+        invocations[0].resumed,
         "the settled call ran under a resume and must say so"
     );
     assert!(
-        !entries[1].resumed,
+        !invocations[1].resumed,
         "an ordinary call must not carry the marker"
     );
 
     // The marker is covered by the hashes and the chain still links.
-    assert_eq!(entries[0].recompute_hash(), entries[0].hash);
-    assert_eq!(entries[1].recompute_hash(), entries[1].hash);
-    assert_eq!(entries[1].prev_hash, entries[0].hash);
+    for entry in &entries {
+        assert_eq!(entry.recompute_hash(), entry.hash);
+    }
+    assert_eq!(entries[2].prev_hash, entries[1].hash);
 
     // The first-run entry keeps the pre-marker byte shape, so trails written
     // before the field existed verify with the same code path.
     let first_run_line = std::fs::read_to_string(&audit_path)
         .expect("the trail must exist")
         .lines()
-        .nth(1)
-        .expect("two entries")
+        .nth(2)
+        .expect("the first-run invocation")
         .to_string();
     assert!(!first_run_line.contains("resumed"), "{first_run_line}");
 }

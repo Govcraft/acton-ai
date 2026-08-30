@@ -131,9 +131,9 @@ pub mod prelude {
     };
     pub use crate::audit::{
         default_audit_path, verify_chain, AppendReceipt, AuditConfig, AuditDecision,
-        AuditDurability, AuditEntry, AuditHealth, AuditHealthChanged, AuditHealthState,
-        AuditOutcome, ChainBreak, ChainBreakKind, ChainHead, InvocationRecord, Redactor,
-        DEFAULT_REDACT_PATTERNS, GENESIS_HASH,
+        AuditDurability, AuditEntry, AuditEntryKind, AuditHealth, AuditHealthChanged,
+        AuditHealthState, AuditOutcome, ChainBreak, ChainBreakKind, ChainHead, InvocationRecord,
+        Redactor, TurnAuditOutcome, TurnRecord, DEFAULT_REDACT_PATTERNS, GENESIS_HASH,
     };
     pub use crate::checkpoint::{
         CheckpointError, CheckpointErrorKind, CheckpointRecord, CheckpointSink, CheckpointStatus,

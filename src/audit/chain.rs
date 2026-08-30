@@ -326,7 +326,7 @@ mod tests {
     #[test]
     fn a_tampered_middle_entry_is_reported_at_that_entry() {
         let mut entries = chain(5);
-        entries[2].arguments = json!({"index": "tampered"});
+        entries[2].arguments = Some(json!({"index": "tampered"}));
 
         let broken = verify_chain(&entries).expect_err("an edited entry must break the chain");
 
@@ -410,8 +410,8 @@ mod tests {
     #[test]
     fn only_the_first_break_is_reported() {
         let mut entries = chain(5);
-        entries[1].tool_name = "edited".to_string();
-        entries[3].tool_name = "also_edited".to_string();
+        entries[1].tool_name = Some("edited".to_string());
+        entries[3].tool_name = Some("also_edited".to_string());
 
         let broken = verify_chain(&entries).expect_err("the chain is broken");
         assert_eq!(broken.line, 2, "the earliest break is the one reported");

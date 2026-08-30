@@ -42,7 +42,7 @@ use crate::audit::chain::ChainHead;
 use crate::audit::config::{
     read_trail_id, resolve_trail_id, write_trail_id, AuditConfig, AuditDurability,
 };
-use crate::audit::entry::{AuditEntry, InvocationRecord};
+use crate::audit::entry::{AuditEntry, AuditRecord, InvocationRecord, TurnRecord};
 use crate::audit::health::AuditHealth;
 use crate::types::TrailId;
 use acton_reactive::prelude::tokio::io::AsyncWriteExt;
@@ -255,6 +255,40 @@ pub struct RecordInvocationDurably {
     pub record: InvocationRecord,
 }
 
+/// One completed or refused turn to append to the trail.
+#[acton_message]
+pub struct RecordTurn {
+    /// Turn metadata excluding its place in the chain.
+    pub record: TurnRecord,
+}
+
+impl RecordTurn {
+    /// Wraps a record for sending.
+    #[must_use]
+    pub fn new(record: TurnRecord) -> Self {
+        Self { record }
+    }
+}
+
+/// A turn record acknowledged once it is on disk.
+#[acton_message]
+pub struct RecordTurnDurably {
+    /// Turn metadata excluding its place in the chain.
+    pub record: TurnRecord,
+}
+
+impl RecordTurnDurably {
+    /// Wraps a record for asking.
+    #[must_use]
+    pub fn new(record: TurnRecord) -> Self {
+        Self { record }
+    }
+}
+
+impl Request for RecordTurnDurably {
+    type Response = AppendReceipt;
+}
+
 impl RecordInvocationDurably {
     /// Wraps a record for asking.
     #[must_use]
@@ -416,7 +450,7 @@ impl AuditLog {
     }
 
     /// Seals the next entry and hands back what an append future needs.
-    fn prepare_append(&mut self, record: InvocationRecord) -> PreparedAppend {
+    fn prepare_append(&mut self, record: AuditRecord) -> PreparedAppend {
         let entry = self.seal_next(record);
         PreparedAppend {
             path: self.path.clone(),
@@ -444,9 +478,16 @@ impl AuditLog {
     }
 
     /// Seals the next entry and advances the head. Pure bookkeeping.
-    fn seal_next(&mut self, record: InvocationRecord) -> AuditEntry {
+    fn seal_next(&mut self, record: AuditRecord) -> AuditEntry {
         let sequence = self.sequence.saturating_add(1);
-        let entry = AuditEntry::seal(record, sequence, &self.prev_hash, Some(&self.trail_id));
+        let entry = match record {
+            AuditRecord::Invocation(record) => {
+                AuditEntry::seal(record, sequence, &self.prev_hash, Some(&self.trail_id))
+            }
+            AuditRecord::Turn(record) => {
+                AuditEntry::seal_turn(record, sequence, &self.prev_hash, Some(&self.trail_id))
+            }
+        };
 
         self.sequence = sequence;
         self.prev_hash.clone_from(&entry.hash);
@@ -598,7 +639,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
     builder.mutate_on::<RecordInvocation>(move |actor, envelope| {
         let prepared = actor
             .model
-            .prepare_append(envelope.message().record.clone());
+            .prepare_append(AuditRecord::Invocation(envelope.message().record.clone()));
         let handle = handle.clone();
 
         Reply::pending(async move {
@@ -615,10 +656,38 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
     builder.mutate_on::<RecordInvocationDurably>(move |actor, envelope| {
         let prepared = actor
             .model
-            .prepare_append(envelope.message().record.clone());
+            .prepare_append(AuditRecord::Invocation(envelope.message().record.clone()));
         let reply = envelope.reply_envelope();
         let handle = handle.clone();
 
+        Reply::pending(async move {
+            let sequence = prepared.entry.sequence;
+            let hash = prepared.entry.hash.clone();
+            let result = prepared.perform(&handle).await;
+            reply
+                .send(PreparedAppend::receipt(sequence, hash, result))
+                .await;
+        })
+    });
+
+    let handle = self_handle.clone();
+    builder.mutate_on::<RecordTurn>(move |actor, envelope| {
+        let prepared = actor
+            .model
+            .prepare_append(AuditRecord::Turn(envelope.message().record.clone()));
+        let handle = handle.clone();
+        Reply::pending(async move {
+            let _ = prepared.perform(&handle).await;
+        })
+    });
+
+    let handle = self_handle.clone();
+    builder.mutate_on::<RecordTurnDurably>(move |actor, envelope| {
+        let prepared = actor
+            .model
+            .prepare_append(AuditRecord::Turn(envelope.message().record.clone()));
+        let reply = envelope.reply_envelope();
+        let handle = handle.clone();
         Reply::pending(async move {
             let sequence = prepared.entry.sequence;
             let hash = prepared.entry.hash.clone();
@@ -775,12 +844,12 @@ mod tests {
             lock: None,
         };
 
-        let first = log.seal_next(record("a"));
+        let first = log.seal_next(AuditRecord::Invocation(record("a")));
         assert_eq!(first.sequence, 1);
         assert_eq!(first.prev_hash, GENESIS_HASH);
         assert_eq!(first.trail_id.as_ref(), Some(&trail_id));
 
-        let second = log.seal_next(record("b"));
+        let second = log.seal_next(AuditRecord::Invocation(record("b")));
         assert_eq!(second.sequence, 2);
         assert_eq!(
             second.prev_hash, first.hash,
