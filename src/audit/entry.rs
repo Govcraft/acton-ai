@@ -5,10 +5,12 @@
 //! an edit anywhere in the file detectable: changing one entry changes its
 //! hash, and every hash after it was computed from the old value.
 
+use crate::instructions::{InstructionLayer, InstructionScope};
 use crate::messages::Usage;
 use crate::policy::Decider;
 use crate::types::{ConversationId, CorrelationId, TrailId, TurnId};
 use serde::{Deserialize, Serialize};
+use std::path::PathBuf;
 
 /// The `prev_hash` of the first entry in a chain.
 ///
@@ -154,6 +156,34 @@ pub enum TurnAuditOutcome {
     },
 }
 
+/// Metadata identifying one source of context that steered a turn.
+///
+/// The source content is deliberately excluded. Its BLAKE3 digest proves
+/// which bytes were used without copying potentially sensitive instructions
+/// into the long-lived audit trail.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ContextSource {
+    /// The authority that supplied the context.
+    pub scope: InstructionScope,
+    /// Absolute path from which the context was loaded.
+    pub path: PathBuf,
+    /// Lowercase hexadecimal BLAKE3 digest of the source content.
+    pub content_hash: String,
+}
+
+impl ContextSource {
+    /// Fingerprints a discovered instruction layer for audit use.
+    #[must_use]
+    pub fn from_instruction_layer(layer: &InstructionLayer) -> Self {
+        Self {
+            scope: layer.scope,
+            path: layer.path.clone(),
+            content_hash: blake3::hash(layer.content.as_bytes()).to_hex().to_string(),
+        }
+    }
+}
+
 /// Metadata for one attempted model turn, excluding its chain position.
 ///
 /// Prompt and response content are deliberately absent. Their byte counts
@@ -184,6 +214,8 @@ pub struct TurnRecord {
     pub model: String,
     /// Usage summed across all provider rounds.
     pub usage: Usage,
+    /// Metadata naming the instruction layers that steered the turn.
+    pub context_sources: Vec<ContextSource>,
 }
 
 /// An unsealed event accepted by the audit writer.
@@ -267,6 +299,10 @@ pub struct AuditEntry {
     /// Output tokens summed across the turn.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output_tokens: Option<u64>,
+    /// Context sources that steered this turn, absent for legacy and
+    /// invocation entries.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub context_sources: Vec<ContextSource>,
     /// Whether the call ran inside a turn resumed from a checkpoint.
     ///
     /// Serialized only when `true`, so entries written before this field
@@ -330,6 +366,8 @@ struct HashPreimage<'a> {
     input_tokens: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     output_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    context_sources: Option<&'a [ContextSource]>,
     /// `Some(true)` only on a resumed call; skipped when absent. A field that
     /// serialized `false` on every pre-existing entry would change their
     /// pre-image bytes and break verification of every chain already written.
@@ -417,6 +455,7 @@ impl AuditEntry {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            context_sources: None,
             resumed: resumed.then_some(true),
             trail_id,
             prev_hash,
@@ -443,6 +482,7 @@ impl AuditEntry {
             model: None,
             input_tokens: None,
             output_tokens: None,
+            context_sources: Vec::new(),
             resumed,
             trail_id: trail_id.cloned(),
             prev_hash: prev_hash.to_string(),
@@ -470,6 +510,7 @@ impl AuditEntry {
             provider,
             model,
             usage,
+            context_sources,
         } = record;
         let kind = AuditEntryKind::Turn;
         let hash = hash_preimage(&HashPreimage {
@@ -498,6 +539,7 @@ impl AuditEntry {
                     .saturating_add(usage.cache_creation_tokens),
             ),
             output_tokens: Some(usage.output_tokens),
+            context_sources: (!context_sources.is_empty()).then_some(context_sources.as_slice()),
             resumed: None,
             trail_id,
             prev_hash,
@@ -528,6 +570,7 @@ impl AuditEntry {
                     .saturating_add(usage.cache_creation_tokens),
             ),
             output_tokens: Some(usage.output_tokens),
+            context_sources,
             resumed: false,
             trail_id: trail_id.cloned(),
             prev_hash: prev_hash.to_string(),
@@ -569,6 +612,8 @@ impl AuditEntry {
             model: self.model.as_deref(),
             input_tokens: self.input_tokens,
             output_tokens: self.output_tokens,
+            context_sources: (!self.context_sources.is_empty())
+                .then_some(self.context_sources.as_slice()),
             resumed: self.resumed.then_some(true),
             trail_id: self.trail_id.as_ref(),
             prev_hash: &self.prev_hash,

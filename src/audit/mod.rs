@@ -108,8 +108,8 @@ pub use config::{
     AuditDurability, TrailIdConflict, DEFAULT_AUDIT_FILE, TRAIL_ID_SUFFIX,
 };
 pub use entry::{
-    AuditDecision, AuditEntry, AuditEntryKind, AuditOutcome, InvocationRecord, TurnAuditOutcome,
-    TurnRecord, GENESIS_HASH,
+    AuditDecision, AuditEntry, AuditEntryKind, AuditOutcome, ContextSource, InvocationRecord,
+    TurnAuditOutcome, TurnRecord, GENESIS_HASH,
 };
 pub use health::{AuditHealth, AuditHealthState};
 pub use redact::{Redactor, DEFAULT_REDACT_PATTERNS, REDACTED};

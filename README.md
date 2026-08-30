@@ -172,6 +172,13 @@ for layer in instructions.layers() {
 }
 
 let turn_start_context = instructions.context_fragment();
+
+runtime
+    .prompt("Review this change")
+    .system(turn_start_context)
+    .context_sources(instructions.context_sources())
+    .collect()
+    .await?;
 # Ok::<(), InstructionsError>(())
 ```
 
@@ -180,6 +187,23 @@ loads only files named exactly `AGENTS.md`. Deeper files appear later, and the
 user-level `~/.agents/AGENTS.md` is last. Use
 `AgentInstructions::discover_with_root` when the host supplies its own
 workspace or trust boundary.
+
+The `context_sources` call seals only each layer's scope, resolved path, and
+BLAKE3 content hash into the turn's audit entry. Instruction content is never
+written to the trail. A host that refuses a turn before calling `prompt` can
+record that decision through the same single writer:
+
+```rust,ignore
+let receipt = runtime
+    .record_refused_turn(
+        TurnId::new(),
+        None,
+        "seat_entitlement",
+        "seat entitlement expired",
+        prompt.len() as u64,
+    )
+    .await?;
+```
 
 ### Custom Tools
 

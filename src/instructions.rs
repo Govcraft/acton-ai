@@ -122,6 +122,15 @@ impl AgentInstructions {
         &self.layers
     }
 
+    /// Returns metadata-only fingerprints suitable for a turn audit entry.
+    #[must_use]
+    pub fn context_sources(&self) -> Vec<crate::audit::ContextSource> {
+        self.layers
+            .iter()
+            .map(crate::audit::ContextSource::from_instruction_layer)
+            .collect()
+    }
+
     /// Renders a context fragment suitable for insertion at turn start.
     ///
     /// Later documents have higher precedence. An empty discovery result
@@ -290,6 +299,17 @@ mod tests {
         let rendered = instructions.context_fragment();
         assert!(rendered.find("cargo test").unwrap() < rendered.find("-p api").unwrap());
         assert!(rendered.find("-p api").unwrap() < rendered.rfind("cargo nextest run").unwrap());
+
+        let sources = instructions.context_sources();
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].scope, InstructionScope::Project);
+        assert_eq!(sources[2].scope, InstructionScope::User);
+        assert_eq!(
+            sources[0].content_hash,
+            blake3::hash(b"test-command: cargo test\n")
+                .to_hex()
+                .to_string()
+        );
     }
 
     #[test]

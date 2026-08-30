@@ -689,6 +689,65 @@ impl ActonAI {
             .map(crate::audit::AuditConfig::durability)
     }
 
+    /// Records a turn that the host refused before entering the prompt loop.
+    ///
+    /// This is the public single-writer path for admission decisions owned by
+    /// an embedder, such as entitlement, control-plane, or audit-backlog
+    /// checks. Prompt content is not recorded, only its byte count.
+    ///
+    /// The returned receipt arrives after the append has met the configured
+    /// [`AuditDurability`](crate::audit::AuditDurability).
+    ///
+    /// # Errors
+    ///
+    /// Returns a configuration error if auditing is disabled, or a provider
+    /// error if the audit actor cannot be reached.
+    pub async fn record_refused_turn(
+        &self,
+        turn: crate::types::TurnId,
+        conversation: Option<crate::types::ConversationId>,
+        decision: &str,
+        reason: &str,
+        prompt_size_bytes: u64,
+    ) -> Result<crate::audit::AppendReceipt, ActonAIError> {
+        let Some((audit, config)) = self.audit() else {
+            return Err(ActonAIError::configuration(
+                "audit",
+                "cannot record a refused turn because no audit trail is configured",
+            ));
+        };
+        let provider = self.default_provider_name().to_string();
+        let record = crate::audit::TurnRecord {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            correlation_id: crate::types::CorrelationId::new(),
+            conversation_id: conversation,
+            user: config.user().map(str::to_string),
+            turn_id: turn,
+            outcome: crate::audit::TurnAuditOutcome::Refused {
+                decision: decision.to_string(),
+                reason: reason.to_string(),
+            },
+            prompt_size_bytes,
+            response_size_bytes: 0,
+            provider: provider.clone(),
+            model: self
+                .provider_model(&provider)
+                .unwrap_or_default()
+                .to_string(),
+            usage: crate::messages::Usage::default(),
+            context_sources: Vec::new(),
+        };
+
+        audit
+            .ask(crate::audit::RecordTurnDurably::new(record))
+            .await
+            .map_err(|error| {
+                ActonAIError::provider_error(format!(
+                    "could not reach the audit log to record the refused turn: {error}"
+                ))
+            })
+    }
+
     /// Whether this runtime checkpoints its turns.
     #[must_use]
     pub fn is_checkpointing(&self) -> bool {

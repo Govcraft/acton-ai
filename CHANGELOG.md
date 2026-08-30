@@ -3,6 +3,24 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## 0.37.0 - 2026-08-30
+
+### Added
+
+- **Host-owned turn refusals reach the audit chain.**
+  `ActonAI::record_refused_turn` gives embedders a public path through the
+  runtime's single audit writer for turns rejected before `run_prompt_loop`,
+  including entitlement, policy, control-plane, and audit-backlog decisions.
+  It returns an `AppendReceipt` after the configured durability guarantee is
+  met and never calls a model provider.
+
+- **Instruction provenance is sealed with each turn.** `ContextSource`
+  records an instruction layer's scope, resolved path, and BLAKE3 content
+  hash without recording its content. `AgentInstructions::context_sources`
+  derives those fingerprints and `PromptBuilder::context_sources` attaches
+  them to the terminal turn entry. Empty source lists remain absent from both
+  serialized entries and hash preimages, so existing trails still verify.
+
 ## 0.36.0 - 2026-08-30
 
 ### Added

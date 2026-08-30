@@ -496,6 +496,8 @@ pub struct PromptBuilder {
     /// Caller-supplied turn identity, when the caller wants to know the id
     /// before the loop runs. `None` mints a fresh one at admission.
     turn_id: Option<TurnId>,
+    /// Metadata-only fingerprints of context sources that steered this turn.
+    context_sources: Vec<crate::audit::ContextSource>,
 }
 
 impl PromptBuilder {
@@ -523,6 +525,7 @@ impl PromptBuilder {
             checkpoint: CheckpointSink::disabled(),
             resume_seed: None,
             turn_id: None,
+            context_sources: Vec::new(),
         }
     }
 
@@ -1154,6 +1157,19 @@ impl PromptBuilder {
         self
     }
 
+    /// Names the instruction sources that steered this turn in its audit entry.
+    ///
+    /// Only source scope, path, and content hash are recorded; instruction
+    /// content is never copied into the audit trail.
+    #[must_use]
+    pub fn context_sources(
+        mut self,
+        sources: impl IntoIterator<Item = crate::audit::ContextSource>,
+    ) -> Self {
+        self.context_sources = sources.into_iter().collect();
+        self
+    }
+
     /// Enables the built-in tools configured on the runtime.
     ///
     /// This method adds all tools that were configured via
@@ -1431,6 +1447,7 @@ impl PromptBuilder {
                 .unwrap_or_default()
                 .to_string(),
             usage: Arc::new(std::sync::Mutex::new(Usage::default())),
+            context_sources: self.context_sources.clone(),
         };
 
         // Admission is checked exactly here: before the span opens, before a
@@ -1576,6 +1593,7 @@ impl PromptBuilder {
             // Already resolved into the `turn_id` parameter by
             // `run_prompt_loop`, which needed it before the span opened.
             turn_id: _,
+            context_sources: _,
         } = self;
 
         // Resolve the provider handle
@@ -2723,6 +2741,7 @@ struct TurnAuditContext {
     provider: String,
     model: String,
     usage: Arc<std::sync::Mutex<Usage>>,
+    context_sources: Vec<crate::audit::ContextSource>,
 }
 
 impl TurnAuditContext {
@@ -2748,6 +2767,7 @@ impl TurnAuditContext {
             provider: self.provider.clone(),
             model: self.model.clone(),
             usage,
+            context_sources: self.context_sources.clone(),
         })
     }
 

@@ -306,7 +306,7 @@ impl Request for RecordInvocationDurably {
 #[serde(rename_all = "snake_case", tag = "outcome")]
 #[non_exhaustive]
 pub enum AppendReceipt {
-    /// The entry is on disk and synced.
+    /// The entry is on disk with the configured durability guarantee.
     Durable {
         /// The entry's place in the chain.
         sequence: u64,

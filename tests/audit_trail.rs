@@ -275,6 +275,7 @@ async fn a_text_only_turn_records_metadata_without_prompt_or_response_content() 
     assert!(turn.tool_name.is_none());
     assert!(turn.arguments.is_none());
     let json = turn.to_jsonl().expect("turn serializes");
+    assert!(!json.contains("context_sources"));
     assert!(!json.contains("private question"));
     assert!(!json.contains("private answer"));
     verify_chain(&entries).expect("turn-only trail verifies");
@@ -314,6 +315,100 @@ async fn admission_refusal_records_the_attempt_without_calling_the_provider() {
     ));
     assert_eq!(entries[0].response_size_bytes, Some(0));
     assert_eq!(server.request_count(), 0);
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn host_refusal_uses_the_single_writer_and_returns_a_receipt() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let path = dir.path().join("audit.jsonl");
+    let server = MockServer::start(Vec::new()).await;
+    let ai = ActonAI::builder()
+        .app_name("audit-host-refusal")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit(AuditConfig::new(&path).with_durability(AuditDurability::Strict))
+        .launch()
+        .await
+        .expect("runtime launches");
+    let turn_id = TurnId::new();
+    let conversation_id = ConversationId::new();
+
+    let receipt = ai
+        .record_refused_turn(
+            turn_id.clone(),
+            Some(conversation_id.clone()),
+            "seat_entitlement",
+            "seat entitlement expired",
+            41,
+        )
+        .await
+        .expect("the audit writer answers");
+
+    assert!(receipt.is_durable());
+    let entries = read_trail(&path);
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].turn_id, turn_id);
+    assert_eq!(entries[0].conversation_id.as_ref(), Some(&conversation_id));
+    assert_eq!(entries[0].prompt_size_bytes, Some(41));
+    assert_eq!(entries[0].response_size_bytes, Some(0));
+    assert!(matches!(
+        entries[0].turn_outcome,
+        Some(TurnAuditOutcome::Refused { ref decision, ref reason })
+            if decision == "seat_entitlement" && reason == "seat entitlement expired"
+    ));
+    assert_eq!(server.request_count(), 0);
+    verify_chain(&entries).expect("host refusal verifies");
+    ai.shutdown().await.expect("clean shutdown");
+}
+
+#[tokio::test]
+async fn turn_records_instruction_fingerprints_without_instruction_content() {
+    let dir = tempfile::tempdir().expect("a temp dir");
+    let workspace = dir.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace is created");
+    let instruction_path = workspace.join("AGENTS.md");
+    let instruction_content = "private deployment token: do-not-seal";
+    std::fs::write(&instruction_path, instruction_content).expect("instructions are written");
+    let instructions = AgentInstructions::discover_with_root(&workspace, &workspace, None)
+        .expect("instructions are discovered");
+    let server = MockServer::start(vec![Round::text("done")]).await;
+    let path = dir.path().join("audit.jsonl");
+    let ai = ActonAI::builder()
+        .app_name("audit-context-sources")
+        .provider(ProviderConfig::openai_compatible(
+            server.base_url().to_string(),
+            "mock-model",
+        ))
+        .audit_to(&path)
+        .launch()
+        .await
+        .expect("runtime launches");
+
+    ai.prompt("ship it")
+        .system(instructions.context_fragment())
+        .context_sources(instructions.context_sources())
+        .collect()
+        .await
+        .expect("turn completes");
+    ai.audit_head().await.expect("turn reaches the trail");
+
+    let entries = read_trail(&path);
+    let source = &entries[0].context_sources[0];
+    assert_eq!(source.scope, InstructionScope::Project);
+    assert_eq!(source.path, instruction_path.canonicalize().unwrap());
+    assert_eq!(
+        source.content_hash,
+        blake3::hash(instruction_content.as_bytes())
+            .to_hex()
+            .to_string()
+    );
+    assert!(!std::fs::read_to_string(&path)
+        .expect("trail is readable")
+        .contains(instruction_content));
+    verify_chain(&entries).expect("context metadata verifies");
     ai.shutdown().await.expect("clean shutdown");
 }
 
