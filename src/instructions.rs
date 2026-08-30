@@ -292,7 +292,10 @@ mod tests {
         assert_eq!(instructions.layers()[0].scope, InstructionScope::Project);
         assert_eq!(
             instructions.layers()[1].path,
-            package.join(INSTRUCTIONS_FILE)
+            package
+                .join(INSTRUCTIONS_FILE)
+                .canonicalize()
+                .expect("the instruction path resolves")
         );
         assert_eq!(instructions.layers()[2].scope, InstructionScope::User);
         assert_eq!(instructions.layers()[2].precedence, 2);
