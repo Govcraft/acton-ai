@@ -931,6 +931,56 @@ acton-ai heartbeat --session main
 
 Output is a JSON activity report to stdout, suitable for monitoring pipelines.
 
+### Serve and Tick
+
+`acton-ai heartbeat` starts a whole process per wake-up. `acton-ai serve` is the
+resident alternative: it launches once and runs one heartbeat pass each time a
+tick arrives on its introspection socket. The systemd timer stays, but it fires
+`acton-ai tick` instead of spawning a run:
+
+```bash
+acton-ai serve --tick-journal /var/lib/acton-ai/ticks.jsonl   # long-lived
+acton-ai tick                                                 # from the timer
+```
+
+`serve` needs an `[introspection]` section with a `socket_path`, so the timer's
+`acton-ai tick` can find it:
+
+```ini
+# acton-ai.service
+[Service]
+Type=notify
+ExecStart=/usr/local/bin/acton-ai serve --tick-journal /var/lib/acton-ai/ticks.jsonl
+ExecStop=/usr/local/bin/acton-ai drain --wait --timeout 0
+
+# acton-ai-tick.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/acton-ai tick
+
+# acton-ai-tick.timer
+[Timer]
+OnCalendar=*:0/30
+Persistent=true
+```
+
+A tick carries no timestamp. The process stamps it with its own clock, numbers
+it, and appends it to the journal before anything runs, so a client of the
+socket can wake the process but cannot tell it what time it is. Each pass runs
+what was due *at the tick's time*, and that time is what the entries record as
+their `last_run`. Ticks that pile up behind a long pass are folded into the
+latest one. While paused, ticks are still recorded and the pass defers its
+entries; once draining, `serve` starts no more passes and exits.
+
+The journal is one JSON object per line, sequence-numbered with no gaps:
+
+```json
+{"seq":1,"at":"2026-09-23T03:00:00.000000Z","kind":"tick","origin":"socket"}
+```
+
+A runtime built with a driven time source can replay it: time then moves only
+to the recorded tick times, never to today's (see `acton_ai::clock`).
+
 ### Status, Pause, Resume, Drain
 
 The only commands that do not start a runtime: they talk to one that is already

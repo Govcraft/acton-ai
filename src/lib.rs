@@ -66,6 +66,7 @@ pub mod agent;
 pub mod audit;
 pub mod checkpoint;
 pub mod cli;
+pub mod clock;
 pub mod config;
 pub mod conversation;
 pub mod error;
@@ -140,6 +141,7 @@ pub mod prelude {
         CheckpointError, CheckpointErrorKind, CheckpointRecord, CheckpointSink, CheckpointStatus,
         ResumePlan, TurnFingerprint, TurnInputs,
     };
+    pub use crate::clock::{ClockError, ClockErrorKind, EventTime, TickOrigin, Ticked, TimeSource};
     pub use crate::config::{
         ActonAIConfig, ActonAIDefaults, AuditFileConfig, BudgetFileConfig,
         CircuitBreakerFileConfig, IntrospectionFileConfig, McpServerConfig, NamedProviderConfig,

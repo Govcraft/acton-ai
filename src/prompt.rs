@@ -1433,6 +1433,7 @@ impl PromptBuilder {
                 .runtime
                 .audit()
                 .map(|(handle, config)| (handle.clone(), config.clone())),
+            time: self.runtime.time_source().clone(),
             correlation_id: CorrelationId::new(),
             conversation_id: self.conversation_id.clone(),
             turn_id: turn_id.clone(),
@@ -1627,6 +1628,7 @@ impl PromptBuilder {
         let audit = runtime
             .audit()
             .map(|(handle, config)| (handle.clone(), config.clone()));
+        let time = runtime.time_source().clone();
 
         // Per-turn invocation counts. Owned outright by this task, so a plain
         // map: the caps are per turn, and a turn is exactly this loop.
@@ -1833,6 +1835,7 @@ impl PromptBuilder {
                             conversation_id: conversation_id.as_ref(),
                             policy: tool_policy.as_ref(),
                             audit: audit.as_ref(),
+                            time: &time,
                             resumed: true,
                         };
                         step.record_uncertain(&entry.call, &feedback).await;
@@ -1869,6 +1872,7 @@ impl PromptBuilder {
                             conversation_id: conversation_id.as_ref(),
                             policy: tool_policy.as_ref(),
                             audit: audit.as_ref(),
+                            time: &time,
                             resumed: true,
                         };
                         let (outcome, executed) =
@@ -2438,6 +2442,7 @@ impl PromptBuilder {
                             conversation_id: conversation_id.as_ref(),
                             policy: tool_policy.as_ref(),
                             audit: audit.as_ref(),
+                            time: &time,
                             resumed: turn_resumed,
                         };
 
@@ -2734,6 +2739,7 @@ impl Drop for ClaimGuard {
 #[derive(Debug, Clone)]
 struct TurnAuditContext {
     audit: Option<(ActorHandle, crate::audit::AuditConfig)>,
+    time: crate::clock::TimeSource,
     correlation_id: CorrelationId,
     conversation_id: Option<crate::types::ConversationId>,
     turn_id: TurnId,
@@ -2756,7 +2762,7 @@ impl TurnAuditContext {
             .lock()
             .map_or_else(|poisoned| *poisoned.into_inner(), |usage| *usage);
         Some(TurnRecord {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: self.time.now().to_rfc3339(),
             correlation_id: self.correlation_id.clone(),
             conversation_id: self.conversation_id.clone(),
             user: config.user().map(str::to_string),
@@ -3117,6 +3123,7 @@ fn outcome_for(error: &ActonAIError) -> &'static str {
         // errors, or a clean rollout looks like an incident.
         Kind::TurnsNotAdmitted { .. } => "turns_not_admitted",
         Kind::Checkpoint { .. } => "checkpoint",
+        Kind::Clock { .. } => "clock",
     }
 }
 
@@ -3563,6 +3570,8 @@ struct ToolStep<'a> {
     policy: Option<&'a crate::policy::ToolPolicy>,
     /// The audit log and its settings, when a trail is configured.
     audit: Option<&'a (ActorHandle, crate::audit::AuditConfig)>,
+    /// Where the audit entry's timestamp comes from.
+    time: &'a crate::clock::TimeSource,
     /// Whether the call runs inside a turn resumed from a checkpoint.
     ///
     /// Stamped onto the audit entry, so the trail distinguishes a first-run
@@ -3938,7 +3947,7 @@ impl ToolStep<'_> {
         };
 
         let record = crate::audit::InvocationRecord {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: self.time.now().to_rfc3339(),
             correlation_id: self.correlation_id.clone(),
             conversation_id: self.conversation_id.cloned(),
             user: config.user().map(str::to_owned),

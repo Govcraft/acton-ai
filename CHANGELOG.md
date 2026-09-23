@@ -3,6 +3,42 @@
 All notable changes to this project are documented in this file. The project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased
+
+### Added
+
+- **A clock actor is the one entry point for ticks.** `acton_ai::clock`
+  adds `EventTime`, a `TimeSource` (the wall clock, or a driven timeline that
+  moves only when told to), and a `ClockActor` that numbers each tick, stamps
+  it from the time source, appends it to an optional JSONL journal, and only
+  then broadcasts `Ticked`. The builder gains `time_source`, `tick_journal`,
+  and `on_tick`; the runtime gains `now`, `time_source`, `tick`, and
+  `replay_journal`, which feeds a recorded journal back through the clock
+  and moves a driven time source to each recorded tick.
+- **`acton-ai serve` and `acton-ai tick`.** `serve` stays resident and runs a
+  heartbeat pass per tick against the tick's time; `tick` asks it for one over
+  the introspection socket and exits non-zero if the tick was not recorded.
+  The wire protocol gains `Tick` / `TickAck` (additive; `SCHEMA_VERSION`
+  stays 1). A tick carries no timestamp, so a socket client cannot set the
+  process's time.
+- Heartbeat reports carry `tick` — the tick's sequence number — when a tick
+  started the pass.
+
+### Changed
+
+- **Breaking:** persistence functions that read `datetime('now')` take the
+  time instead: `save_agent_state`, `touch_session`, `create_heartbeat_entry`,
+  `list_due_entries`, `list_entries_for_session`, `update_entry_after_run`,
+  and `save_checkpoint` each gain an `EventTime` argument. What is due is now
+  decided by the runtime's timeline rather than SQLite's clock, and
+  `created_at` is bound for heartbeat entries and checkpoints because it
+  orders the due list.
+- Audit records, checkpoint rows, session activity, and heartbeat reports are
+  stamped from the runtime's `TimeSource`. `MemoryStore::spawn_with_time_source`
+  and `AuditLog::spawn_with_time_source` let an embedder do the same;
+  `spawn` keeps using the wall clock.
+- `ActonAIErrorKind` gains `Clock`.
+
 ## 0.37.0 - 2026-08-30
 
 ### Added

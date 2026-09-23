@@ -181,7 +181,7 @@ pub async fn execute(
                 persistence::save_message(&conn, &conversation_id, &record.as_message()).await?;
             }
             persistence::save_message(&conn, &conversation_id, &assistant_msg).await?;
-            persistence::touch_session(&conn, &session_name).await?;
+            persistence::touch_session(&conn, &session_name, rt.ai.now()).await?;
 
             // Output
             match output.mode() {
@@ -228,6 +228,7 @@ pub async fn execute(
                 conn: &conn,
                 conversation_id: &conversation_id,
                 session_name: &session_name,
+                time: rt.ai.time_source(),
             };
 
             let started_at = std::time::Instant::now();
@@ -242,7 +243,7 @@ pub async fn execute(
             // land here the DB is already up to date. `touch_session` is
             // idempotent and cheap — call it once more to bump the
             // last-used timestamp on clean exit.
-            persistence::touch_session(&conn, &session_name).await?;
+            persistence::touch_session(&conn, &session_name, rt.ai.now()).await?;
             let history_len = conv.history().len();
 
             if run_result.is_ok() {

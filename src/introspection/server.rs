@@ -193,7 +193,8 @@ pub(crate) async fn start_listener(
     socket_mode: u32,
 ) -> Result<acton_reactive::ipc::IpcListenerHandle, ActonAIError> {
     use crate::introspection::wire::{
-        AdmissionAck, Drain, GetStatus, Pause, Resume, StatusReport, INTROSPECTION_ACTOR_NAME,
+        AdmissionAck, Drain, GetStatus, Pause, Resume, StatusReport, Tick, TickAck,
+        INTROSPECTION_ACTOR_NAME,
     };
     use acton_reactive::prelude::RemoteRequest;
 
@@ -206,8 +207,10 @@ pub(crate) async fn start_listener(
     registry.register::<Pause>(Pause::MESSAGE_TYPE);
     registry.register::<Resume>(Resume::MESSAGE_TYPE);
     registry.register::<Drain>(Drain::MESSAGE_TYPE);
+    registry.register::<Tick>(Tick::MESSAGE_TYPE);
     registry.register::<StatusReport>("acton_ai.StatusReport");
     registry.register::<AdmissionAck>("acton_ai.AdmissionAck");
+    registry.register::<TickAck>("acton_ai.TickAck");
 
     runtime
         .ipc_expose(INTROSPECTION_ACTOR_NAME, handle)

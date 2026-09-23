@@ -19,6 +19,7 @@
 //! reply to a `send` goes nowhere.
 
 use crate::checkpoint::{CheckpointRecord, CheckpointStatus};
+use crate::clock::TimeSource;
 use crate::memory::context::{ContextStats, ContextWindow, ContextWindowConfig};
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
@@ -729,6 +730,8 @@ pub struct MemoryStore {
     /// goes through — rather than shared behind a lock, so claim and release
     /// are ordinary messages and the registry has exactly one owner.
     pub active_checkpoints: std::collections::HashSet<CheckpointId>,
+    /// Where the timestamps this store writes come from.
+    pub time: TimeSource,
     /// Metrics
     pub metrics: MemoryStoreMetrics,
 }
@@ -744,7 +747,21 @@ impl MemoryStore {
     ///
     /// A handle to the spawned Memory Store actor.
     pub async fn spawn(runtime: &mut ActorRuntime) -> ActorHandle {
+        Self::spawn_with_time_source(runtime, TimeSource::system()).await
+    }
+
+    /// Spawns the Memory Store actor, stamping what it writes from `time`.
+    ///
+    /// Use this with the runtime's own
+    /// [`time_source`](crate::facade::ActonAI::time_source) so the rows this
+    /// store writes carry the same times as everything else the runtime
+    /// records — including during a replay, when that is not today.
+    pub async fn spawn_with_time_source(
+        runtime: &mut ActorRuntime,
+        time: TimeSource,
+    ) -> ActorHandle {
         let mut builder = runtime.new_actor_with_name::<MemoryStore>("memory_store".to_string());
+        builder.model.time = time;
 
         // Set up lifecycle hooks
         builder
@@ -862,6 +879,7 @@ fn configure_checkpoint_write_handlers(builder: &mut ManagedActor<Idle, MemorySt
     builder.mutate_on::<SaveCheckpoint>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let record = envelope.message().record.clone();
+        let now = actor.model.time.now();
 
         let conn = match actor.model.ready_connection() {
             Ok(conn) => conn,
@@ -869,7 +887,7 @@ fn configure_checkpoint_write_handlers(builder: &mut ManagedActor<Idle, MemorySt
         };
 
         attached(async move {
-            let result = persistence::save_checkpoint(&conn, &record).await;
+            let result = persistence::save_checkpoint(&conn, &record, now).await;
             log_failure("save_checkpoint", &result);
             reply.send(CheckpointSaved { result }).await;
         })
@@ -1253,9 +1271,10 @@ fn configure_session_write_handlers(builder: &mut ManagedActor<Idle, MemoryStore
     builder.mutate_on::<TouchSession>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let name = envelope.message().name.clone();
+        let now = actor.model.time.now();
 
         session_operation(&actor.model, reply, "touch_session", move |conn| {
-            Box::pin(async move { persistence::touch_session(&conn, &name).await })
+            Box::pin(async move { persistence::touch_session(&conn, &name, now).await })
         })
     });
 
@@ -1336,6 +1355,7 @@ fn configure_state_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
     builder.mutate_on::<SaveAgentState>(|actor, envelope| {
         let reply = envelope.reply_envelope();
         let snapshot = envelope.message().snapshot.clone();
+        let now = actor.model.time.now();
 
         let conn = match actor.model.ready_connection() {
             Ok(conn) => conn,
@@ -1358,7 +1378,7 @@ fn configure_state_handlers(builder: &mut ManagedActor<Idle, MemoryStore>) {
             .fetch_add(1, Ordering::Relaxed);
 
         attached(async move {
-            let result = persistence::save_agent_state(&conn, &snapshot).await;
+            let result = persistence::save_agent_state(&conn, &snapshot, now).await;
             log_failure("save_agent_state", &result);
             reply
                 .send(OperationCompleted {

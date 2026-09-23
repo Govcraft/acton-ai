@@ -310,6 +310,11 @@ pub enum ActonAIErrorKind {
         /// What went wrong, already rendered.
         reason: String,
     },
+    /// The clock refused a tick or a replay, or could not reach its journal.
+    Clock {
+        /// The clock's own error.
+        error: crate::clock::ClockError,
+    },
 }
 
 /// One provider's turn in a failover chain, and how it ended.
@@ -493,6 +498,18 @@ impl ActonAIError {
         })
     }
 
+    /// Creates a clock error.
+    #[must_use]
+    pub fn clock(error: crate::clock::ClockError) -> Self {
+        Self::new(ActonAIErrorKind::Clock { error })
+    }
+
+    /// Returns true if the clock refused a tick or a replay.
+    #[must_use]
+    pub fn is_clock(&self) -> bool {
+        matches!(self.kind, ActonAIErrorKind::Clock { .. })
+    }
+
     /// Returns true if this error concerns a turn checkpoint.
     #[must_use]
     pub fn is_checkpoint(&self) -> bool {
@@ -613,6 +630,7 @@ impl fmt::Display for ActonAIError {
                 Some(id) => write!(f, "checkpoint {id}: {reason}"),
                 None => write!(f, "checkpoint: {reason}"),
             },
+            ActonAIErrorKind::Clock { error } => write!(f, "clock: {error}"),
             ActonAIErrorKind::AllProvidersFailed { attempts } => {
                 write!(
                     f,
@@ -672,6 +690,17 @@ mod tests {
         let message = error.to_string();
         assert!(message.contains("web_search"));
         assert!(message.contains("connection timeout"));
+    }
+
+    #[test]
+    fn acton_ai_error_clock_carries_the_clock_error() {
+        let error = ActonAIError::clock(crate::clock::ClockError::out_of_sequence(2, 4));
+
+        assert!(error.is_clock());
+        assert!(!error.is_configuration());
+        let message = error.to_string();
+        assert!(message.starts_with("clock: "), "{message}");
+        assert!(message.contains("entry 4"), "{message}");
     }
 
     // ActonAIError tests

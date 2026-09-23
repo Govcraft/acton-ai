@@ -190,7 +190,7 @@ pub async fn execute(
                 .await?;
         }
         crate::memory::persistence::save_message(&conn, &conversation_id, &assistant_msg).await?;
-        crate::memory::persistence::touch_session(&conn, session_name).await?;
+        crate::memory::persistence::touch_session(&conn, session_name, rt.ai.now()).await?;
     }
 
     // Step 10: Shutdown

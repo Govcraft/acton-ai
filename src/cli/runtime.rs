@@ -24,7 +24,7 @@
 use crate::cli::error::CliError;
 use crate::cli::output::OutputWriter;
 use crate::config;
-use crate::facade::ActonAI;
+use crate::facade::{ActonAI, ActonAIBuilder};
 use crate::memory::persistence::{initialize_schema, open_database};
 use crate::memory::PersistenceConfig;
 use libsql::Connection;
@@ -55,6 +55,23 @@ impl CliRuntime {
         config_path: Option<&PathBuf>,
         provider_override: Option<&str>,
         skill_paths: &[PathBuf],
+    ) -> Result<Self, CliError> {
+        Self::with_builder(config_path, provider_override, skill_paths, |builder| {
+            builder
+        })
+        .await
+    }
+
+    /// As [`new`](Self::new), with a last word on the builder before launch.
+    ///
+    /// `customize` runs after the config file, the provider override, and the
+    /// CLI's own settings are applied, so what it sets wins. `serve` uses it to
+    /// subscribe to ticks and to name the tick journal.
+    pub async fn with_builder(
+        config_path: Option<&PathBuf>,
+        provider_override: Option<&str>,
+        skill_paths: &[PathBuf],
+        customize: impl FnOnce(ActonAIBuilder) -> ActonAIBuilder,
     ) -> Result<Self, CliError> {
         // Load config — try explicit path first, then default search paths.
         // Track the source path so we can log it at info level for operators
@@ -145,6 +162,7 @@ impl CliRuntime {
         // has already run a tool has already changed the world. Nothing here
         // needs a socket — the gate is in-process state.
         builder = builder.drain_on_sigterm();
+        builder = customize(builder);
 
         let ai = builder.launch().await?;
 

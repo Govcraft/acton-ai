@@ -1,5 +1,5 @@
-//! The `status`, `pause`, `resume`, and `drain` commands — talking to a
-//! running process over its control socket.
+//! The `status`, `pause`, `resume`, `drain`, and `tick` commands — talking to
+//! a running process over its control socket.
 //!
 //! These are the only commands that do not start a runtime of their own. They
 //! connect to one that is already running, which is what makes them usable
@@ -70,6 +70,13 @@ pub struct DrainArgs {
     pub timeout: u64,
 }
 
+/// Options for `acton-ai tick`.
+#[derive(Debug, clap::Args)]
+pub struct TickArgs {
+    #[command(flatten)]
+    pub socket: SocketArgs,
+}
+
 /// How long `drain --wait` waits before reporting the turns still running.
 ///
 /// Five minutes is longer than almost any single turn and shorter than a
@@ -132,6 +139,22 @@ pub async fn execute_drain(
 
     let ack = wait_for_drain(&socket, ack, args.timeout, output).await?;
     write_ack(output, &ack, "drained")
+}
+
+/// Executes `acton-ai tick`.
+///
+/// Fails — and so exits non-zero — when the process could not record the
+/// tick, so the timer unit that fired it shows as failed rather than
+/// reporting success for a tick that never reached the journal.
+pub async fn execute_tick(
+    args: &TickArgs,
+    output: &OutputWriter,
+    config_path: Option<&PathBuf>,
+) -> Result<(), CliError> {
+    let socket = resolve_socket(args.socket.socket.as_deref(), config_path)?;
+    let ack = ask_tick(&socket).await?;
+    write_tick_ack(output, &ack)?;
+    tick_outcome(&ack)
 }
 
 /// Resolves which socket to talk to.
@@ -265,6 +288,43 @@ fn write_ack(
         }
     }
     Ok(())
+}
+
+/// Renders a tick acknowledgement in whichever form was asked for.
+#[cfg(all(feature = "ipc", unix))]
+fn write_tick_ack(
+    output: &OutputWriter,
+    ack: &crate::introspection::TickAck,
+) -> Result<(), CliError> {
+    use crate::cli::output::OutputMode;
+
+    match output.mode() {
+        OutputMode::Json => output.write_json(ack)?,
+        OutputMode::Plain => match (ack.seq, ack.at.as_deref(), ack.error.as_deref()) {
+            (Some(seq), Some(at), None) => output.write_line(&format!(
+                "tick {seq} recorded at {at} (admission: {})",
+                ack.admission
+            ))?,
+            _ => output.write_line(&format!(
+                "tick not recorded: {} (admission: {})",
+                ack.error.as_deref().unwrap_or("no reason given"),
+                ack.admission
+            ))?,
+        },
+    }
+    Ok(())
+}
+
+/// Turns a refused tick into a failing exit.
+#[cfg(all(feature = "ipc", unix))]
+fn tick_outcome(ack: &crate::introspection::TickAck) -> Result<(), CliError> {
+    if ack.is_recorded() {
+        return Ok(());
+    }
+    Err(CliError::configuration(format!(
+        "the process did not record the tick: {}",
+        ack.error.as_deref().unwrap_or("no reason given")
+    )))
 }
 
 /// Renders a status report in whichever form was asked for.
@@ -407,8 +467,8 @@ mod client {
     use super::{CliError, Path, DRAIN_POLL_INTERVAL};
     use crate::cli::output::{OutputMode, OutputWriter};
     use crate::introspection::wire::{
-        AdmissionAck, Drain, GetStatus, Pause, Resume, StatusReport, INTROSPECTION_ACTOR_NAME,
-        SCHEMA_VERSION,
+        AdmissionAck, Drain, GetStatus, Pause, Resume, StatusReport, Tick, TickAck,
+        INTROSPECTION_ACTOR_NAME, SCHEMA_VERSION,
     };
     use acton_reactive::ipc::IpcClient;
     // Via the actor framework's re-export: `tokio` is not a direct dependency
@@ -517,6 +577,18 @@ mod client {
             .map_err(|error| remote_error(socket, "drain", &error))
     }
 
+    /// Asks a running process to record a tick.
+    pub(super) async fn ask_tick(socket: &Path) -> Result<TickAck, CliError> {
+        let client = connect(socket).await?;
+        let ack: TickAck = client
+            .actor(INTROSPECTION_ACTOR_NAME)
+            .ask(Tick)
+            .await
+            .map_err(|error| remote_error(socket, "tick", &error))?;
+        warn_on_newer_schema(None, ack.schema_version);
+        Ok(ack)
+    }
+
     /// Polls until no turns are in flight, or the timeout expires.
     ///
     /// `timeout_secs` of 0 waits indefinitely, which is what a supervisor with
@@ -567,7 +639,7 @@ mod client {
 }
 
 #[cfg(all(feature = "ipc", unix))]
-use client::{ask_drain, ask_pause, ask_resume, ask_status, wait_for_drain};
+use client::{ask_drain, ask_pause, ask_resume, ask_status, ask_tick, wait_for_drain};
 
 /// The stand-ins a build without the `ipc` feature gets.
 ///
@@ -604,6 +676,10 @@ mod stub {
         Err(unsupported("drain"))
     }
 
+    pub(super) async fn ask_tick(_socket: &Path) -> Result<Unsupported, CliError> {
+        Err(unsupported("tick"))
+    }
+
     pub(super) async fn wait_for_drain(
         _socket: &Path,
         _first: Unsupported,
@@ -621,7 +697,7 @@ mod stub {
 }
 
 #[cfg(not(all(feature = "ipc", unix)))]
-use stub::{ask_drain, ask_pause, ask_resume, ask_status, wait_for_drain, Unsupported};
+use stub::{ask_drain, ask_pause, ask_resume, ask_status, ask_tick, wait_for_drain, Unsupported};
 
 /// Statically unreachable: `ask_*` never returns an [`Unsupported`], so this
 /// exists only to keep the command bodies identical across both builds.
@@ -634,6 +710,18 @@ fn write_ack(_output: &OutputWriter, ack: &Unsupported, _summary: &str) -> Resul
 #[cfg(not(all(feature = "ipc", unix)))]
 fn write_status(_output: &OutputWriter, report: &Unsupported) -> Result<(), CliError> {
     match *report {}
+}
+
+/// Statically unreachable, for the same reason as [`write_ack`].
+#[cfg(not(all(feature = "ipc", unix)))]
+fn write_tick_ack(_output: &OutputWriter, ack: &Unsupported) -> Result<(), CliError> {
+    match *ack {}
+}
+
+/// Statically unreachable, for the same reason as [`write_ack`].
+#[cfg(not(all(feature = "ipc", unix)))]
+fn tick_outcome(ack: &Unsupported) -> Result<(), CliError> {
+    match *ack {}
 }
 
 #[cfg(test)]

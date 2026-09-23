@@ -7,6 +7,7 @@
 use crate::checkpoint::{
     decode_row, encode_record, CheckpointColumns, CheckpointRecord, CheckpointStatus,
 };
+use crate::clock::EventTime;
 use crate::memory::embeddings::{Embedding, Memory, ScoredMemory};
 use crate::memory::error::PersistenceError;
 use crate::messages::{Message, MessageRole};
@@ -503,6 +504,7 @@ pub async fn get_latest_conversation(
 ///
 /// * `conn` - The database connection
 /// * `snapshot` - The agent state snapshot to save
+/// * `now` - The time recorded as `updated_at`
 ///
 /// # Errors
 ///
@@ -510,14 +512,15 @@ pub async fn get_latest_conversation(
 pub async fn save_agent_state(
     conn: &Connection,
     snapshot: &AgentStateSnapshot,
+    now: EventTime,
 ) -> Result<(), PersistenceError> {
     let state_json = serde_json::to_string(snapshot)
         .map_err(|e| PersistenceError::serialization_failed(e.to_string()))?;
 
     conn.execute(
         "INSERT OR REPLACE INTO agent_state (agent_id, state, updated_at)
-         VALUES (?1, ?2, datetime('now'))",
-        [snapshot.agent_id.to_string(), state_json],
+         VALUES (?1, ?2, ?3)",
+        [snapshot.agent_id.to_string(), state_json, now.to_sql()],
     )
     .await
     .map_err(|e| PersistenceError::query_failed("save_agent_state", e.to_string()))?;
@@ -1136,11 +1139,15 @@ pub async fn delete_session(conn: &Connection, name: &str) -> Result<(), Persist
     Ok(())
 }
 
-/// Updates the last_active timestamp for a session.
-pub async fn touch_session(conn: &Connection, name: &str) -> Result<(), PersistenceError> {
+/// Sets a session's `last_active` to `now`.
+pub async fn touch_session(
+    conn: &Connection,
+    name: &str,
+    now: EventTime,
+) -> Result<(), PersistenceError> {
     conn.execute(
-        "UPDATE sessions SET last_active = datetime('now') WHERE name = ?1",
-        [name.to_string()],
+        "UPDATE sessions SET last_active = ?2 WHERE name = ?1",
+        [name.to_string(), now.to_sql()],
     )
     .await
     .map_err(|e| PersistenceError::query_failed("touch_session", e.to_string()))?;
@@ -1222,18 +1229,22 @@ pub async fn create_heartbeat_entry(
     summary: &str,
     schedule: Option<&str>,
     tools: Option<&str>,
+    now: EventTime,
 ) -> Result<String, PersistenceError> {
     let id = format!("hb_{}", MemoryId::new());
 
+    // `created_at` is bound rather than defaulted because it orders the due
+    // list, and the order entries run in is part of what a replay reproduces.
     conn.execute(
-        "INSERT INTO heartbeat_entries (id, session_name, summary, schedule, tools)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
+        "INSERT INTO heartbeat_entries (id, session_name, summary, schedule, tools, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         libsql::params![
             id.clone(),
             session_name.to_string(),
             summary.to_string(),
             schedule.map(|s| s.to_string()),
             tools.map(|s| s.to_string()),
+            now.to_sql(),
         ],
     )
     .await
@@ -1242,15 +1253,23 @@ pub async fn create_heartbeat_entry(
     Ok(id)
 }
 
-/// Lists all due heartbeat entries (active entries where next_due <= now or next_due is null).
-pub async fn list_due_entries(conn: &Connection) -> Result<Vec<HeartbeatEntry>, PersistenceError> {
+/// Lists the heartbeat entries due at `now`: active, with a `next_due` at or
+/// before `now` or none at all.
+///
+/// `now` is an argument rather than SQLite's `datetime('now')` so that what
+/// counts as due is decided by the runtime's timeline — a replayed tick asks
+/// "what was due then", not "what is due today".
+pub async fn list_due_entries(
+    conn: &Connection,
+    now: EventTime,
+) -> Result<Vec<HeartbeatEntry>, PersistenceError> {
     let mut rows = conn
         .query(
             "SELECT id, session_name, summary, schedule, tools, last_run, next_due, status, created_at
              FROM heartbeat_entries
-             WHERE status = 'active' AND (next_due IS NULL OR next_due <= datetime('now'))
+             WHERE status = 'active' AND (next_due IS NULL OR next_due <= ?1)
              ORDER BY created_at ASC",
-            (),
+            [now.to_sql()],
         )
         .await
         .map_err(|e| PersistenceError::query_failed("list_due_entries", e.to_string()))?;
@@ -1266,19 +1285,22 @@ pub async fn list_due_entries(conn: &Connection) -> Result<Vec<HeartbeatEntry>, 
     Ok(entries)
 }
 
-/// Lists heartbeat entries for a specific session.
+/// Lists the heartbeat entries of one session that are due at `now`.
+///
+/// See [`list_due_entries`] for why `now` is an argument.
 pub async fn list_entries_for_session(
     conn: &Connection,
     session_name: &str,
+    now: EventTime,
 ) -> Result<Vec<HeartbeatEntry>, PersistenceError> {
     let mut rows = conn
         .query(
             "SELECT id, session_name, summary, schedule, tools, last_run, next_due, status, created_at
              FROM heartbeat_entries
              WHERE session_name = ?1 AND status = 'active'
-             AND (next_due IS NULL OR next_due <= datetime('now'))
+             AND (next_due IS NULL OR next_due <= ?2)
              ORDER BY created_at ASC",
-            [session_name.to_string()],
+            [session_name.to_string(), now.to_sql()],
         )
         .await
         .map_err(|e| PersistenceError::query_failed("list_entries_for_session", e.to_string()))?;
@@ -1294,15 +1316,20 @@ pub async fn list_entries_for_session(
     Ok(entries)
 }
 
-/// Updates a heartbeat entry after execution.
+/// Records that a heartbeat entry ran at `ran_at`, and when it is next due.
 pub async fn update_entry_after_run(
     conn: &Connection,
     id: &str,
     next_due: Option<&str>,
+    ran_at: EventTime,
 ) -> Result<(), PersistenceError> {
     conn.execute(
-        "UPDATE heartbeat_entries SET last_run = datetime('now'), next_due = ?2 WHERE id = ?1",
-        libsql::params![id.to_string(), next_due.map(|s| s.to_string()),],
+        "UPDATE heartbeat_entries SET last_run = ?3, next_due = ?2 WHERE id = ?1",
+        libsql::params![
+            id.to_string(),
+            next_due.map(|s| s.to_string()),
+            ran_at.to_sql()
+        ],
     )
     .await
     .map_err(|e| PersistenceError::query_failed("update_entry_after_run", e.to_string()))?;
@@ -1558,7 +1585,8 @@ const CHECKPOINT_COLUMNS: &str = "id, conversation_id, fingerprint, format_versi
 /// An upsert rather than an insert: a turn writes its checkpoint after every
 /// round, and the point of the record is the latest progress, not a history of
 /// it. `created_at` survives the update so the row still says when the turn
-/// first started.
+/// first started. `now` is written as `updated_at`, and as `created_at` on the
+/// first save.
 ///
 /// # Errors
 ///
@@ -1566,6 +1594,7 @@ const CHECKPOINT_COLUMNS: &str = "id, conversation_id, fingerprint, format_versi
 pub async fn save_checkpoint(
     conn: &Connection,
     record: &CheckpointRecord,
+    now: EventTime,
 ) -> Result<(), PersistenceError> {
     let columns =
         encode_record(record).map_err(|e| PersistenceError::serialization_failed(e.to_string()))?;
@@ -1574,8 +1603,8 @@ pub async fn save_checkpoint(
         "INSERT INTO turn_checkpoints
              (id, conversation_id, fingerprint, format_version, status, rounds_completed,
               token_count, usage, messages, tool_calls, final_text, stop_reason,
-              structured_output, pending_round, resume_attempts)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
+              structured_output, pending_round, resume_attempts, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?16)
          ON CONFLICT(id) DO UPDATE SET
              conversation_id = excluded.conversation_id,
              fingerprint = excluded.fingerprint,
@@ -1591,7 +1620,7 @@ pub async fn save_checkpoint(
              structured_output = excluded.structured_output,
              pending_round = excluded.pending_round,
              resume_attempts = excluded.resume_attempts,
-             updated_at = datetime('now')",
+             updated_at = excluded.updated_at",
         libsql::params![
             columns.id,
             columns.conversation_id,
@@ -1608,6 +1637,7 @@ pub async fn save_checkpoint(
             columns.structured_output,
             columns.pending_round,
             columns.resume_attempts,
+            now.to_sql(),
         ],
     )
     .await
@@ -1852,6 +1882,79 @@ CREATE TABLE IF NOT EXISTS sessions (
             .expect("a version row exists");
         let version: i64 = row.get(0).expect("the version is an integer");
         u32::try_from(version).expect("the version is small")
+    }
+
+    fn at(text: &str) -> EventTime {
+        EventTime::parse_rfc3339(text).expect("a valid timestamp")
+    }
+
+    #[tokio::test]
+    async fn what_is_due_is_decided_by_the_time_passed_in() {
+        let conn = fresh_connection().await;
+        create_session(&conn, "main", &AgentId::new(), None, None)
+            .await
+            .expect("creating succeeds");
+        let id = create_heartbeat_entry(
+            &conn,
+            "main",
+            "check the disk",
+            None,
+            None,
+            at("2026-01-01T00:00:00Z"),
+        )
+        .await
+        .expect("creating succeeds");
+
+        // Ran on the 1st, next due on the 3rd.
+        update_entry_after_run(
+            &conn,
+            &id,
+            Some("2026-01-03 00:00:00"),
+            at("2026-01-01T09:30:00Z"),
+        )
+        .await
+        .expect("updating succeeds");
+
+        // Dates chosen far from today, so a comparison against SQLite's own
+        // clock would give the opposite answer to both of these.
+        let on_the_2nd = list_due_entries(&conn, at("2026-01-02T00:00:00Z"))
+            .await
+            .expect("listing succeeds");
+        assert!(on_the_2nd.is_empty(), "not due yet on the 2nd");
+
+        let on_the_3rd = list_due_entries(&conn, at("2026-01-03T00:00:00Z"))
+            .await
+            .expect("listing succeeds");
+        assert_eq!(on_the_3rd.len(), 1, "due exactly at next_due");
+        assert_eq!(
+            on_the_3rd[0].last_run.as_deref(),
+            Some("2026-01-01 09:30:00")
+        );
+        assert_eq!(on_the_3rd[0].created_at, "2026-01-01 00:00:00");
+
+        let for_session = list_entries_for_session(&conn, "main", at("2026-01-02T00:00:00Z"))
+            .await
+            .expect("listing succeeds");
+        assert!(for_session.is_empty(), "the per-session query agrees");
+    }
+
+    #[tokio::test]
+    async fn touching_a_session_records_the_time_passed_in() {
+        let conn = fresh_connection().await;
+        create_session(&conn, "main", &AgentId::new(), None, None)
+            .await
+            .expect("creating succeeds");
+        touch_session(&conn, "main", at("2030-06-01T12:00:00Z"))
+            .await
+            .expect("touching succeeds");
+
+        let session = list_sessions(&conn)
+            .await
+            .expect("listing succeeds")
+            .into_iter()
+            .find(|s| s.name == "main")
+            .expect("the session exists");
+        assert_eq!(session.last_active, "2030-06-01 12:00:00");
     }
 
     #[tokio::test]

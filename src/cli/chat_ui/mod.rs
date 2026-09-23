@@ -81,6 +81,8 @@ pub struct PersistCtx<'a> {
     pub conn: &'a Connection,
     pub conversation_id: &'a ConversationId,
     pub session_name: &'a str,
+    /// Where `last_active` is read from — the runtime's own timeline.
+    pub time: &'a crate::clock::TimeSource,
 }
 
 /// Options bag for [`run`]. Passing a struct keeps the signature stable as
@@ -528,7 +530,7 @@ async fn flush_new_messages(
             .await
             .map_err(|e| ActonAIError::prompt_failed(format!("failed to save message: {e}")))?;
     }
-    persistence::touch_session(ctx.conn, ctx.session_name)
+    persistence::touch_session(ctx.conn, ctx.session_name, ctx.time.now())
         .await
         .map_err(|e| ActonAIError::prompt_failed(format!("failed to touch session: {e}")))?;
     *cursor = history.len();

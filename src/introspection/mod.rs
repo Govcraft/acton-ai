@@ -80,7 +80,7 @@ pub use actor::IntrospectionActor;
 #[cfg(all(feature = "ipc", unix))]
 pub use wire::{
     AdmissionAck, BudgetStanding, Drain, GetStatus, McpServerStatus, Pause, ProviderStatus, Resume,
-    StatusReport, UsageSummary, INTROSPECTION_ACTOR_NAME, SCHEMA_VERSION,
+    StatusReport, Tick, TickAck, UsageSummary, INTROSPECTION_ACTOR_NAME, SCHEMA_VERSION,
 };
 
 /// Validated introspection settings.

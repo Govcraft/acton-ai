@@ -1,12 +1,15 @@
 //! The `heartbeat` command — autonomous wake-up cycle.
 //!
-//! Triggered by a systemd timer (or cron), the heartbeat reviews stored
-//! heartbeat entries, references session context, executes due tasks
-//! autonomously, and outputs a JSON activity report.
+//! The heartbeat reviews stored heartbeat entries, references session
+//! context, executes due tasks autonomously, and outputs a JSON activity
+//! report. One pass is `run_pass`: `acton-ai heartbeat` runs one against the
+//! runtime's current time and exits, and `acton-ai serve` runs one per tick,
+//! against the tick's time.
 
 use crate::cli::error::CliError;
 use crate::cli::output::OutputWriter;
 use crate::cli::runtime::CliRuntime;
+use crate::clock::EventTime;
 use crate::memory::persistence;
 use serde::Serialize;
 use std::path::PathBuf;
@@ -42,9 +45,18 @@ struct EntryResult {
 
 /// Top-level JSON report emitted by the heartbeat command.
 #[derive(Debug, Serialize)]
-struct HeartbeatReport {
+pub(crate) struct HeartbeatReport {
     /// ISO 8601 timestamp of when the heartbeat ran.
+    ///
+    /// The time the pass acted on: the tick's time under `serve`, the
+    /// runtime's current time for a one-shot `heartbeat`. It is also what
+    /// "due" was decided against and what each entry's `last_run` records.
     timestamp: String,
+    /// The tick this pass handled, when it was started by one.
+    ///
+    /// Joins a report to its line in the tick journal.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tick: Option<u64>,
     /// How many entries were processed.
     entries_processed: usize,
     /// How many due entries were left unattempted because the runtime stopped
@@ -66,13 +78,33 @@ pub async fn execute(
     provider_override: Option<&str>,
 ) -> Result<(), CliError> {
     let rt = CliRuntime::new(config_path, provider_override, &[]).await?;
+    let report = run_pass(&rt, args.session.as_deref(), rt.ai.now(), None, output).await?;
+    output.write_json(&report)?;
+
+    rt.shutdown().await?;
+    Ok(())
+}
+
+/// Runs every entry due at `at`, and reports what happened.
+///
+/// `at` is the only time the pass reads: it decides which entries are due and
+/// is recorded as their `last_run`. Passing a tick's time rather than reading
+/// the clock is what makes a pass for a late or replayed tick do what it
+/// would have done on time.
+pub(crate) async fn run_pass(
+    rt: &CliRuntime,
+    session: Option<&str>,
+    at: EventTime,
+    tick: Option<u64>,
+    output: &OutputWriter,
+) -> Result<HeartbeatReport, CliError> {
     let conn = rt.connection().await?;
 
     // Query due entries — either all or filtered by session.
-    let entries = if let Some(ref session_name) = args.session {
-        persistence::list_entries_for_session(&conn, session_name).await?
+    let entries = if let Some(session_name) = session {
+        persistence::list_entries_for_session(&conn, session_name, at).await?
     } else {
-        persistence::list_due_entries(&conn).await?
+        persistence::list_due_entries(&conn, at).await?
     };
 
     let _ = output.status(&format!("heartbeat: {} due entries found", entries.len()));
@@ -93,21 +125,17 @@ pub async fn execute(
             ));
             break;
         }
-        let result = process_entry(&rt, &conn, entry, output).await;
+        let result = process_entry(rt, &conn, entry, at, output).await;
         results.push(result);
     }
 
-    let report = HeartbeatReport {
-        timestamp: chrono::Utc::now().to_rfc3339(),
+    Ok(HeartbeatReport {
+        timestamp: at.to_rfc3339(),
+        tick,
         entries_processed: results.len(),
         entries_deferred: deferred,
         results,
-    };
-
-    output.write_json(&report)?;
-
-    rt.shutdown().await?;
-    Ok(())
+    })
 }
 
 /// Build the system prompt for a heartbeat task execution.
@@ -158,6 +186,7 @@ async fn process_entry(
     rt: &CliRuntime,
     conn: &libsql::Connection,
     entry: &persistence::HeartbeatEntry,
+    at: EventTime,
     output: &OutputWriter,
 ) -> EntryResult {
     let _ = output.status(&format!(
@@ -169,7 +198,7 @@ async fn process_entry(
     match execute_entry(rt, conn, entry).await {
         Ok((response_text, token_count)) => {
             // Update the database based on the schedule.
-            let db_result = update_entry_status(conn, entry).await;
+            let db_result = update_entry_status(conn, entry, at).await;
             if let Err(e) = db_result {
                 let _ = output.error(&format!(
                     "failed to update entry {} after run: {e}",
@@ -241,6 +270,7 @@ async fn execute_entry(
 async fn update_entry_status(
     conn: &libsql::Connection,
     entry: &persistence::HeartbeatEntry,
+    ran_at: EventTime,
 ) -> Result<(), CliError> {
     let is_once = entry
         .schedule
@@ -251,7 +281,7 @@ async fn update_entry_status(
         persistence::complete_entry(conn, &entry.id).await?;
     } else {
         // Recurring: mark as run, clear next_due so it becomes due again next cycle.
-        persistence::update_entry_after_run(conn, &entry.id, None).await?;
+        persistence::update_entry_after_run(conn, &entry.id, None, ran_at).await?;
     }
 
     Ok(())
@@ -319,6 +349,7 @@ mod tests {
     fn heartbeat_report_serializes_to_json() {
         let report = HeartbeatReport {
             timestamp: "2026-03-18T12:00:00+00:00".to_string(),
+            tick: None,
             entries_processed: 1,
             entries_deferred: 0,
             results: vec![EntryResult {

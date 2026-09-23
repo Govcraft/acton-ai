@@ -28,6 +28,9 @@
 //! - [`Pause`]/[`Resume`]/[`Drain`] are `act_on` as well: they write through
 //!   the [`AdmissionGate`], whose own atomic does the serialising, and read
 //!   the in-flight count for their ack.
+//! - [`Tick`] is `act_on` for the same reason [`GetStatus`] is: it asks the
+//!   [`ClockActor`](crate::clock::ClockActor), which does the sequencing. This
+//!   actor only forwards; it never stamps a time of its own.
 
 use std::collections::HashMap;
 use std::time::Instant;
@@ -35,9 +38,10 @@ use std::time::Instant;
 use acton_reactive::prelude::*;
 
 use crate::accounting::{GetUsage, UsageSnapshot};
+use crate::clock::{RecordTick, TickOrigin, TickRecorded};
 use crate::introspection::wire::{
     AdmissionAck, BudgetStanding, Drain, GetStatus, McpServerStatus, Pause, ProviderStatus, Resume,
-    StatusReport, UsageSummary, SCHEMA_VERSION,
+    StatusReport, Tick, TickAck, UsageSummary, SCHEMA_VERSION,
 };
 use crate::introspection::AdmissionGate;
 use crate::llm::{CheckHealth, ProviderHealth};
@@ -75,6 +79,11 @@ pub(crate) struct StatusSources {
     /// `Clone`, and say nothing a status report needs. A `SupervisedChild` is
     /// a cheap handle over a watch channel, which is all this reads.
     pub(crate) mcp: HashMap<String, SupervisedChild>,
+    /// The clock, which socket ticks are forwarded to.
+    ///
+    /// `Option` only because the struct must be `Default`; a launched runtime
+    /// always has one.
+    pub(crate) clock: Option<ActorHandle>,
     /// The runtime's `app_name`.
     pub(crate) app_name: String,
 }
@@ -264,9 +273,48 @@ impl IntrospectionActor {
             })
         });
 
+        builder.act_on::<Tick>(|actor, envelope| {
+            let reply = envelope.reply_envelope();
+            let clock = actor.model.sources.clock.clone();
+            let admission = actor.model.gate.state().as_str().to_string();
+            Reply::pending(async move {
+                reply.send(forward_tick(clock, admission).await).await;
+            })
+        });
+
         builder.handle().subscribe::<TurnLifecycle>().await;
 
         builder.start().await
+    }
+}
+
+/// Hands a socket tick to the clock and turns its answer into an ack.
+///
+/// Bounded by [`COLLABORATOR_TIMEOUT`], like every other ask this actor
+/// makes: a wedged clock must produce a refusal the timer's log can show,
+/// not a hung `acton-ai tick`.
+async fn forward_tick(clock: Option<ActorHandle>, admission: String) -> TickAck {
+    let Some(clock) = clock else {
+        return TickAck::refused(admission, "this process has no clock to tick");
+    };
+    let answer: Result<TickRecorded, _> = clock
+        .ask_with_timeout(
+            RecordTick {
+                origin: TickOrigin::Socket,
+            },
+            COLLABORATOR_TIMEOUT,
+        )
+        .await;
+    match answer {
+        Ok(TickRecorded { result: Ok(ticked) }) => {
+            tracing::info!(seq = ticked.seq, at = %ticked.at, "tick recorded over introspection");
+            TickAck::recorded(ticked.seq, ticked.at.to_rfc3339(), admission)
+        }
+        Ok(TickRecorded { result: Err(error) }) => TickAck::refused(admission, error.to_string()),
+        Err(error) => TickAck::refused(
+            admission,
+            format!("the clock did not answer ({error}); the tick was not recorded"),
+        ),
     }
 }
 

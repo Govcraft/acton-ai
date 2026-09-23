@@ -116,6 +116,28 @@ pub enum Commands {
     /// Tell a paused or draining process to admit turns again.
     Resume(commands::introspect::ResumeArgs),
 
+    /// Stay resident and run the heartbeat once per tick.
+    #[command(
+        long_about = "Launch once and run a heartbeat pass each time a tick arrives \
+                            on the introspection socket, instead of starting a whole \
+                            process per wake-up. A systemd timer fires `acton-ai tick`; \
+                            each pass runs what was due at the tick's time.\n\n\
+                            Needs an [introspection] section with a socket_path, so the \
+                            timer's `acton-ai tick` can find the process. With \
+                            --tick-journal, every tick is recorded before any work starts."
+    )]
+    Serve(commands::serve::ServeArgs),
+
+    /// Tell a running process that time has passed.
+    #[command(
+        long_about = "Ask a running `acton-ai serve` process to record a tick. The \
+                            process stamps the tick with its own clock — this command \
+                            cannot choose the time — journals it, and runs whatever is \
+                            due. Exits non-zero when the tick was not recorded, so the \
+                            timer unit that fired it shows as failed."
+    )]
+    Tick(commands::introspect::TickArgs),
+
     /// Stop admitting new turns and report when the last one finishes.
     #[command(
         long_about = "Stop a running process admitting new turns and report how \
@@ -167,6 +189,12 @@ pub async fn run(cli: Cli) -> i32 {
         Commands::Drain(args) => {
             commands::introspect::execute_drain(args, &output, config_path).await
         }
+        Commands::Serve(args) => {
+            commands::serve::execute(args, &output, config_path, provider).await
+        }
+        Commands::Tick(args) => {
+            commands::introspect::execute_tick(args, &output, config_path).await
+        }
     };
 
     match result {
@@ -197,7 +225,7 @@ mod tests {
         // These four strings appear in the module docs, the README, and every
         // systemd unit anyone writes. Renaming a subcommand is a breaking
         // change to an interface with no compiler to catch it.
-        for name in ["status", "pause", "resume", "drain"] {
+        for name in ["status", "pause", "resume", "drain", "tick"] {
             let cli = Cli::try_parse_from(["acton-ai", name]).expect("{name} should parse");
             let parsed = matches!(
                 (&cli.command, name),
@@ -205,6 +233,7 @@ mod tests {
                     | (Commands::Pause(_), "pause")
                     | (Commands::Resume(_), "resume")
                     | (Commands::Drain(_), "drain")
+                    | (Commands::Tick(_), "tick")
             );
             assert!(parsed, "`acton-ai {name}` dispatched to the wrong command");
         }
@@ -212,10 +241,31 @@ mod tests {
 
     #[test]
     fn the_socket_flag_is_accepted_by_every_introspection_command() {
-        for name in ["status", "pause", "resume", "drain"] {
+        for name in ["status", "pause", "resume", "drain", "tick"] {
             Cli::try_parse_from(["acton-ai", name, "--socket", "/run/a.sock"])
                 .unwrap_or_else(|e| panic!("`{name} --socket` must parse: {e}"));
         }
+    }
+
+    #[test]
+    fn serve_takes_a_tick_journal_and_a_session() {
+        let cli = Cli::try_parse_from([
+            "acton-ai",
+            "serve",
+            "--tick-journal",
+            "/var/lib/agent/ticks.jsonl",
+            "--session",
+            "main",
+        ])
+        .expect("parses");
+        let Commands::Serve(args) = cli.command else {
+            panic!("expected serve");
+        };
+        assert_eq!(
+            args.tick_journal.as_deref(),
+            Some(std::path::Path::new("/var/lib/agent/ticks.jsonl"))
+        );
+        assert_eq!(args.session.as_deref(), Some("main"));
     }
 
     #[test]

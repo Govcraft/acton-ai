@@ -101,9 +101,84 @@ impl RemoteRequest for Drain {
     const MESSAGE_TYPE: &'static str = "acton_ai.Drain";
 }
 
+/// Asks the process to record a tick: time has passed, and anything that
+/// runs on rhythm should look again.
+///
+/// Carries no timestamp, deliberately. The process stamps the tick from its
+/// own clock, so a client of this socket can make the process look again but
+/// cannot tell it what time it is — and cannot put a time of its choosing into
+/// the tick journal or anything recorded while handling the tick.
+///
+/// Recorded whatever the admission state: a paused process still notes that
+/// time passed, and the work the tick would have started is what admission
+/// defers. [`TickAck::admission`] says which it was.
+#[acton_message(ipc)]
+pub struct Tick;
+
+impl Request for Tick {
+    type Response = TickAck;
+}
+
+impl RemoteRequest for Tick {
+    const MESSAGE_TYPE: &'static str = "acton_ai.Tick";
+}
+
 // =============================================================================
 // Responses
 // =============================================================================
+
+/// The answer to [`Tick`].
+///
+/// Either `seq` and `at` are set and `error` is not, or the reverse.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TickAck {
+    /// See the module docs on compatibility.
+    pub schema_version: u32,
+    /// The tick's position on the process's timeline, when it was recorded.
+    pub seq: Option<u64>,
+    /// The time the process stamped it with, RFC 3339, when it was recorded.
+    pub at: Option<String>,
+    /// The admission state in force when the tick arrived, as
+    /// [`AdmissionState::as_str`](crate::introspection::AdmissionState::as_str).
+    ///
+    /// Anything but `running` means the tick was recorded but the work it
+    /// would start is being held back.
+    pub admission: String,
+    /// Why the tick was not recorded, when it was not.
+    pub error: Option<String>,
+}
+
+impl TickAck {
+    /// An ack for a recorded tick, at the current [`SCHEMA_VERSION`].
+    #[must_use]
+    pub fn recorded(seq: u64, at: impl Into<String>, admission: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            seq: Some(seq),
+            at: Some(at.into()),
+            admission: admission.into(),
+            error: None,
+        }
+    }
+
+    /// An ack for a tick the process could not record.
+    #[must_use]
+    pub fn refused(admission: impl Into<String>, error: impl Into<String>) -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            seq: None,
+            at: None,
+            admission: admission.into(),
+            error: Some(error.into()),
+        }
+    }
+
+    /// Whether the tick made it onto the timeline.
+    #[must_use]
+    pub fn is_recorded(&self) -> bool {
+        self.error.is_none() && self.seq.is_some()
+    }
+}
 
 /// The answer to [`Pause`], [`Resume`], and [`Drain`].
 ///

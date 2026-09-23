@@ -6,4 +6,5 @@ pub mod config;
 pub mod heartbeat;
 pub mod introspect;
 pub mod run_job;
+pub mod serve;
 pub mod session;

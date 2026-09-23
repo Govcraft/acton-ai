@@ -44,6 +44,7 @@ use crate::audit::config::{
 };
 use crate::audit::entry::{AuditEntry, AuditRecord, InvocationRecord, TurnRecord};
 use crate::audit::health::AuditHealth;
+use crate::clock::TimeSource;
 use crate::types::TrailId;
 use acton_reactive::prelude::tokio::io::AsyncWriteExt;
 use acton_reactive::prelude::*;
@@ -432,6 +433,8 @@ pub struct AuditLog {
     /// the actor stops and never before. `None` only in unit tests that
     /// exercise sealing without a file.
     lock: Option<File>,
+    /// Where the log reads the time it records about itself.
+    time: TimeSource,
 }
 
 impl AuditLog {
@@ -460,6 +463,23 @@ impl AuditLog {
         runtime: &mut ActorRuntime,
         config: &AuditConfig,
     ) -> Result<ActorHandle, crate::error::ActonAIError> {
+        Self::spawn_with_time_source(runtime, config, TimeSource::system()).await
+    }
+
+    /// Spawns the log, reading the time it records from `time`.
+    ///
+    /// The time source stamps what the log itself notices — when the writer
+    /// became degraded. The records it seals already carry the time their
+    /// callers stamped them with.
+    ///
+    /// # Errors
+    ///
+    /// As [`spawn`](Self::spawn).
+    pub async fn spawn_with_time_source(
+        runtime: &mut ActorRuntime,
+        config: &AuditConfig,
+        time: TimeSource,
+    ) -> Result<ActorHandle, crate::error::ActonAIError> {
         // Claimed before the head is read, so no other writer can append
         // between the read and the first seal: the head we resume from is
         // exact for as long as we hold the lock.
@@ -479,6 +499,7 @@ impl AuditLog {
         builder.model.durability = config.durability();
         builder.model.health = AuditHealth::armed(head, config.durability());
         builder.model.lock = Some(lock);
+        builder.model.time = time;
 
         configure_handlers(&mut builder);
 
@@ -737,7 +758,7 @@ fn configure_handlers(builder: &mut ManagedActor<Idle, AuditLog>) {
     // Folding an outcome is bookkeeping; the one asynchronous thing it can
     // produce is the transition broadcast, which is a send.
     builder.mutate_on::<NoteAppendOutcome>(|actor, envelope| {
-        let now = chrono::Utc::now().to_rfc3339();
+        let now = actor.model.time.now().to_rfc3339();
         let Some(event) = actor.model.note_outcome(envelope.message(), &now) else {
             return Reply::ready();
         };
@@ -878,6 +899,7 @@ mod tests {
             durability: AuditDurability::BestEffort,
             health: AuditHealth::armed(ChainHead::empty(), AuditDurability::BestEffort),
             lock: None,
+            time: TimeSource::system(),
         };
 
         let first = log.seal_next(AuditRecord::Invocation(record("a")));

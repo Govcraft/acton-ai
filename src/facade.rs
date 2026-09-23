@@ -225,6 +225,14 @@ pub(crate) struct ActonAIInner {
     /// that drive it, admission itself costs nothing when unused: the prompt
     /// loop reads one relaxed atomic per turn.
     pub(crate) admission: crate::introspection::AdmissionGate,
+    /// Where the runtime reads the current time.
+    ///
+    /// The wall clock unless the builder installed a driven one. Every
+    /// calendar timestamp the runtime writes — audit records, stored rows,
+    /// heartbeat reports — comes from here.
+    pub(crate) time: crate::clock::TimeSource,
+    /// The clock actor: the one entry point for ticks.
+    pub(crate) clock: ActorHandle,
     /// The control socket, when introspection was configured.
     ///
     /// `None` means nothing is listening, which is the default. Compiling the
@@ -718,7 +726,7 @@ impl ActonAI {
         };
         let provider = self.default_provider_name().to_string();
         let record = crate::audit::TurnRecord {
-            timestamp: chrono::Utc::now().to_rfc3339(),
+            timestamp: self.now().to_rfc3339(),
             correlation_id: crate::types::CorrelationId::new(),
             conversation_id: conversation,
             user: config.user().map(str::to_string),
@@ -1430,6 +1438,94 @@ impl ActonAI {
             .map(|introspection| introspection.socket_path.as_path())
     }
 
+    // =========================================================================
+    // Time
+    // =========================================================================
+
+    /// Where this runtime reads the current time.
+    ///
+    /// Hand it to anything that writes timestamps on the runtime's behalf —
+    /// [`MemoryStore::spawn_with_time_source`](crate::memory::MemoryStore::spawn_with_time_source),
+    /// for one — so that a replay stamps them with the replayed time too.
+    #[must_use]
+    pub fn time_source(&self) -> &crate::clock::TimeSource {
+        &self.inner.time
+    }
+
+    /// The current time on this runtime's timeline.
+    #[must_use]
+    pub fn now(&self) -> crate::clock::EventTime {
+        self.inner.time.now()
+    }
+
+    /// Records a tick now and broadcasts it to everything that runs on
+    /// rhythm.
+    ///
+    /// The tick is stamped with this runtime's [`now`](Self::now), numbered,
+    /// and — when a [`tick_journal`](ActonAIBuilder::tick_journal) is
+    /// configured — written to disk before it is broadcast.
+    ///
+    /// Admission does not gate ticks. A paused or draining process still
+    /// records that time passed; whatever the tick would have started is what
+    /// admission refuses.
+    ///
+    /// # Errors
+    ///
+    /// A clock error when the journal cannot be written — the tick is then
+    /// neither recorded nor broadcast — or a provider error when the clock
+    /// cannot be reached.
+    pub async fn tick(&self) -> Result<crate::clock::Ticked, ActonAIError> {
+        self.inner
+            .clock
+            .ask(crate::clock::RecordTick {
+                origin: crate::clock::TickOrigin::InProcess,
+            })
+            .await
+            .map_err(|error| {
+                ActonAIError::provider_error(format!("could not reach the clock: {error}"))
+            })?
+            .result
+            .map_err(ActonAIError::clock)
+    }
+
+    /// Replays a tick journal through this runtime's clock, in order.
+    ///
+    /// Each entry moves the runtime's driven time source to the entry's time
+    /// and is broadcast as a [`Ticked`](crate::clock::Ticked) with
+    /// `replayed: true`, so [`on_tick`](ActonAIBuilder::on_tick) callbacks
+    /// and anything else subscribed see the recorded timeline instead of
+    /// today's. Returns the number of entries replayed.
+    ///
+    /// The runtime must have been built with a driven
+    /// [`time_source`](ActonAIBuilder::time_source) starting at or before the
+    /// journal's first entry, and without a
+    /// [`tick_journal`](ActonAIBuilder::tick_journal) of its own.
+    ///
+    /// # Errors
+    ///
+    /// A clock error when the journal cannot be read or fails validation, or
+    /// when the clock refuses an entry. Entries before the refused one have
+    /// already been replayed.
+    pub async fn replay_journal(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<usize, ActonAIError> {
+        let entries = crate::clock::read_journal(path.as_ref()).map_err(ActonAIError::clock)?;
+        let count = entries.len();
+        for entry in entries {
+            self.inner
+                .clock
+                .ask(crate::clock::ReplayEntry { entry })
+                .await
+                .map_err(|error| {
+                    ActonAIError::provider_error(format!("could not reach the clock: {error}"))
+                })?
+                .result
+                .map_err(ActonAIError::clock)?;
+        }
+        Ok(count)
+    }
+
     pub async fn shutdown(self) -> Result<(), ActonAIError> {
         self.inner.is_shutdown.store(true, Ordering::SeqCst);
 
@@ -1651,6 +1747,13 @@ pub struct ActonAIBuilder {
     checkpoint_file: Option<crate::config::CheckpointFileConfig>,
     /// Whether `SIGTERM` should start a drain.
     drain_on_sigterm: bool,
+    /// The time source set with [`time_source`](Self::time_source). `None`
+    /// is the wall clock.
+    time_source: Option<crate::clock::TimeSource>,
+    /// Where ticks are journaled, set with [`tick_journal`](Self::tick_journal).
+    tick_journal: Option<PathBuf>,
+    /// Callback registered with [`on_tick`](Self::on_tick).
+    tick_callback: Option<Arc<dyn Fn(crate::clock::Ticked) + Send + Sync>>,
 }
 
 /// How a runtime's telemetry providers come to exist.
@@ -2251,6 +2354,83 @@ impl ActonAIBuilder {
     #[must_use]
     pub fn drain_on_sigterm(mut self) -> Self {
         self.drain_on_sigterm = true;
+        self
+    }
+
+    // =========================================================================
+    // Time
+    // =========================================================================
+
+    /// Sets where the runtime reads the current time.
+    ///
+    /// The default is the wall clock. A
+    /// [`TimeSource::driven`](crate::clock::TimeSource::driven) timeline stands
+    /// still until it is moved — by
+    /// [`replay_journal`](ActonAI::replay_journal), or by a test calling
+    /// [`advance_to`](crate::clock::TimeSource::advance_to) — which is what
+    /// lets a replay or a test decide what "now" is.
+    ///
+    /// Only calendar time is affected: timeouts, backoff, and circuit-breaker
+    /// cooldowns measure durations on a monotonic clock regardless.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use acton_ai::clock::{EventTime, TimeSource};
+    ///
+    /// let time = TimeSource::driven(EventTime::parse_rfc3339("2026-01-01T00:00:00Z")?);
+    /// let ai = ActonAI::builder()
+    ///     .ollama("qwen2.5:7b")
+    ///     .time_source(time.clone())
+    ///     .launch()
+    ///     .await?;
+    /// ```
+    #[must_use]
+    pub fn time_source(mut self, time: crate::clock::TimeSource) -> Self {
+        self.time_source = Some(time);
+        self
+    }
+
+    /// Records every tick to an append-only journal at `path`.
+    ///
+    /// The file is created with owner-only permissions if absent. If it
+    /// exists it is read and validated at launch, and the timeline continues
+    /// from its last entry, so one journal holds one timeline across
+    /// restarts. A journal that cannot be read fails the launch.
+    ///
+    /// A runtime that records a journal cannot also
+    /// [replay](ActonAI::replay_journal) one.
+    #[must_use]
+    pub fn tick_journal(mut self, path: impl Into<PathBuf>) -> Self {
+        self.tick_journal = Some(path.into());
+        self
+    }
+
+    /// Runs `callback` for every tick the clock accepts, live or replayed.
+    ///
+    /// Ticks are delivered one at a time, in timeline order. The callback runs
+    /// inside a small subscriber actor's message loop, so it must be cheap and
+    /// must not block — send on a channel and do the work elsewhere.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let (sender, mut ticks) = tokio::sync::mpsc::unbounded_channel();
+    /// let ai = ActonAI::builder()
+    ///     .ollama("qwen2.5:7b")
+    ///     .on_tick(move |tick| { let _ = sender.send(tick); })
+    ///     .launch()
+    ///     .await?;
+    /// while let Some(tick) = ticks.recv().await {
+    ///     // run whatever is due at tick.at
+    /// }
+    /// ```
+    #[must_use]
+    pub fn on_tick(
+        mut self,
+        callback: impl Fn(crate::clock::Ticked) + Send + Sync + 'static,
+    ) -> Self {
+        self.tick_callback = Some(Arc::new(callback));
         self
     }
 
@@ -3239,8 +3419,13 @@ impl ActonAIBuilder {
         // The one writer of the trail. Spawned before any prompt can run, and
         // only when a trail was configured: with no `[audit]` section and no
         // `.audit(..)` call there is no actor and nothing is written.
+        let time = self.time_source.take().unwrap_or_default();
+
         let audit = match audit_config {
-            Some(ref config) => Some(crate::audit::AuditLog::spawn(&mut runtime, config).await?),
+            Some(ref config) => Some(
+                crate::audit::AuditLog::spawn_with_time_source(&mut runtime, config, time.clone())
+                    .await?,
+            ),
             None => None,
         };
 
@@ -3249,7 +3434,7 @@ impl ActonAIBuilder {
         // are settled under the configured policy ahead of new work — and so
         // a runtime with no `[checkpoint]` section opens nothing at all.
         let checkpoint = match checkpoint_config {
-            Some(config) => Some(launch_checkpoints(&mut runtime, &config).await?),
+            Some(config) => Some(launch_checkpoints(&mut runtime, &config, time.clone()).await?),
             None => None,
         };
 
@@ -3265,6 +3450,20 @@ impl ActonAIBuilder {
         if let Some(callback) = self.failover_event_callback.take() {
             crate::llm::failover::FailoverEventListener::spawn(&mut runtime, callback).await;
         }
+
+        // The listener goes first so its subscription is in place before the
+        // clock can broadcast anything. The clock itself goes before
+        // introspection, which forwards socket ticks to it.
+        if let Some(callback) = self.tick_callback.take() {
+            crate::clock::TickListener::spawn(&mut runtime, callback).await;
+        }
+        let clock = crate::clock::ClockActor::spawn(
+            &mut runtime,
+            time.clone(),
+            self.tick_journal.as_deref(),
+        )
+        .await
+        .map_err(|error| ActonAIError::configuration("tick_journal", error.to_string()))?;
 
         // Only when telemetry is configured: with no providers installed the
         // actor would subscribe to three broadcasts and record every one of
@@ -3297,6 +3496,7 @@ impl ActonAIBuilder {
                         provider_failover: &provider_failover,
                         accountant: accountant.as_ref(),
                         mcp: mcp.as_ref(),
+                        clock: &clock,
                     },
                 )
                 .await?,
@@ -3346,6 +3546,8 @@ impl ActonAIBuilder {
                 custom_tools: self.custom_tools,
                 telemetry,
                 admission,
+                time,
+                clock,
                 introspection,
                 tool_policy,
                 audit,
@@ -3636,10 +3838,11 @@ impl ActonAIBuilder {
 async fn launch_checkpoints(
     runtime: &mut ActorRuntime,
     config: &crate::checkpoint::CheckpointConfig,
+    time: crate::clock::TimeSource,
 ) -> Result<CheckpointRuntime, ActonAIError> {
     use crate::checkpoint::ResumePolicy;
 
-    let store = crate::memory::MemoryStore::spawn(runtime).await;
+    let store = crate::memory::MemoryStore::spawn_with_time_source(runtime, time).await;
     store
         .send(crate::memory::InitMemoryStore {
             config: crate::memory::PersistenceConfig::new(&config.db_path),
@@ -3914,6 +4117,7 @@ struct IntrospectionCollaborators<'a> {
     provider_failover: &'a HashMap<String, Vec<String>>,
     accountant: Option<&'a ActorHandle>,
     mcp: Option<&'a crate::mcp::McpTools>,
+    clock: &'a ActorHandle,
 }
 
 /// Spawns the introspection actor and binds its control socket.
@@ -3934,6 +4138,7 @@ async fn start_introspection(
         provider_failover,
         accountant,
         mcp,
+        clock,
     } = collaborators;
 
     let socket_path = crate::introspection::resolve_socket_path(config, app_name);
@@ -3953,6 +4158,7 @@ async fn start_introspection(
                         .collect()
                 })
                 .unwrap_or_default(),
+            clock: Some(clock.clone()),
             app_name: app_name.to_string(),
         };
 
@@ -3987,6 +4193,7 @@ async fn start_introspection(
             provider_failover,
             accountant,
             mcp,
+            clock,
         );
         Ok(IntrospectionRuntime { socket_path })
     }
